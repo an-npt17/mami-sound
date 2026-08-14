@@ -26,7 +26,8 @@
             packages = with pkgs; [
               zig
               zls
-              alsa-utils # aplay, for sensor-ui audio
+              alsa-utils # aplay, the audio sink
+              ffmpeg # decodes interview.ogg and waterfall.mp3 at startup
             ];
           };
         }
