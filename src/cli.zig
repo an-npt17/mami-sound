@@ -6,6 +6,7 @@
 const std = @import("std");
 const select = @import("select.zig");
 const sensors = @import("sensors.zig");
+const ads1115 = @import("ads1115.zig");
 
 pub const Error = error{
     UnknownFlag,
@@ -13,8 +14,33 @@ pub const Error = error{
     UnknownTouch,
     InvalidDevice,
     InvalidTrigger,
+    UnknownAdcInput,
     TooManyArguments,
 } || select.Error;
+
+/// The names `--adc` accepts, in the order the ADS1115 datasheet lists them:
+/// `a0` and friends read one pin against ground, `a0-a1` reads the difference
+/// between two. Spelled shorter than the `Mux` tags, which carry the register
+/// layout in their names and are no fun to type at a prompt.
+const adc_inputs = [_]struct { name: []const u8, mux: ads1115.Mux }{
+    .{ .name = "a0", .mux = .ain0_gnd },
+    .{ .name = "a1", .mux = .ain1_gnd },
+    .{ .name = "a2", .mux = .ain2_gnd },
+    .{ .name = "a3", .mux = .ain3_gnd },
+    .{ .name = "a0-a1", .mux = .ain0_ain1 },
+    .{ .name = "a0-a3", .mux = .ain0_ain3 },
+    .{ .name = "a1-a3", .mux = .ain1_ain3 },
+    .{ .name = "a2-a3", .mux = .ain2_ain3 },
+};
+
+/// The multiplexer setting for an `--adc` name, or null if there is no such
+/// input. Pure, so the table can be checked without a chip.
+pub fn adcInput(name: []const u8) ?ads1115.Mux {
+    for (adc_inputs) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry.mux;
+    }
+    return null;
+}
 
 /// Threshold `--trigger` means when given no number of its own: plant A pinned
 /// at the top of its range.
@@ -55,6 +81,8 @@ pub const Options = struct {
     /// Volts plant A must reach before plants B and C are allowed to sound.
     /// `null` lets them sound whenever they are awake, as before.
     trigger_volts: ?f32 = null,
+    /// Which ADS1115 input plant A's probe is wired to.
+    adc_input: ads1115.Mux = ads1115.Config.default_mux,
     /// The device name is carried inline rather than as a slice into `args`, so
     /// `Options` outlives the arguments it was parsed from and the caller is
     /// free to drop them.
@@ -77,6 +105,8 @@ pub fn parse(args: []const []const u8) Error!Options {
         if (std.mem.startsWith(u8, arg, "--voice=")) {
             const name = arg["--voice=".len..];
             opts.voice = std.meta.stringToEnum(Voice, name) orelse return Error.UnknownVoice;
+        } else if (std.mem.startsWith(u8, arg, "--adc=")) {
+            opts.adc_input = adcInput(arg["--adc=".len..]) orelse return Error.UnknownAdcInput;
         } else if (std.mem.eql(u8, arg, "--trigger")) {
             opts.trigger_volts = default_trigger;
         } else if (std.mem.startsWith(u8, arg, "--trigger=")) {
@@ -107,7 +137,7 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
-    \\                 [--trigger[=VOLTS]] [--device=NAME]
+    \\                 [--trigger[=VOLTS]] [--adc=INPUT] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
@@ -134,6 +164,14 @@ pub const usage =
     \\until stopped, as the installation does; B and C are one-shots, so they
     \\sound once at the start and plant A carries the rest.
     \\
+    \\--adc is the ADS1115 input plant A's probe is wired to, a0 by default:
+    \\  a0 a1 a2 a3      one pin read against ground
+    \\  a0-a1 a0-a3      the difference between two pins, and likewise
+    \\  a1-a3 a2-a3      for the other pairs the chip can measure
+    \\Only these eight exist; the chip has four pins and one multiplexer, so
+    \\it measures one of them at a time. A differential input swings negative,
+    \\which the engine reads as zero.
+    \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
     \\plug prefix is what resamples when the card cannot do 44100 Hz itself.
@@ -147,6 +185,7 @@ pub const usage =
     \\  mami_sound --touch=motion      wake the plants from the GPIO sensors
     \\  mami_sound --trigger           B and C wait for plant A to read 3.3 V
     \\  mami_sound --trigger=2.5       and the same at a lower threshold
+    \\  mami_sound --adc=a2            read the probe on AIN2 instead of AIN0
     \\
 ;
 
@@ -185,6 +224,28 @@ test "every voice can be asked for by name" {
 
 test "rejects a voice that does not exist" {
     try testing.expectError(Error.UnknownVoice, parse(&.{"--voice=tuba"}));
+}
+
+test "the adc input defaults to AIN0 against ground" {
+    try testing.expectEqual(ads1115.Mux.ain0_gnd, (try parse(&.{})).adc_input);
+}
+
+test "every input the chip has can be asked for" {
+    try testing.expectEqual(ads1115.Mux.ain2_gnd, (try parse(&.{"--adc=a2"})).adc_input);
+    try testing.expectEqual(ads1115.Mux.ain0_ain1, (try parse(&.{"--adc=a0-a1"})).adc_input);
+    try testing.expectEqual(ads1115.Mux.ain2_ain3, (try parse(&.{"--adc=a2-a3"})).adc_input);
+
+    // The table covers the multiplexer exactly: eight names, eight settings.
+    var seen = std.enums.EnumSet(ads1115.Mux).initEmpty();
+    for (adc_inputs) |entry| seen.insert(entry.mux);
+    try testing.expectEqual(std.enums.values(ads1115.Mux).len, seen.count());
+}
+
+test "rejects a pin pairing the chip cannot measure" {
+    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc=a4"}));
+    // Real pins, but not a pair the multiplexer offers.
+    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc=a1-a2"}));
+    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc="}));
 }
 
 test "no trigger unless asked for" {

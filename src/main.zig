@@ -4,7 +4,7 @@ const std = @import("std");
 const ms = @import("mami_sound");
 
 /// Plant B's clip: a spoken interview.
-const clip_b_path = "phong-van1.mp3";
+const clip_b_path = "phong-van3.mp3";
 /// Plant C's clip: running water.
 const clip_c_path = "am-thanh-tu-nhien.mp3";
 

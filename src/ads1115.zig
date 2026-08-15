@@ -96,7 +96,10 @@ pub const Rate = enum(u3) {
 /// resolution at 860 SPS is a few counts worse than at 8 — and that lands well
 /// under the voices' one-second pitch smoothing.
 pub const Config = struct {
-    mux: Mux = .ain0_gnd,
+    /// Named so callers can default to the same input without repeating it.
+    pub const default_mux: Mux = .ain0_gnd;
+
+    mux: Mux = default_mux,
     gain: Gain = .fs_4_096v,
     rate: Rate = .sps_860,
 };
