@@ -33,11 +33,23 @@ pub const Sink = struct {
 
     /// Spawns `aplay`. `argv[0]` is resolved through the parent's `PATH`, so
     /// the dev shell providing `alsa-utils` is enough.
-    pub fn init(io: std.Io, comptime sample_rate: u32, comptime channels: u32) !Sink {
+    ///
+    /// `device` is passed straight to `-D`. `default` follows whatever the
+    /// machine's ALSA configuration points at, which on a board with a USB or
+    /// I2S card added is often not the card wanted; naming it, as in
+    /// `plughw:0,0`, settles it.
+    pub fn init(
+        io: std.Io,
+        device: []const u8,
+        comptime sample_rate: u32,
+        comptime channels: u32,
+    ) !Sink {
         const child = try std.process.spawn(io, .{
             .argv = &.{
                 "aplay",
                 "-q",
+                "-D",
+                device,
                 "-f",
                 "S16_LE",
                 "-r",

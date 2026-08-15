@@ -5,6 +5,8 @@
 const std = @import("std");
 
 pub const sensors = @import("sensors.zig");
+pub const ads1115 = @import("ads1115.zig");
+pub const gpio = @import("gpio.zig");
 pub const noise = @import("noise.zig");
 pub const player = @import("player.zig");
 pub const decode = @import("decode.zig");
@@ -23,6 +25,8 @@ pub const block_frames: usize = 512;
 
 test {
     _ = sensors;
+    _ = ads1115;
+    _ = gpio;
     _ = noise;
     _ = player;
     _ = decode;

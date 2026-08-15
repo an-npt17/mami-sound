@@ -67,16 +67,18 @@ pub fn main(init: std.process.Init) !void {
         &.{};
     defer if (flute.len != 0) ms.sampler.free(gpa, flute);
 
-    var out = ms.sink.Sink.init(io, ms.sample_rate, ms.channels) catch |err| {
+    var out = ms.sink.Sink.init(io, opts.device(), ms.sample_rate, ms.channels) catch |err| {
         std.debug.print(
-            \\could not start aplay: {s}
+            \\could not start aplay on {s}: {s}
             \\aplay comes from alsa-utils; run this inside `nix develop`.
+            \\`aplay -l` lists the cards, then pass --device=plughw:0,0.
             \\
-        , .{@errorName(err)});
+        , .{ opts.device(), @errorName(err) });
         return err;
     };
 
-    var sens = ms.sensors.Sensors.init(ms.sample_rate, seed);
+    var sens = openSensors();
+    defer sens.deinit();
     var voice_a: VoiceA = switch (opts.voice) {
         // Falls back to the drone when the flute was asked for but plant A is
         // not playing, in which case nothing was loaded and nothing is heard.
@@ -94,8 +96,14 @@ pub fn main(init: std.process.Init) !void {
     var pcm: [ms.block_frames]i16 = undefined;
 
     const script_frames = ms.sample_rate * script_seconds;
+    // Real motion sensors mean there is no script to reach the end of: the
+    // installation runs until it is switched off.
+    const live = sens.motion != null;
     var rendered: usize = 0;
-    while (rendered < script_frames or voice_b.isPlaying() or voice_c.isPlaying()) {
+
+    var status: Status = .init(io);
+
+    while (live or rendered < script_frames or voice_b.isPlaying() or voice_c.isPlaying()) {
         // Voices add into the block, so it starts from silence each time.
         @memset(&block, 0);
 
@@ -103,18 +111,161 @@ pub fn main(init: std.process.Init) !void {
         // Disabled plants read as untouched, so their voices simply never open.
         const touch = ms.select.apply(sel, reading.touch);
         voice_a.render(&block, reading.ecg_volts, touch[0]);
-        std.debug.print("ecg={d:.2}\n", .{reading.ecg_volts}); // TEST: for debugging the ECG sensor in comptime
         voice_b.render(&block, touch[1]);
         voice_c.render(&block, touch[2]);
 
         ms.sink.toPcm(&block, &pcm);
         // Blocks until aplay wants more, which is what paces the whole program.
-        try out.write(&pcm);
+        out.write(&pcm) catch |err| switch (err) {
+            // aplay gave up on the card and closed the pipe. It has already
+            // said why on its own stderr, so add what to do about it.
+            error.BrokenPipe => reportSinkDeath(gpa, io, opts.device()),
+            else => return err,
+        };
 
         rendered += ms.block_frames;
+        status.observe(io, reading, &block, rendered);
     }
 
     try out.finish();
+}
+
+/// Say what a dead `aplay` means and list what else could be played through.
+///
+/// The device existing is not the same as the device accepting this stream: a
+/// Pi's HDMI card is present whether or not a display is, and refuses to set
+/// hardware parameters when nothing is plugged into it. `aplay -l` is the list
+/// of what is really there, and it is worth printing rather than telling
+/// someone to go and run it.
+fn reportSinkDeath(gpa: std.mem.Allocator, io: std.Io, device: []const u8) noreturn {
+    std.debug.print(
+        \\
+        \\aplay stopped: {s} would not take this stream (44100 Hz, mono,
+        \\S16_LE). Its own reason is above.
+        \\
+    , .{device});
+
+    if (std.process.run(gpa, io, .{
+        .argv = &.{ "aplay", "-l" },
+        .stdout_limit = .limited(64 * 1024),
+        .reserve_amount = 4096,
+    })) |result| {
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        std.debug.print("\n{s}\n", .{result.stdout});
+    } else |_| {}
+
+    std.debug.print(
+        \\Pass --device=plughw:CARD,DEVICE with the numbers from that list. The
+        \\`plug` prefix resamples for a card that cannot do 44100 Hz itself.
+        \\
+    , .{});
+    std.process.exit(1);
+}
+
+/// One line a second on stderr, in place of anything per block: a print every
+/// 11.6 ms is both unreadable and slow enough to matter on a Zero 2 W.
+///
+/// The three numbers answer the three questions worth asking of a run that is
+/// not making the noise it should:
+///
+///   * `peak` is the loudest sample of the last second. Zero means the engine
+///     itself is silent, so no plant was awake and nothing is wrong downstream.
+///   * `realtime` is audio time over wall time. `aplay` blocks until the card
+///     wants more, so a healthy run sits at x1.00. Much above that means
+///     nothing is being paced: the samples are going somewhere that swallows
+///     them, which is the shape of a wrong `--device`.
+///   * `ecg` and `touch` are the sensors as the voices see them.
+const Status = struct {
+    /// When the last line went out, so each line reports the second it covers
+    /// rather than an average since startup. An average would hide a sink that
+    /// stops pacing partway through, and takes a while to shake off `aplay`
+    /// swallowing the first second into its buffer as fast as it is offered.
+    last_ns: i96,
+    next_frame: usize,
+    peak: f32,
+
+    /// Audio frames between lines.
+    const period = ms.sample_rate;
+
+    fn init(io: std.Io) Status {
+        return .{
+            .last_ns = std.Io.Timestamp.now(io, .awake).nanoseconds,
+            .next_frame = period,
+            .peak = 0.0,
+        };
+    }
+
+    fn observe(
+        self: *Status,
+        io: std.Io,
+        reading: ms.sensors.Reading,
+        block: []const f32,
+        rendered: usize,
+    ) void {
+        for (block) |sample| self.peak = @max(self.peak, @abs(sample));
+        if (rendered < self.next_frame) return;
+        self.next_frame += period;
+
+        const now_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        const wall_s = @as(f64, @floatFromInt(now_ns - self.last_ns)) / std.time.ns_per_s;
+        self.last_ns = now_ns;
+        const audio_s = @as(f64, @floatFromInt(rendered)) /
+            @as(f64, @floatFromInt(ms.sample_rate));
+        // Every line covers exactly one second of audio, so the ratio is just
+        // how long that second took to hand over.
+        const interval_s = @as(f64, @floatFromInt(period)) /
+            @as(f64, @floatFromInt(ms.sample_rate));
+
+        const letters = [ms.sensors.plant_count]u8{ 'A', 'B', 'C' };
+        var touch: [ms.sensors.plant_count]u8 = undefined;
+        for (&touch, letters, reading.touch) |*out, letter, awake| {
+            out.* = if (awake) letter else '-';
+        }
+
+        std.debug.print("t={d:.0}s ecg={d:.2}V touch={s} peak={d:.2} realtime=x{d:.2}\n", .{
+            audio_s,
+            reading.ecg_volts,
+            &touch,
+            self.peak,
+            // Guarded so a clock that has not moved yet reports nothing absurd.
+            if (wall_s > 0) interval_s / wall_s else 0.0,
+        });
+        self.peak = 0.0;
+    }
+};
+
+/// Attach whichever devices are actually present. Each one falls back to its
+/// simulation on its own, so the same binary runs on the finished installation,
+/// on a half-wired bench and on a laptop with no hardware at all.
+fn openSensors() ms.sensors.Sensors {
+    var sens = ms.sensors.Sensors.init(ms.sample_rate, seed);
+
+    if (ms.ads1115.Ads1115.open(
+        ms.ads1115.default_bus,
+        ms.ads1115.default_address,
+        .{},
+    )) |adc| {
+        sens.attachAdc(adc);
+    } else |err| {
+        std.debug.print(
+            \\no ADS1115 on {s}: {s}
+            \\Plant A runs on the simulated ECG.
+            \\
+        , .{ ms.ads1115.default_bus, @errorName(err) });
+    }
+
+    if (ms.gpio.Lines.openDefault(&ms.gpio.default_offsets, .{})) |lines| {
+        sens.attachMotion(lines);
+    } else |err| {
+        std.debug.print(
+            \\no motion sensors on GPIO {any}: {s}
+            \\The plants wake on the scripted timeline instead.
+            \\
+        , .{ ms.gpio.default_offsets, @errorName(err) });
+    }
+
+    return sens;
 }
 
 /// Collect the arguments and hand them to the parser, which is pure.
