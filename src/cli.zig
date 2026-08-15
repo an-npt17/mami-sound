@@ -104,7 +104,11 @@ pub const usage =
     \\--touch decides when a plant is awake and sounding:
     \\  always  every plant, from the first block on (default)
     \\  script  the built-in timeline: A holds, B and C tap inside it
-    \\  motion  one GPIO motion sensor per plant, and the run never ends
+    \\  motion  one GPIO motion sensor per plant
+    \\
+    \\The run ends on its own only under --touch=script. Otherwise it plays
+    \\until stopped, as the installation does; B and C are one-shots, so they
+    \\sound once at the start and plant A carries the rest.
     \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the

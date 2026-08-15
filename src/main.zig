@@ -4,13 +4,14 @@ const std = @import("std");
 const ms = @import("mami_sound");
 
 /// Plant B's clip: a spoken interview.
-const clip_b_path = "interview.ogg";
+const clip_b_path = "phong-van1.mp3";
 /// Plant C's clip: running water.
-const clip_c_path = "waterfall.mp3";
+const clip_c_path = "am-thanh-tu-nhien.mp3";
 
-/// Length of the sensor script. The loop keeps running past this until the
-/// one-shot clips have finished, so nothing is cut off mid-playback. With real
-/// sensors the script goes away and the loop becomes unbounded.
+/// Length of the sensor script, which is the only thing that ever ends a run.
+/// The loop keeps going past this until the one-shot clips have finished, so
+/// nothing is cut off mid-playback. Every other touch source plays until the
+/// program is stopped.
 const script_seconds: usize = 15;
 
 /// Fixed so every run sounds identical and can be compared by ear.
@@ -96,14 +97,18 @@ pub fn main(init: std.process.Init) !void {
     var pcm: [ms.block_frames]i16 = undefined;
 
     const script_frames = ms.sample_rate * script_seconds;
-    // Real motion sensors mean there is no script to reach the end of: the
-    // installation runs until it is switched off.
-    const live = sens.touch == .motion;
+    // Only the script has an end to reach. Driven by sensors, real or assumed,
+    // the installation plays until it is switched off.
+    const scripted = opts.touch == .script;
     var rendered: usize = 0;
 
     var status: Status = .init(io);
 
-    while (live or rendered < script_frames or voice_b.isPlaying() or voice_c.isPlaying()) {
+    while (!scripted or
+        rendered < script_frames or
+        voice_b.isPlaying() or
+        voice_c.isPlaying())
+    {
         // Voices add into the block, so it starts from silence each time.
         @memset(&block, 0);
 
