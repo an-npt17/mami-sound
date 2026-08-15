@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var sens = openSensors();
+    var sens = openSensors(opts.touch);
     defer sens.deinit();
     var voice_a: VoiceA = switch (opts.voice) {
         // Falls back to the drone when the flute was asked for but plant A is
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     const script_frames = ms.sample_rate * script_seconds;
     // Real motion sensors mean there is no script to reach the end of: the
     // installation runs until it is switched off.
-    const live = sens.motion != null;
+    const live = sens.touch == .motion;
     var rendered: usize = 0;
 
     var status: Status = .init(io);
@@ -238,7 +238,7 @@ const Status = struct {
 /// Attach whichever devices are actually present. Each one falls back to its
 /// simulation on its own, so the same binary runs on the finished installation,
 /// on a half-wired bench and on a laptop with no hardware at all.
-fn openSensors() ms.sensors.Sensors {
+fn openSensors(touch: ms.cli.Touch) ms.sensors.Sensors {
     var sens = ms.sensors.Sensors.init(ms.sample_rate, seed);
 
     if (ms.ads1115.Ads1115.open(
@@ -255,14 +255,22 @@ fn openSensors() ms.sensors.Sensors {
         , .{ ms.ads1115.default_bus, @errorName(err) });
     }
 
-    if (ms.gpio.Lines.openDefault(&ms.gpio.default_offsets, .{})) |lines| {
-        sens.attachMotion(lines);
-    } else |err| {
-        std.debug.print(
-            \\no motion sensors on GPIO {any}: {s}
-            \\The plants wake on the scripted timeline instead.
-            \\
-        , .{ ms.gpio.default_offsets, @errorName(err) });
+    switch (touch) {
+        // The GPIO sensors are only opened when they are asked for, so a run
+        // during bring-up neither depends on them nor complains about them.
+        .always => {},
+        .script => sens.useScript(),
+        .motion => {
+            if (ms.gpio.Lines.openDefault(&ms.gpio.default_offsets, .{})) |lines| {
+                sens.attachMotion(lines);
+            } else |err| {
+                std.debug.print(
+                    \\no motion sensors on GPIO {any}: {s}
+                    \\Every plant stays awake instead.
+                    \\
+                , .{ ms.gpio.default_offsets, @errorName(err) });
+            }
+        },
     }
 
     return sens;

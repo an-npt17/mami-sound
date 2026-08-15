@@ -65,20 +65,31 @@ pub fn ecgFromAdc(volts: f32) f32 {
     return std.math.clamp(volts, 0.0, volts_max);
 }
 
+/// Where the per-plant awake flags come from.
+pub const Touch = union(enum) {
+    /// Every plant awake, every block. What to use while the motion sensors are
+    /// not wired yet: it takes them out of the picture entirely, so anything
+    /// still wrong is the ECG, the mix or the sound card.
+    always,
+    /// The scripted timeline, for demonstrating the piece without hardware.
+    script,
+    /// One GPIO line per plant.
+    motion: gpio.Lines,
+};
+
 pub const Sensors = struct {
     prng: std.Random.DefaultPrng,
     sample_rate: u32,
     elapsed_frames: u64,
     ecg_volts: f32,
     /// Held so a failed read repeats the last state instead of cutting a voice.
-    touch: [plant_count]bool,
+    touch_state: [plant_count]bool,
+    touch: Touch,
     /// `null` runs the random walk instead.
     adc: ?ads1115.Ads1115,
-    /// `null` runs the scripted timeline instead.
-    motion: ?gpio.Lines,
 
-    /// Fully simulated. `attachAdc` and `attachMotion` swap in real hardware
-    /// one input at a time, so a half-wired installation still runs.
+    /// Simulated ECG, every plant awake. `attachAdc` and `attachMotion` swap in
+    /// real hardware one input at a time, so a half-wired installation runs.
     pub fn init(sample_rate: u32, seed: u64) Sensors {
         return .{
             .prng = std.Random.DefaultPrng.init(seed),
@@ -86,9 +97,9 @@ pub const Sensors = struct {
             .elapsed_frames = 0,
             // Start mid-range so the first block is already audible.
             .ecg_volts = (walk_min + walk_max) / 2.0,
-            .touch = .{false} ** plant_count,
+            .touch_state = .{true} ** plant_count,
+            .touch = .always,
             .adc = null,
-            .motion = null,
         };
     }
 
@@ -102,14 +113,25 @@ pub const Sensors = struct {
     /// plant, in plant order.
     pub fn attachMotion(self: *Sensors, lines: gpio.Lines) void {
         std.debug.assert(lines.count == plant_count);
-        self.motion = lines;
+        self.touch = .{ .motion = lines };
+        // Nothing is known about the sensors until the first read; assume the
+        // room is empty rather than opening every voice for one block.
+        self.touch_state = .{false} ** plant_count;
+    }
+
+    pub fn useScript(self: *Sensors) void {
+        self.touch = .script;
+        self.touch_state = .{false} ** plant_count;
     }
 
     pub fn deinit(self: *Sensors) void {
         if (self.adc) |*adc| adc.close();
-        if (self.motion) |*lines| lines.close();
+        switch (self.touch) {
+            .motion => |*lines| lines.close(),
+            else => {},
+        }
         self.adc = null;
-        self.motion = null;
+        self.touch = .always;
     }
 
     /// Advance by `frames` and report the current state. Called once per audio
@@ -130,16 +152,20 @@ pub const Sensors = struct {
             self.ecg_volts = std.math.clamp(self.ecg_volts + delta, walk_min, walk_max);
         }
 
-        if (self.motion) |*lines| {
-            var next: [plant_count]bool = undefined;
-            if (lines.read(&next)) |_| self.touch = next else |_| {}
-        } else {
-            self.touch = touchAt(t);
+        switch (self.touch) {
+            .always => self.touch_state = .{true} ** plant_count,
+            .script => self.touch_state = touchAt(t),
+            .motion => |*lines| {
+                var next: [plant_count]bool = undefined;
+                // A failed ioctl holds the last state, for the same reason a
+                // failed ADC read holds the last voltage.
+                if (lines.read(&next)) |_| self.touch_state = next else |_| {}
+            },
         }
 
         self.elapsed_frames += frames;
 
-        return .{ .ecg_volts = self.ecg_volts, .touch = self.touch };
+        return .{ .ecg_volts = self.ecg_volts, .touch = self.touch_state };
     }
 };
 
@@ -153,6 +179,24 @@ test "adc readings land inside the voice's range" {
     // The ADC's range overhangs the supply at both ends; the voices' does not.
     try testing.expectApproxEqAbs(volts_max, ecgFromAdc(4.0), 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.0), ecgFromAdc(-0.5), 0.001);
+}
+
+test "by default every plant is awake from the first block" {
+    var sens = Sensors.init(44100, 1);
+    for (0..10) |_| {
+        for (sens.tick(512).touch) |awake| try testing.expect(awake);
+    }
+}
+
+test "the script still gates the plants when asked for" {
+    var sens = Sensors.init(44100, 1);
+    sens.useScript();
+    // Nothing is awake before plant A's cue at one second.
+    for (sens.tick(512).touch) |awake| try testing.expect(!awake);
+
+    var elapsed: usize = 512;
+    while (elapsed < 44100 * 2) : (elapsed += 512) _ = sens.tick(512);
+    try testing.expectEqual([plant_count]bool{ true, false, false }, sens.tick(512).touch);
 }
 
 test "without an adc the walk stays in range" {

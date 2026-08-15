@@ -9,9 +9,20 @@ const select = @import("select.zig");
 pub const Error = error{
     UnknownFlag,
     UnknownVoice,
+    UnknownTouch,
     InvalidDevice,
     TooManyArguments,
 } || select.Error;
+
+/// What decides when a plant is awake.
+pub const Touch = enum {
+    /// Every plant, always. The default while the motion sensors are not wired.
+    always,
+    /// The scripted timeline the piece was built against.
+    script,
+    /// One GPIO motion sensor per plant.
+    motion,
+};
 
 /// What `aplay` opens when nothing was asked for: ALSA's own default, which is
 /// whatever card the machine's configuration points at.
@@ -34,6 +45,7 @@ pub const Voice = enum {
 pub const Options = struct {
     plants: select.Selection = select.all,
     voice: Voice = .drone,
+    touch: Touch = .always,
     /// The device name is carried inline rather than as a slice into `args`, so
     /// `Options` outlives the arguments it was parsed from and the caller is
     /// free to drop them.
@@ -56,6 +68,9 @@ pub fn parse(args: []const []const u8) Error!Options {
         if (std.mem.startsWith(u8, arg, "--voice=")) {
             const name = arg["--voice=".len..];
             opts.voice = std.meta.stringToEnum(Voice, name) orelse return Error.UnknownVoice;
+        } else if (std.mem.startsWith(u8, arg, "--touch=")) {
+            const name = arg["--touch=".len..];
+            opts.touch = std.meta.stringToEnum(Touch, name) orelse return Error.UnknownTouch;
         } else if (std.mem.startsWith(u8, arg, "--device=")) {
             const name = arg["--device=".len..];
             if (name.len == 0 or name.len > device_max) return Error.InvalidDevice;
@@ -73,7 +88,8 @@ pub fn parse(args: []const []const u8) Error!Options {
 }
 
 pub const usage =
-    \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--device=NAME]
+    \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
+    \\                 [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
@@ -85,6 +101,11 @@ pub const usage =
     \\  flute  recorded flute notes, replayed at the ECG's pitch
     \\  beep   a bare synthesized sine at the ECG's pitch
     \\
+    \\--touch decides when a plant is awake and sounding:
+    \\  always  every plant, from the first block on (default)
+    \\  script  the built-in timeline: A holds, B and C tap inside it
+    \\  motion  one GPIO motion sensor per plant, and the run never ends
+    \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
     \\plug prefix is what resamples when the card cannot do 44100 Hz itself.
@@ -95,6 +116,7 @@ pub const usage =
     \\  mami_sound 1 --voice=flute     plant A as a flute
     \\  mami_sound 1 --voice=beep      plant A as a sine, no files needed
     \\  mami_sound --device=plughw:0,0 play through card 0 whatever else is set
+    \\  mami_sound --touch=motion      wake the plants from the GPIO sensors
     \\
 ;
 
@@ -133,6 +155,19 @@ test "every voice can be asked for by name" {
 
 test "rejects a voice that does not exist" {
     try testing.expectError(Error.UnknownVoice, parse(&.{"--voice=tuba"}));
+}
+
+test "touch defaults to every plant awake" {
+    try testing.expectEqual(Touch.always, (try parse(&.{})).touch);
+}
+
+test "every touch source can be asked for by name" {
+    for (std.enums.values(Touch)) |source| {
+        var buf: [32]u8 = undefined;
+        const arg = try std.fmt.bufPrint(&buf, "--touch={s}", .{@tagName(source)});
+        try testing.expectEqual(source, (try parse(&.{arg})).touch);
+    }
+    try testing.expectError(Error.UnknownTouch, parse(&.{"--touch=maybe"}));
 }
 
 test "the device defaults to ALSA's own" {
