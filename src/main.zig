@@ -45,6 +45,12 @@ pub fn main(init: std.process.Init) !void {
             error.TooManyArguments => std.debug.print("takes at most one plant selection.\n\n", .{}),
             error.InvalidSelection => std.debug.print("PLANTS must be digits 1-3.\n\n", .{}),
             error.UnknownVoice => std.debug.print("--voice must be drone, flute or beep.\n\n", .{}),
+            error.UnknownTouch => std.debug.print("--touch must be always, script or motion.\n\n", .{}),
+            error.InvalidTrigger => std.debug.print(
+                "--trigger takes volts between 0 and {d:.1}, or nothing at all.\n\n",
+                .{ms.sensors.volts_max},
+            ),
+            error.InvalidDevice => std.debug.print("--device needs a name, at most 63 characters.\n\n", .{}),
             error.UnknownFlag => std.debug.print("unknown flag.\n\n", .{}),
             else => std.debug.print("could not read arguments: {s}\n\n", .{@errorName(err)}),
         }
@@ -112,12 +118,36 @@ pub fn main(init: std.process.Init) !void {
         // Voices add into the block, so it starts from silence each time.
         @memset(&block, 0);
 
-        const reading = sens.tick(ms.block_frames);
-        // Disabled plants read as untouched, so their voices simply never open.
-        const touch = ms.select.apply(sel, reading.touch);
-        voice_a.render(&block, reading.ecg_volts, touch[0]);
-        voice_b.render(&block, touch[1]);
-        voice_c.render(&block, touch[2]);
+        // The block is rendered in poll-sized pieces, each one driven by its
+        // own sensor reading, so the sound follows the plants at the sensor
+        // rate rather than the sound card's.
+        var ecg_volts: f32 = 0.0;
+        var touch: [ms.sensors.plant_count]bool = undefined;
+
+        var offset: usize = 0;
+        while (offset < block.len) : (offset += ms.sensor_frames) {
+            const piece = block[offset..][0..ms.sensor_frames];
+
+            const reading = sens.tick(ms.sensor_frames);
+            ecg_volts = reading.ecg_volts;
+            // Disabled plants read as untouched, so their voices never open.
+            touch = ms.select.apply(sel, reading.touch);
+
+            // Plant A's reading can hold the other two shut. Folded into their
+            // touch flags rather than wrapped around `render`: skipping the
+            // call would freeze a clip in place mid-word and resume it later,
+            // where this way the threshold is just another thing that has to be
+            // true for a clip to start, and a started clip still plays through.
+            if (opts.trigger_volts) |threshold| {
+                const open = ecg_volts >= threshold;
+                touch[1] = touch[1] and open;
+                touch[2] = touch[2] and open;
+            }
+
+            voice_a.render(piece, ecg_volts, touch[0]);
+            voice_b.render(piece, touch[1]);
+            voice_c.render(piece, touch[2]);
+        }
 
         ms.sink.toPcm(&block, &pcm);
         // Blocks until aplay wants more, which is what paces the whole program.
@@ -129,7 +159,9 @@ pub fn main(init: std.process.Init) !void {
         };
 
         rendered += ms.block_frames;
-        status.observe(io, reading, &block, rendered);
+        // The letters report what the voices were told, threshold included, so
+        // a line showing `A--` under `--trigger` is the gate doing its job.
+        status.observe(io, ecg_volts, touch, &block, rendered);
     }
 
     try out.finish();
@@ -204,7 +236,8 @@ const Status = struct {
     fn observe(
         self: *Status,
         io: std.Io,
-        reading: ms.sensors.Reading,
+        ecg_volts: f32,
+        touched: [ms.sensors.plant_count]bool,
         block: []const f32,
         rendered: usize,
     ) void {
@@ -224,13 +257,13 @@ const Status = struct {
 
         const letters = [ms.sensors.plant_count]u8{ 'A', 'B', 'C' };
         var touch: [ms.sensors.plant_count]u8 = undefined;
-        for (&touch, letters, reading.touch) |*out, letter, awake| {
+        for (&touch, letters, touched) |*out, letter, awake| {
             out.* = if (awake) letter else '-';
         }
 
         std.debug.print("t={d:.0}s ecg={d:.2}V touch={s} peak={d:.2} realtime=x{d:.2}\n", .{
             audio_s,
-            reading.ecg_volts,
+            ecg_volts,
             &touch,
             self.peak,
             // Guarded so a clock that has not moved yet reports nothing absurd.

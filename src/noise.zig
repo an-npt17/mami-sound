@@ -11,8 +11,8 @@ const sensors = @import("sensors.zig");
 
 /// Pitch range. `freq_max` is the first number to retune for a different room
 /// or smaller speakers.
-pub const freq_min: f32 = 120.0;
-pub const freq_max: f32 = 2000.0;
+pub const freq_min: f32 = 50.0;
+pub const freq_max: f32 = 300.0;
 
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
 /// ECG wiggles faster than this never reach the filter.

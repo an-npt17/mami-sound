@@ -5,14 +5,20 @@
 
 const std = @import("std");
 const select = @import("select.zig");
+const sensors = @import("sensors.zig");
 
 pub const Error = error{
     UnknownFlag,
     UnknownVoice,
     UnknownTouch,
     InvalidDevice,
+    InvalidTrigger,
     TooManyArguments,
 } || select.Error;
+
+/// Threshold `--trigger` means when given no number of its own: plant A pinned
+/// at the top of its range.
+pub const default_trigger: f32 = sensors.volts_max;
 
 /// What decides when a plant is awake.
 pub const Touch = enum {
@@ -46,6 +52,9 @@ pub const Options = struct {
     plants: select.Selection = select.all,
     voice: Voice = .drone,
     touch: Touch = .always,
+    /// Volts plant A must reach before plants B and C are allowed to sound.
+    /// `null` lets them sound whenever they are awake, as before.
+    trigger_volts: ?f32 = null,
     /// The device name is carried inline rather than as a slice into `args`, so
     /// `Options` outlives the arguments it was parsed from and the caller is
     /// free to drop them.
@@ -68,6 +77,15 @@ pub fn parse(args: []const []const u8) Error!Options {
         if (std.mem.startsWith(u8, arg, "--voice=")) {
             const name = arg["--voice=".len..];
             opts.voice = std.meta.stringToEnum(Voice, name) orelse return Error.UnknownVoice;
+        } else if (std.mem.eql(u8, arg, "--trigger")) {
+            opts.trigger_volts = default_trigger;
+        } else if (std.mem.startsWith(u8, arg, "--trigger=")) {
+            const volts = std.fmt.parseFloat(f32, arg["--trigger=".len..]) catch
+                return Error.InvalidTrigger;
+            // A threshold outside the sensor's range would either never fire or
+            // always fire, which is a typo rather than an intention.
+            if (!(volts >= 0.0) or volts > sensors.volts_max) return Error.InvalidTrigger;
+            opts.trigger_volts = volts;
         } else if (std.mem.startsWith(u8, arg, "--touch=")) {
             const name = arg["--touch=".len..];
             opts.touch = std.meta.stringToEnum(Touch, name) orelse return Error.UnknownTouch;
@@ -89,7 +107,7 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
-    \\                 [--device=NAME]
+    \\                 [--trigger[=VOLTS]] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
@@ -106,6 +124,12 @@ pub const usage =
     \\  script  the built-in timeline: A holds, B and C tap inside it
     \\  motion  one GPIO motion sensor per plant
     \\
+    \\--trigger holds plants B and C silent until plant A's ECG reaches VOLTS,
+    \\so the reading on one plant is what releases the other two. Given no
+    \\number it uses the top of the range, 3.3 V. Left out, B and C sound
+    \\whenever they are awake. Their clips are one-shots: crossing the
+    \\threshold starts one, and it plays through even if the reading falls.
+    \\
     \\The run ends on its own only under --touch=script. Otherwise it plays
     \\until stopped, as the installation does; B and C are one-shots, so they
     \\sound once at the start and plant A carries the rest.
@@ -121,6 +145,8 @@ pub const usage =
     \\  mami_sound 1 --voice=beep      plant A as a sine, no files needed
     \\  mami_sound --device=plughw:0,0 play through card 0 whatever else is set
     \\  mami_sound --touch=motion      wake the plants from the GPIO sensors
+    \\  mami_sound --trigger           B and C wait for plant A to read 3.3 V
+    \\  mami_sound --trigger=2.5       and the same at a lower threshold
     \\
 ;
 
@@ -159,6 +185,27 @@ test "every voice can be asked for by name" {
 
 test "rejects a voice that does not exist" {
     try testing.expectError(Error.UnknownVoice, parse(&.{"--voice=tuba"}));
+}
+
+test "no trigger unless asked for" {
+    try testing.expectEqual(@as(?f32, null), (try parse(&.{})).trigger_volts);
+}
+
+test "trigger takes the top of the range, or a number" {
+    try testing.expectEqual(
+        @as(?f32, default_trigger),
+        (try parse(&.{"--trigger"})).trigger_volts,
+    );
+    try testing.expectEqual(@as(?f32, 2.5), (try parse(&.{"--trigger=2.5"})).trigger_volts);
+    try testing.expectEqual(@as(?f32, 0.0), (try parse(&.{"--trigger=0"})).trigger_volts);
+}
+
+test "rejects a threshold the sensor could never mean" {
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=high"}));
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger="}));
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=-1"}));
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=5"}));
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=nan"}));
 }
 
 test "touch defaults to every plant awake" {

@@ -19,9 +19,25 @@ pub const cli = @import("cli.zig");
 pub const sample_rate: u32 = 44100;
 pub const channels: u32 = 1;
 
-/// ~11.6 ms per block. Sensors are polled once per block, which is far faster
-/// than the one-second pitch smoothing cares about.
+/// ~11.6 ms per block. This is the unit handed to `aplay`, so it sets how
+/// often the program talks to the sound card and nothing else.
 pub const block_frames: usize = 512;
+
+/// ~2.9 ms per poll: the sensors are read four times inside every block, and
+/// the voices are rendered in the same four pieces so each one hears its own
+/// reading.
+///
+/// Splitting them apart matters because the two rates want opposite things. A
+/// smaller block means more writes to the card for no gain, while a smaller
+/// poll means the ECG is followed closely enough that a touch or a spike is
+/// caught rather than averaged away. The floor is the I2C transaction itself,
+/// around half a millisecond on a 100 kHz bus.
+pub const sensor_frames: usize = 128;
+
+comptime {
+    // The render loop walks the block in whole polls.
+    std.debug.assert(block_frames % sensor_frames == 0);
+}
 
 test {
     _ = sensors;

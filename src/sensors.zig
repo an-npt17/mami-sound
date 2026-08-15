@@ -20,9 +20,11 @@ pub const volts_max: f32 = 3.3;
 const walk_min: f32 = 0.3;
 const walk_max: f32 = 3.0;
 
-/// Volts of drift per block. Small enough that audible pitch movement takes
-/// seconds, which is what the slow-envelope mapping wants.
-const walk_step: f32 = 0.05;
+/// Volts of drift per poll, at the engine's four polls per block. Small enough
+/// that audible pitch movement takes seconds, which is what the slow-envelope
+/// mapping wants; polling faster would otherwise make the simulated plant
+/// twitchier than the real one.
+const walk_step: f32 = 0.0125;
 
 pub const Reading = struct {
     ecg_volts: f32,

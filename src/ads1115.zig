@@ -68,8 +68,8 @@ pub const Gain = enum(u3) {
     }
 };
 
-/// Samples per second. Must stay at or above the block rate (~86 Hz for 512
-/// frames at 44.1 kHz) or the same conversion is read twice.
+/// Samples per second. Must stay at or above the rate the engine polls at, or
+/// the same conversion is read twice and the extra polls buy nothing.
 pub const Rate = enum(u3) {
     sps_8 = 0b000,
     sps_16 = 0b001,
@@ -90,10 +90,15 @@ pub const Rate = enum(u3) {
 /// healthy plant reads the same. +/-4.096 V is the smallest range that clears
 /// 3.3 V. A differential probe wants `.ain0_ain1` back, and a mapping in
 /// `sensors.zig` that expects negative volts.
+/// The rate is the fastest the chip offers, which is the only setting that
+/// keeps up with a poll every 2.9 ms: at 128 SPS a reading can be 7.8 ms stale
+/// and most polls see the same number twice. The cost is noise — the effective
+/// resolution at 860 SPS is a few counts worse than at 8 — and that lands well
+/// under the voices' one-second pitch smoothing.
 pub const Config = struct {
     mux: Mux = .ain0_gnd,
     gain: Gain = .fs_4_096v,
-    rate: Rate = .sps_128,
+    rate: Rate = .sps_860,
 };
 
 /// The 16-bit config register value: continuous conversion, comparator off.
@@ -176,23 +181,24 @@ test "config word matches the reference C driver" {
     // AIN0-AIN1, +/-2.048 V, continuous, 128 SPS: 0x84, 0x83.
     try testing.expectEqual(
         @as(u16, 0x8483),
-        configWord(.{ .mux = .ain0_ain1, .gain = .fs_2_048v }),
+        configWord(.{ .mux = .ain0_ain1, .gain = .fs_2_048v, .rate = .sps_128 }),
     );
 }
 
-test "the default config is single-ended and covers the supply" {
-    // AIN0 against ground, +/-4.096 V, continuous, 128 SPS.
-    try testing.expectEqual(@as(u16, 0xC283), configWord(.{}));
+test "the default config is single-ended, covers the supply and runs fast" {
+    // AIN0 against ground, +/-4.096 V, continuous, 860 SPS.
+    try testing.expectEqual(@as(u16, 0xC2E3), configWord(.{}));
     const defaults: Config = .{};
     try testing.expect(defaults.gain.fullScale() > 3.3);
+    try testing.expectEqual(Rate.sps_860, defaults.rate);
 }
 
 test "config word tracks each field" {
     try testing.expectEqual(
-        @as(u16, 0xC683),
+        @as(u16, 0xC6E3),
         configWord(.{ .mux = .ain0_gnd, .gain = .fs_1_024v }),
     );
-    try testing.expectEqual(@as(u16, 0xC2E3), configWord(.{ .rate = .sps_860 }));
+    try testing.expectEqual(@as(u16, 0xC203), configWord(.{ .rate = .sps_8 }));
 }
 
 test "raw readings scale to volts" {
