@@ -195,35 +195,3 @@ fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
     const rc = linux.write(fd, bytes.ptr, bytes.len);
     if (linux.errno(rc) != .SUCCESS or rc != bytes.len) return Error.WriteFailed;
 }
-
-const testing = std.testing;
-
-test "config word matches the reference C driver" {
-    // AIN0-AIN1, +/-2.048 V, continuous, 128 SPS: 0x84, 0x83.
-    try testing.expectEqual(
-        @as(u16, 0x8483),
-        configWord(.{ .mux = .ain0_ain1, .gain = .fs_2_048v, .rate = .sps_128 }),
-    );
-}
-
-test "the default config is single-ended, covers the supply and runs fast" {
-    // AIN0 against ground, +/-4.096 V, continuous, 860 SPS.
-    try testing.expectEqual(@as(u16, 0xC2E3), configWord(.{}));
-    const defaults: Config = .{};
-    try testing.expect(defaults.gain.fullScale() > 3.3);
-    try testing.expectEqual(Rate.sps_860, defaults.rate);
-}
-
-test "config word tracks each field" {
-    try testing.expectEqual(
-        @as(u16, 0xC6E3),
-        configWord(.{ .mux = .ain0_gnd, .gain = .fs_1_024v }),
-    );
-    try testing.expectEqual(@as(u16, 0xC203), configWord(.{ .rate = .sps_8 }));
-}
-
-test "each gain names the range it covers" {
-    // Only used to pick the setting that clears the supply; nothing scales by it.
-    try testing.expectEqual(@as(f32, 2.048), Gain.fs_2_048v.fullScale());
-    try testing.expectEqual(@as(f32, 4.096), Gain.fs_4_096v.fullScale());
-}

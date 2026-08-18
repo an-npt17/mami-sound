@@ -36,6 +36,47 @@ pub fn isAudio(name: []const u8) bool {
     return false;
 }
 
+/// Every clip in `dir_path`, in whatever order the directory gives them. Caller
+/// owns the paths and the slice holding them; `freeList` returns both.
+///
+/// The whole folder is loaded because a touch has to start a clip *now* —
+/// decoding one on demand means shelling out to ffmpeg for seconds while the
+/// sound card starves. Folders are therefore sized by what a machine can hold:
+/// see the total this prints at start up.
+pub fn list(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+) ![][]u8 {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (paths.items) |path| gpa.free(path);
+        paths.deinit(gpa);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        switch (entry.kind) {
+            .file, .sym_link => {},
+            else => continue,
+        }
+        if (!isAudio(entry.name)) continue;
+        // The entry's name is only valid until the next step, so join now.
+        try paths.append(gpa, try std.fs.path.join(gpa, &.{ dir_path, entry.name }));
+    }
+
+    if (paths.items.len == 0) return Error.NoAudioFiles;
+    return paths.toOwnedSlice(gpa);
+}
+
+pub fn freeList(gpa: std.mem.Allocator, paths: [][]u8) void {
+    for (paths) |path| gpa.free(path);
+    gpa.free(paths);
+}
+
 /// The path of one clip from `dir_path`, chosen uniformly at random. Caller
 /// owns the returned slice.
 pub fn pick(

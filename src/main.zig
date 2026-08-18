@@ -54,6 +54,14 @@ pub fn main(init: std.process.Init) !void {
                 "--trigger takes a whole number between 0 and {d}, or nothing at all.\n\n",
                 .{ms.sensors.ecg_max},
             ),
+            error.InvalidInterrupt => std.debug.print(
+                "--interrupt takes seconds between 0 and 3600.\n\n",
+                .{},
+            ),
+            error.InvalidTriggerAverage => std.debug.print(
+                "--trigger-average takes milliseconds between 0 and 3000.\n\n",
+                .{},
+            ),
             error.InvalidTriggerHold => std.debug.print(
                 "--trigger-hold takes milliseconds between 0 and 5000.\n\n",
                 .{},
@@ -67,17 +75,18 @@ pub fn main(init: std.process.Init) !void {
     };
     const sel = opts.plants;
 
-    // A plant that is not playing does not need its clip, so a run of `1` works
-    // on a machine with no audio files and no ffmpeg.
     // The engine's own `seed` is fixed so a run sounds identical; which clips a
-    // run draws is the one thing that should not be.
+    // touch draws is the one thing that should not be.
     var shuffle = std.Random.DefaultPrng.init(shuffleSeed(io));
     const draw = shuffle.random();
 
-    const clip_b: []const f32 = if (sel[1]) try loadFrom(gpa, io, clip_b_dir, draw) else &.{};
-    defer if (clip_b.len != 0) gpa.free(clip_b);
-    const clip_c: []const f32 = if (sel[2]) try loadFrom(gpa, io, clip_c_dir, draw) else &.{};
-    defer if (clip_c.len != 0) gpa.free(clip_c);
+    // A plant that is not playing needs no clips, so a run of `1` works on a
+    // machine with no audio folders and no ffmpeg.
+    var folder_b: Folder = if (sel[1]) try loadFolder(gpa, io, clip_b_dir) else .empty;
+    defer folder_b.deinit(gpa);
+    var folder_c: Folder = if (sel[2]) try loadFolder(gpa, io, clip_c_dir) else .empty;
+    defer folder_c.deinit(gpa);
+    const folders = [_]*const Folder{ &folder_b, &folder_c };
 
     // Likewise the flute set: twelve files to decode, and only when both the
     // flute voice was asked for and plant A is actually playing.
@@ -110,20 +119,22 @@ pub fn main(init: std.process.Init) !void {
         .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed) },
     };
     // B and C answer one probe between them, so they are one voice with two
-    // clips rather than two voices that happen to share a threshold.
+    // folders rather than two voices that happen to share a threshold.
     var voices_bc = ms.player.Sequence.init(
-        .{ clip_b, clip_c },
-        .{ sel[1], sel[2] },
+        .{ folder_b.clips, folder_c.clips },
+        ms.sample_rate,
+        @as(u64, @intFromFloat(opts.interrupt_s * @as(f32, @floatFromInt(ms.sample_rate)))),
+        draw,
     );
 
     // The threshold, debounced. A reading is a vote rather than a decision:
     // see `trigger.zig` for why one poll of it cannot be trusted.
     var gate: ?ms.trigger.Trigger = if (opts.trigger_level) |level|
-        ms.trigger.Trigger.init(level, ms.trigger.holdPolls(
-            opts.trigger_hold_ms,
-            ms.sample_rate,
-            ms.sensor_frames,
-        ))
+        ms.trigger.Trigger.init(
+            level,
+            ms.trigger.holdPolls(opts.trigger_hold_ms, ms.sample_rate, ms.sensor_frames),
+            ms.trigger.holdPolls(opts.trigger_average_ms, ms.sample_rate, ms.sensor_frames),
+        )
     else
         null;
 
@@ -180,21 +191,19 @@ pub fn main(init: std.process.Init) !void {
             // Plant A hears its own probe, and only that one.
             voice_a.render(piece, ecg_a, touch[0]);
 
-            // The threshold is tested here, every poll, 344 times a second. The
-            // status line below prints once a second, so a reading that crosses
-            // for a few milliseconds starts a clip and is gone before the next
-            // line — which looks exactly like a clip starting on its own. Say
-            // so at the moment it happens, with the number that did it.
-            const was_idle = !voices_bc.isPlaying();
+            // The threshold is tested here, every poll, 344 times a second,
+            // while the status line below prints once a second. A reading that
+            // crosses for a few milliseconds starts a clip and is gone before
+            // the next line, which looks exactly like a clip starting on its
+            // own. Say so at the moment it happens, with the number that did
+            // it and the recording it drew.
+            //
+            // Counted rather than watched for idle-to-playing: an interrupt
+            // replaces one clip with another inside a single block, and never
+            // passes through idle at all.
+            const before = voices_bc.starts;
             voices_bc.render(piece, open);
-            if (was_idle) {
-                if (voices_bc.playingIndex()) |started| {
-                    std.debug.print("clip {c} started: a1={d}\n", .{
-                        @as(u8, 'B') + @as(u8, @intCast(started)),
-                        ecg_bc,
-                    });
-                }
-            }
+            if (voices_bc.starts != before) reportStart(&voices_bc, folders, ecg_bc);
 
             // Report the clip that is actually sounding, not the pair's gate:
             // under a sequence only one of them can be audible at a time.
@@ -394,16 +403,53 @@ fn shuffleSeed(io: std.Io) u64 {
     return @truncate(@as(u96, @bitCast(ns)));
 }
 
-/// Pick a clip out of `dir` and decode it, saying which one it landed on: an
-/// operator who hears something unexpected needs to know what is playing, and
-/// the choice is different every run.
-fn loadFrom(
+/// One plant's folder: the decoded clips, and the names to call them by.
+const Folder = struct {
+    clips: []const []const f32,
+    /// Held past loading only so a clip can be named when it starts.
+    names: [][]u8,
+
+    const empty: Folder = .{ .clips = &.{}, .names = &.{} };
+
+    fn deinit(self: *Folder, gpa: std.mem.Allocator) void {
+        for (self.clips) |clip| gpa.free(clip);
+        if (self.clips.len != 0) gpa.free(self.clips);
+        if (self.names.len != 0) ms.library.freeList(gpa, self.names);
+        self.* = .empty;
+    }
+};
+
+/// Say which recording just started and what let it in. An operator hearing
+/// something unexpected needs the name, and the reading tells them whether the
+/// threshold is doing its job or noise is.
+fn reportStart(
+    seq: *const ms.player.Sequence,
+    folders: [ms.player.Sequence.count]*const Folder,
+    reading: i16,
+) void {
+    const slot = seq.playingIndex() orelse return;
+    const clip = seq.playingClip() orelse return;
+    const names = folders[slot].names;
+    if (clip >= names.len) return;
+    std.debug.print("clip {c}: {s}  (a1={d})\n", .{
+        @as(u8, 'B') + @as(u8, @intCast(slot)),
+        names[clip],
+        reading,
+    });
+}
+
+/// Decode every clip in `dir`, listing them and what they cost.
+///
+/// A touch has to start a clip at once, and decoding one takes ffmpeg seconds,
+/// so the whole folder is held in memory and drawn from. The total is printed
+/// because that is the number which decides how many recordings a machine can
+/// carry: roughly 10 MB per minute of audio.
+fn loadFolder(
     gpa: std.mem.Allocator,
     io: std.Io,
     dir: []const u8,
-    draw: std.Random,
-) ![]f32 {
-    const path = ms.library.pick(gpa, io, dir, draw) catch |err| {
+) !Folder {
+    const paths = ms.library.list(gpa, io, dir) catch |err| {
         switch (err) {
             ms.library.Error.NoAudioFiles => std.debug.print(
                 \\no audio files in ./{s}/
@@ -421,10 +467,31 @@ fn loadFrom(
         // as a bad flag: it has been explained, so leave without a stack trace.
         std.process.exit(1);
     };
-    defer gpa.free(path);
+    errdefer ms.library.freeList(gpa, paths);
 
-    std.debug.print("playing {s}\n", .{path});
-    return loadClip(gpa, io, path);
+    const pool = try gpa.alloc([]const f32, paths.len);
+    var done: usize = 0;
+    errdefer {
+        for (pool[0..done]) |clip| gpa.free(clip);
+        gpa.free(pool);
+    }
+
+    var frames: usize = 0;
+    for (paths, pool) |path, *slot| {
+        slot.* = try loadClip(gpa, io, path);
+        frames += slot.len;
+        done += 1;
+        std.debug.print("  {s}\n", .{path});
+    }
+
+    const seconds = @as(f64, @floatFromInt(frames)) / @as(f64, @floatFromInt(ms.sample_rate));
+    std.debug.print("{s}: {d} clips, {d:.0}s, {d:.0} MB\n", .{
+        dir,
+        pool.len,
+        seconds,
+        @as(f64, @floatFromInt(frames * @sizeOf(f32))) / (1024.0 * 1024.0),
+    });
+    return .{ .clips = pool, .names = paths };
 }
 
 fn loadClip(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]f32 {

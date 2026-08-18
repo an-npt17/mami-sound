@@ -15,12 +15,19 @@ pub const Error = error{
     InvalidDevice,
     InvalidTrigger,
     InvalidTriggerHold,
+    InvalidTriggerAverage,
+    InvalidInterrupt,
     TooManyArguments,
 } || select.Error;
 
 /// Threshold `--trigger` means when given no number of its own: the AIN1 probe
 /// pinned at the top of its range.
 pub const default_trigger: i16 = sensors.ecg_max;
+
+/// How long a clip plays before a touch is allowed to cut it short. Long
+/// enough that a visitor hears what they started, short enough that they are
+/// not held there by a recording they have finished with.
+pub const default_interrupt_s: f32 = 10.0;
 
 /// What decides when a plant is awake.
 pub const Touch = enum {
@@ -61,6 +68,12 @@ pub const Options = struct {
     /// a touch, in milliseconds. Guards against a single noisy sample starting
     /// a clip that runs for minutes.
     trigger_hold_ms: f32 = trigger.default_hold_ms,
+    /// How long the reading is averaged over before the threshold sees it.
+    /// What turns a probe swinging about ground into a level.
+    trigger_average_ms: f32 = trigger.default_window_ms,
+    /// How long a clip must have been playing before a fresh touch may cut it
+    /// short and draw another, in seconds. Zero lets every clip finish.
+    interrupt_s: f32 = default_interrupt_s,
     /// The device name is carried inline rather than as a slice into `args`, so
     /// `Options` outlives the arguments it was parsed from and the caller is
     /// free to drop them.
@@ -101,6 +114,19 @@ pub fn parse(args: []const []const u8) Error!Options {
             // on purpose; NaN fails the first test.
             if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTriggerHold;
             opts.trigger_hold_ms = held;
+        } else if (std.mem.startsWith(u8, arg, "--trigger-average=")) {
+            const window = std.fmt.parseFloat(f32, arg["--trigger-average=".len..]) catch
+                return Error.InvalidTriggerAverage;
+            // Past a few seconds the average stops tracking a touch at all.
+            if (!(window >= 0.0) or window > 3000.0) return Error.InvalidTriggerAverage;
+            opts.trigger_average_ms = window;
+        } else if (std.mem.startsWith(u8, arg, "--interrupt=")) {
+            const after = std.fmt.parseFloat(f32, arg["--interrupt=".len..]) catch
+                return Error.InvalidInterrupt;
+            // An hour is longer than any clip in the folders, so anything past
+            // it is a typo rather than "never" — which is what 0 is for.
+            if (!(after >= 0.0) or after > 3600.0) return Error.InvalidInterrupt;
+            opts.interrupt_s = after;
         } else if (std.mem.startsWith(u8, arg, "--touch=")) {
             const name = arg["--touch=".len..];
             opts.touch = std.meta.stringToEnum(Touch, name) orelse return Error.UnknownTouch;
@@ -122,7 +148,8 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
-    \\                 [--trigger[=LEVEL]] [--trigger-hold=MS] [--device=NAME]
+    \\                 [--trigger[=LEVEL]] [--trigger-hold=MS] [--trigger-average=MS]
+    \\                 [--interrupt=SECONDS] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
@@ -153,6 +180,12 @@ pub const usage =
     \\no number it uses the top of that range. Left out, B and C sound whenever
     \\they are awake.
     \\
+    \\--interrupt is how long a clip must have been playing before a fresh
+    \\touch cuts it short and draws another, 10 seconds by default. Below that
+    \\a touch is ignored, so the clip a visitor started is theirs to hear; past
+    \\it the clip fades out and the next turn begins at once. Pass 0 to let
+    \\every clip play to its end.
+    \\
     \\B and C share that one probe, so they take turns, one clip per touch:
     \\crossing the threshold plays the interview, and when it ends nothing
     \\sounds until the next crossing, which plays the waterfall. Then the
@@ -165,7 +198,14 @@ pub const usage =
     \\motion sensors are not consulted, since the threshold is what a touch
     \\means. Without --trigger they go back to sounding when they are awake.
     \\
-    \\--trigger-hold is how long the reading must stay over LEVEL before it
+    \\--trigger-average is how long the reading is averaged over before LEVEL
+    \\sees it, 200 ms by default. A probe swings about ground and its negative
+    \\half reads as zero, so the raw samples are half nothing and half peaks;
+    \\their average is a level, and that is what LEVEL should be set against.
+    \\Pass 0 to compare raw samples instead.
+    \\
+    \\--trigger-hold is how long the averaged reading must then stay over LEVEL
+    \\before it counts
     \\counts, 100 ms by default. The threshold is tested 344 times a second, so
     \\without this a single noisy sample — mains hum, a brushed pot, static —
     \\starts a clip that then runs for minutes. Raise it if clips start on
