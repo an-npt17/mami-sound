@@ -15,6 +15,8 @@ pub const select = @import("select.zig");
 pub const sampler = @import("sampler.zig");
 pub const tone = @import("tone.zig");
 pub const cli = @import("cli.zig");
+pub const trigger = @import("trigger.zig");
+pub const library = @import("library.zig");
 
 pub const sample_rate: u32 = 44100;
 pub const channels: u32 = 1;
@@ -37,6 +39,12 @@ pub const sensor_frames: usize = 128;
 comptime {
     // The render loop walks the block in whole polls.
     std.debug.assert(block_frames % sensor_frames == 0);
+    // The polls inside a block happen back to back — the whole block is
+    // rendered in tens of microseconds and the sink blocks for the rest of it —
+    // so the only wall-clock gap the ADC can count on is a block boundary.
+    // `sensors.switch_frames` is what holds the multiplexer still until one
+    // arrives, and it is worth nothing if it is shorter than a block.
+    std.debug.assert(sensors.switch_frames >= block_frames);
 }
 
 test {
@@ -51,6 +59,8 @@ test {
     _ = sampler;
     _ = tone;
     _ = cli;
+    _ = trigger;
+    _ = library;
 }
 
 const testing = std.testing;
@@ -85,7 +95,7 @@ fn peakOf(touch: [3]bool, blocks: usize) !f32 {
 
     for (0..blocks) |_| {
         @memset(&block, 0);
-        voice_a.render(&block, 1.65, touch[0]);
+        voice_a.render(&block, 16500, touch[0]);
         voice_b.render(&block, touch[1]);
         voice_c.render(&block, touch[2]);
         for (block) |s| peak = @max(peak, @abs(s));

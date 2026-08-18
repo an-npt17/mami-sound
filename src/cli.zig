@@ -6,7 +6,7 @@
 const std = @import("std");
 const select = @import("select.zig");
 const sensors = @import("sensors.zig");
-const ads1115 = @import("ads1115.zig");
+const trigger = @import("trigger.zig");
 
 pub const Error = error{
     UnknownFlag,
@@ -14,37 +14,13 @@ pub const Error = error{
     UnknownTouch,
     InvalidDevice,
     InvalidTrigger,
-    UnknownAdcInput,
+    InvalidTriggerHold,
     TooManyArguments,
 } || select.Error;
 
-/// The names `--adc` accepts, in the order the ADS1115 datasheet lists them:
-/// `a0` and friends read one pin against ground, `a0-a1` reads the difference
-/// between two. Spelled shorter than the `Mux` tags, which carry the register
-/// layout in their names and are no fun to type at a prompt.
-const adc_inputs = [_]struct { name: []const u8, mux: ads1115.Mux }{
-    .{ .name = "a0", .mux = .ain0_gnd },
-    .{ .name = "a1", .mux = .ain1_gnd },
-    .{ .name = "a2", .mux = .ain2_gnd },
-    .{ .name = "a3", .mux = .ain3_gnd },
-    .{ .name = "a0-a1", .mux = .ain0_ain1 },
-    .{ .name = "a0-a3", .mux = .ain0_ain3 },
-    .{ .name = "a1-a3", .mux = .ain1_ain3 },
-    .{ .name = "a2-a3", .mux = .ain2_ain3 },
-};
-
-/// The multiplexer setting for an `--adc` name, or null if there is no such
-/// input. Pure, so the table can be checked without a chip.
-pub fn adcInput(name: []const u8) ?ads1115.Mux {
-    for (adc_inputs) |entry| {
-        if (std.mem.eql(u8, entry.name, name)) return entry.mux;
-    }
-    return null;
-}
-
-/// Threshold `--trigger` means when given no number of its own: plant A pinned
-/// at the top of its range.
-pub const default_trigger: f32 = sensors.volts_max;
+/// Threshold `--trigger` means when given no number of its own: the AIN1 probe
+/// pinned at the top of its range.
+pub const default_trigger: i16 = sensors.ecg_max;
 
 /// What decides when a plant is awake.
 pub const Touch = enum {
@@ -78,11 +54,13 @@ pub const Options = struct {
     plants: select.Selection = select.all,
     voice: Voice = .drone,
     touch: Touch = .always,
-    /// Volts plant A must reach before plants B and C are allowed to sound.
-    /// `null` lets them sound whenever they are awake, as before.
-    trigger_volts: ?f32 = null,
-    /// Which ADS1115 input plant A's probe is wired to.
-    adc_input: ads1115.Mux = ads1115.Config.default_mux,
+    /// The reading the AIN1 probe must reach before plants B and C are allowed
+    /// to sound. `null` lets them sound whenever they are awake, as before.
+    trigger_level: ?i16 = null,
+    /// How long the reading has to stay over the threshold before it counts as
+    /// a touch, in milliseconds. Guards against a single noisy sample starting
+    /// a clip that runs for minutes.
+    trigger_hold_ms: f32 = trigger.default_hold_ms,
     /// The device name is carried inline rather than as a slice into `args`, so
     /// `Options` outlives the arguments it was parsed from and the caller is
     /// free to drop them.
@@ -105,17 +83,24 @@ pub fn parse(args: []const []const u8) Error!Options {
         if (std.mem.startsWith(u8, arg, "--voice=")) {
             const name = arg["--voice=".len..];
             opts.voice = std.meta.stringToEnum(Voice, name) orelse return Error.UnknownVoice;
-        } else if (std.mem.startsWith(u8, arg, "--adc=")) {
-            opts.adc_input = adcInput(arg["--adc=".len..]) orelse return Error.UnknownAdcInput;
         } else if (std.mem.eql(u8, arg, "--trigger")) {
-            opts.trigger_volts = default_trigger;
+            opts.trigger_level = default_trigger;
         } else if (std.mem.startsWith(u8, arg, "--trigger=")) {
-            const volts = std.fmt.parseFloat(f32, arg["--trigger=".len..]) catch
-                return Error.InvalidTrigger;
             // A threshold outside the sensor's range would either never fire or
-            // always fire, which is a typo rather than an intention.
-            if (!(volts >= 0.0) or volts > sensors.volts_max) return Error.InvalidTrigger;
-            opts.trigger_volts = volts;
+            // always fire, which is a typo rather than an intention. The top of
+            // the range is the largest `i16`, so the parse itself rejects
+            // anything above it and only the negative half is left to check.
+            const level = std.fmt.parseInt(i16, arg["--trigger=".len..], 10) catch
+                return Error.InvalidTrigger;
+            if (level < 0) return Error.InvalidTrigger;
+            opts.trigger_level = level;
+        } else if (std.mem.startsWith(u8, arg, "--trigger-hold=")) {
+            const held = std.fmt.parseFloat(f32, arg["--trigger-hold=".len..]) catch
+                return Error.InvalidTriggerHold;
+            // A hold longer than a few seconds is a threshold nobody can cross
+            // on purpose; NaN fails the first test.
+            if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTriggerHold;
+            opts.trigger_hold_ms = held;
         } else if (std.mem.startsWith(u8, arg, "--touch=")) {
             const name = arg["--touch=".len..];
             opts.touch = std.meta.stringToEnum(Touch, name) orelse return Error.UnknownTouch;
@@ -137,40 +122,66 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
-    \\                 [--trigger[=VOLTS]] [--adc=INPUT] [--device=NAME]
+    \\                 [--trigger[=LEVEL]] [--trigger-hold=MS] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
-    \\  2  plant B, the interview clip
-    \\  3  plant C, the waterfall clip
+    \\  2  plant B, an interview
+    \\  3  plant C, a field recording
     \\
-    \\--voice selects what plant A sounds like:
-    \\  drone  filtered noise, pitch following the ECG (default)
-    \\  flute  recorded flute notes, replayed at the ECG's pitch
-    \\  beep   a bare synthesized sine at the ECG's pitch
+    \\B and C draw one clip each from ./interview files/ and ./field records/,
+    \\chosen at random when the program starts, so a run is a different pair
+    \\from the last one. Drop a recording into a folder to put it in the
+    \\rotation; mp3, wav, ogg and flac are all read. The name of what was
+    \\drawn is printed at start up.
+    \\
+    \\--voice selects what plant A sounds like. All three take their pitch from
+    \\the probe on AIN0, and nothing else does:
+    \\  drone  filtered noise, pitch following the probe (default)
+    \\  flute  recorded flute notes, replayed at the probe's pitch
+    \\  beep   a bare synthesized sine at the probe's pitch
     \\
     \\--touch decides when a plant is awake and sounding:
     \\  always  every plant, from the first block on (default)
     \\  script  the built-in timeline: A holds, B and C tap inside it
     \\  motion  one GPIO motion sensor per plant
     \\
-    \\--trigger holds plants B and C silent until plant A's ECG reaches VOLTS,
-    \\so the reading on one plant is what releases the other two. Given no
-    \\number it uses the top of the range, 3.3 V. Left out, B and C sound
-    \\whenever they are awake. Their clips are one-shots: crossing the
-    \\threshold starts one, and it plays through even if the reading falls.
+    \\--trigger holds plants B and C silent until the probe on AIN1 reaches
+    \\LEVEL, so a second probe is what releases their clips. That is the only
+    \\thing this probe does, and plant A's probe on AIN0 has no say in it.
+    \\LEVEL is the ADC's own number, 0 at ground and 32767 at full scale; given
+    \\no number it uses the top of that range. Left out, B and C sound whenever
+    \\they are awake.
+    \\
+    \\B and C share that one probe, so they take turns, one clip per touch:
+    \\crossing the threshold plays the interview, and when it ends nothing
+    \\sounds until the next crossing, which plays the waterfall. Then the
+    \\interview again, and so on. A clip plays through even if the reading
+    \\falls away, and a crossing while one is playing is ignored rather than
+    \\queued. A plant left out of PLANTS never takes a turn, so `13` plays the
+    \\waterfall on every touch.
+    \\
+    \\Under --trigger the probe is the only thing that starts B and C: their
+    \\motion sensors are not consulted, since the threshold is what a touch
+    \\means. Without --trigger they go back to sounding when they are awake.
+    \\
+    \\--trigger-hold is how long the reading must stay over LEVEL before it
+    \\counts, 100 ms by default. The threshold is tested 344 times a second, so
+    \\without this a single noisy sample — mains hum, a brushed pot, static —
+    \\starts a clip that then runs for minutes. Raise it if clips start on
+    \\their own, lower it if a real touch feels slow to answer. It needs the
+    \\reading to be over LEVEL more often than under it, so a probe that only
+    \\peaks over the line will not trigger however long it is held; that is a
+    \\LEVEL set too high, not a hold set too short.
     \\
     \\The run ends on its own only under --touch=script. Otherwise it plays
     \\until stopped, as the installation does; B and C are one-shots, so they
     \\sound once at the start and plant A carries the rest.
     \\
-    \\--adc is the ADS1115 input plant A's probe is wired to, a0 by default:
-    \\  a0 a1 a2 a3      one pin read against ground
-    \\  a0-a1 a0-a3      the difference between two pins, and likewise
-    \\  a1-a3 a2-a3      for the other pairs the chip can measure
-    \\Only these eight exist; the chip has four pins and one multiplexer, so
-    \\it measures one of them at a time. A differential input swings negative,
-    \\which the engine reads as zero.
+    \\Both probes are read against ground on one ADS1115, plant A's on AIN0 and
+    \\the trigger probe on AIN1. Which pin is which is wiring, not a flag. The
+    \\chip has one converter, so it is switched between the two once a block and
+    \\each is sampled every other block. A probe below ground reads as zero.
     \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
@@ -183,9 +194,10 @@ pub const usage =
     \\  mami_sound 1 --voice=beep      plant A as a sine, no files needed
     \\  mami_sound --device=plughw:0,0 play through card 0 whatever else is set
     \\  mami_sound --touch=motion      wake the plants from the GPIO sensors
-    \\  mami_sound --trigger           B and C wait for plant A to read 3.3 V
-    \\  mami_sound --trigger=2.5       and the same at a lower threshold
-    \\  mami_sound --adc=a2            read the probe on AIN2 instead of AIN0
+    \\  mami_sound --trigger           B then C, once AIN1 reads 32767
+    \\  mami_sound --trigger=25000     and the same at a lower threshold
+    \\  mami_sound --trigger=25000 --trigger-hold=250
+    \\                                 and only if it stays there a quarter second
     \\
 ;
 
@@ -226,47 +238,34 @@ test "rejects a voice that does not exist" {
     try testing.expectError(Error.UnknownVoice, parse(&.{"--voice=tuba"}));
 }
 
-test "the adc input defaults to AIN0 against ground" {
-    try testing.expectEqual(ads1115.Mux.ain0_gnd, (try parse(&.{})).adc_input);
-}
-
-test "every input the chip has can be asked for" {
-    try testing.expectEqual(ads1115.Mux.ain2_gnd, (try parse(&.{"--adc=a2"})).adc_input);
-    try testing.expectEqual(ads1115.Mux.ain0_ain1, (try parse(&.{"--adc=a0-a1"})).adc_input);
-    try testing.expectEqual(ads1115.Mux.ain2_ain3, (try parse(&.{"--adc=a2-a3"})).adc_input);
-
-    // The table covers the multiplexer exactly: eight names, eight settings.
-    var seen = std.enums.EnumSet(ads1115.Mux).initEmpty();
-    for (adc_inputs) |entry| seen.insert(entry.mux);
-    try testing.expectEqual(std.enums.values(ads1115.Mux).len, seen.count());
-}
-
-test "rejects a pin pairing the chip cannot measure" {
-    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc=a4"}));
-    // Real pins, but not a pair the multiplexer offers.
-    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc=a1-a2"}));
-    try testing.expectError(Error.UnknownAdcInput, parse(&.{"--adc="}));
+test "the inputs are wired, not chosen" {
+    // Each probe has a job that names its pin, so there is no flag to move them
+    // with: `--adc=a1` would have pointed plant A's voice at the probe whose
+    // whole purpose is gating B and C.
+    try testing.expectError(Error.UnknownFlag, parse(&.{"--adc=a2"}));
 }
 
 test "no trigger unless asked for" {
-    try testing.expectEqual(@as(?f32, null), (try parse(&.{})).trigger_volts);
+    try testing.expectEqual(@as(?i16, null), (try parse(&.{})).trigger_level);
 }
 
 test "trigger takes the top of the range, or a number" {
     try testing.expectEqual(
-        @as(?f32, default_trigger),
-        (try parse(&.{"--trigger"})).trigger_volts,
+        @as(?i16, default_trigger),
+        (try parse(&.{"--trigger"})).trigger_level,
     );
-    try testing.expectEqual(@as(?f32, 2.5), (try parse(&.{"--trigger=2.5"})).trigger_volts);
-    try testing.expectEqual(@as(?f32, 0.0), (try parse(&.{"--trigger=0"})).trigger_volts);
+    try testing.expectEqual(@as(?i16, 25000), (try parse(&.{"--trigger=25000"})).trigger_level);
+    try testing.expectEqual(@as(?i16, 0), (try parse(&.{"--trigger=0"})).trigger_level);
 }
 
 test "rejects a threshold the sensor could never mean" {
     try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=high"}));
     try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger="}));
     try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=-1"}));
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=5"}));
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=nan"}));
+    // Above full scale, so it would never fire.
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=40000"}));
+    // A count is a whole number; there is nothing between two of them.
+    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=2.5"}));
 }
 
 test "touch defaults to every plant awake" {
@@ -311,4 +310,28 @@ test "rejects two plant selections" {
 
 test "bad plant digits still fail" {
     try testing.expectError(select.Error.InvalidSelection, parse(&.{"5"}));
+}
+
+test "the trigger hold defaults to something that rejects a lone sample" {
+    try testing.expectEqual(trigger.default_hold_ms, (try parse(&.{})).trigger_hold_ms);
+    // Long enough to span many polls, so one noisy reading cannot decide.
+    try testing.expect(trigger.holdPolls(
+        (try parse(&.{})).trigger_hold_ms,
+        44100,
+        128,
+    ) > 10);
+}
+
+test "the trigger hold can be tuned on site" {
+    try testing.expectEqual(@as(f32, 250.0), (try parse(&.{"--trigger-hold=250"})).trigger_hold_ms);
+    try testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--trigger-hold=0"})).trigger_hold_ms);
+}
+
+test "rejects a hold that is not a length of time" {
+    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=soon"}));
+    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold="}));
+    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=-1"}));
+    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=nan"}));
+    // Nobody holds a plant for six seconds to start a clip.
+    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=6000"}));
 }

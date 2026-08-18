@@ -8,6 +8,24 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
+
+/// How much audio each queue between the mixer and the speaker may hold.
+///
+/// Both default to far more than this piece wants. The kernel gives a pipe
+/// 64 KiB, which is 0.74 s of mono audio at 44100 Hz, and `aplay` asks ALSA for
+/// a 500 ms buffer. They stack, and `write` only blocks once both are full, so
+/// the steady state is both of them full: left alone, a touch is heard about
+/// 1.2 s after it happens. That is an installation where the plants seem not to
+/// respond, and no amount of polling the sensors faster can fix it.
+///
+/// These are the numbers to raise if the sound breaks up. A Zero 2 W that
+/// misses a 93 ms deadline clicks, where a half-second buffer would have ridden
+/// over the same stall — and the trade is one for one, every millisecond of
+/// safety is a millisecond of delay.
+const buffer_frames = 4096;
+const period_frames = 512;
+const pipe_frames = 4096;
 
 comptime {
     // `aplay -f S16_LE` reads little-endian samples, and `write` hands it the
@@ -27,6 +45,21 @@ pub fn toPcm(block: []const f32, out: []i16) void {
     }
 }
 
+/// Shrink the pipe to `bytes`, so `aplay` cannot be handed more audio than it
+/// is about to play.
+///
+/// `F_SETPIPE_SZ` is the only way to reach this queue: nothing about how the
+/// writes are made changes how much the kernel is willing to hold, so a writer
+/// that stays ahead will always sit on a full 64 KiB otherwise.
+///
+/// A failure is left alone rather than reported. The kernel rounds the request
+/// up to a page and refuses to go under one, so the worst case is a machine
+/// with unusual pages keeping more audio in flight than asked — more latency,
+/// never a broken stream.
+fn shrinkPipe(fd: linux.fd_t, bytes: usize) void {
+    _ = linux.fcntl(fd, linux.F.SETPIPE_SZ, bytes);
+}
+
 pub const Sink = struct {
     io: std.Io,
     child: std.process.Child,
@@ -38,6 +71,9 @@ pub const Sink = struct {
     /// machine's ALSA configuration points at, which on a board with a USB or
     /// I2S card added is often not the card wanted; naming it, as in
     /// `plughw:0,0`, settles it.
+    ///
+    /// The period is one engine block, so a block handed over is a block the
+    /// card is about to play.
     pub fn init(
         io: std.Io,
         device: []const u8,
@@ -56,10 +92,21 @@ pub const Sink = struct {
                 std.fmt.comptimePrint("{d}", .{sample_rate}),
                 "-c",
                 std.fmt.comptimePrint("{d}", .{channels}),
+                "--period-size",
+                std.fmt.comptimePrint("{d}", .{period_frames}),
+                "--buffer-size",
+                std.fmt.comptimePrint("{d}", .{buffer_frames}),
                 "-",
             },
             .stdin = .pipe,
         });
+
+        // Shrinking `aplay`'s own buffer is only half of it: the pipe in front
+        // of it is a queue too, and the larger one by default.
+        const pipe_bytes = pipe_frames * @sizeOf(i16) * channels;
+        comptime std.debug.assert(pipe_bytes >= 4096); // the kernel's own floor
+        if (child.stdin) |stdin| shrinkPipe(stdin.handle, pipe_bytes);
+
         return .{ .io = io, .child = child };
     }
 
@@ -77,3 +124,28 @@ pub const Sink = struct {
         _ = try self.child.wait(self.io);
     }
 };
+
+const testing = std.testing;
+
+/// Milliseconds of audio `frames` is, at the rate the engine runs at.
+fn millis(frames: u32) f32 {
+    return @as(f32, @floatFromInt(frames)) / 44100.0 * 1000.0;
+}
+
+test "the queues in front of the card stay inside a playable delay" {
+    // Both fill and stay full, so this sum is what a visitor waits between
+    // touching a plant and hearing it. Under ~200 ms a touch still reads as
+    // having caused the sound; the 1.2 s of stock defaults does not.
+    const total = millis(pipe_frames) + millis(buffer_frames);
+    try testing.expect(total < 250.0);
+
+    // Left at their defaults these are 32768 frames of pipe and 22050 of ALSA
+    // buffer. Guard the point of the exercise rather than the exact numbers.
+    try testing.expect(pipe_frames < 32768);
+    try testing.expect(buffer_frames < 22050);
+
+    // One period per engine block: a block handed over is a block the card is
+    // about to play, and never a fraction of one it has to wait to complete.
+    try testing.expectEqual(@as(u32, 512), period_frames);
+    try testing.expectEqual(@as(u32, 0), buffer_frames % period_frames);
+}

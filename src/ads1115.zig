@@ -89,7 +89,7 @@ pub const Rate = enum(u3) {
 /// driver's +/-2.048 V the ADC saturates at two thirds of the way up and every
 /// healthy plant reads the same. +/-4.096 V is the smallest range that clears
 /// 3.3 V. A differential probe wants `.ain0_ain1` back, and a mapping in
-/// `sensors.zig` that expects negative volts.
+/// `sensors.zig` that keeps negative counts instead of folding them to zero.
 /// The rate is the fastest the chip offers, which is the only setting that
 /// keeps up with a poll every 2.9 ms: at 128 SPS a reading can be 7.8 ms stale
 /// and most polls see the same number twice. The cost is noise — the effective
@@ -118,15 +118,11 @@ pub fn configWord(cfg: Config) u16 {
         0b11;
 }
 
-/// Convert a conversion-register reading to volts. Pure, so the scaling can be
-/// tested without a chip on the bus.
-pub fn voltsFromRaw(raw: i16, gain: Gain) f32 {
-    return @as(f32, @floatFromInt(raw)) * gain.fullScale() / 32768.0;
-}
-
 pub const Ads1115 = struct {
     fd: linux.fd_t,
-    gain: Gain,
+    /// What was last written to the config register, so a mux change can rewrite
+    /// it without the caller repeating the gain and rate.
+    cfg: Config,
 
     /// Open the bus, claim the address and write the config register.
     ///
@@ -143,11 +139,9 @@ pub const Ads1115 = struct {
             return Error.AddressFailed;
         }
 
-        const word = configWord(cfg);
-        const frame = [3]u8{ reg_config, @truncate(word >> 8), @truncate(word) };
-        try writeAll(fd, &frame);
+        try writeConfig(fd, cfg);
 
-        return .{ .fd = fd, .gain = cfg.gain };
+        return .{ .fd = fd, .cfg = cfg };
     }
 
     pub fn close(self: *Ads1115) void {
@@ -155,7 +149,30 @@ pub const Ads1115 = struct {
         self.fd = -1;
     }
 
+    /// Point the multiplexer at another input.
+    ///
+    /// The chip has one converter, so reading two probes means switching
+    /// between them. Writing the config register restarts conversion on the new
+    /// input, and the conversion register holds the *old* input's last result
+    /// until that finishes — one sample period, 1.2 ms at 860 SPS. So this
+    /// returns immediately and never waits: it is the caller's business to read
+    /// far enough after the switch, which `sensors.zig` does by holding the
+    /// multiplexer still for a whole block, so the sink's blocking write falls
+    /// between the switch and the next read.
+    pub fn selectInput(self: *Ads1115, mux: Mux) Error!void {
+        if (self.cfg.mux == mux) return;
+        self.cfg.mux = mux;
+        try writeConfig(self.fd, self.cfg);
+    }
+
     /// Point at the conversion register and read it, big-endian and signed.
+    ///
+    /// The count is handed on as it comes off the chip. Scaling it to volts
+    /// would only be undone by the pitch mapping, which works in fractions of
+    /// full scale, so the gain is a hardware setting and not a factor anything
+    /// multiplies by.
+    ///
+    /// Which input this reads is whatever `selectInput` last pointed at.
     pub fn readRaw(self: *Ads1115) Error!i16 {
         try writeAll(self.fd, &[_]u8{reg_conversion});
 
@@ -165,11 +182,12 @@ pub const Ads1115 = struct {
 
         return std.mem.readInt(i16, &data, .big);
     }
-
-    pub fn readVolts(self: *Ads1115) Error!f32 {
-        return voltsFromRaw(try self.readRaw(), self.gain);
-    }
 };
+
+fn writeConfig(fd: linux.fd_t, cfg: Config) Error!void {
+    const word = configWord(cfg);
+    try writeAll(fd, &[3]u8{ reg_config, @truncate(word >> 8), @truncate(word) });
+}
 
 /// I2C has no partial transfers: a short write is a failed transaction, not a
 /// reason to loop.
@@ -204,17 +222,8 @@ test "config word tracks each field" {
     try testing.expectEqual(@as(u16, 0xC203), configWord(.{ .rate = .sps_8 }));
 }
 
-test "raw readings scale to volts" {
-    try testing.expectEqual(@as(f32, 0.0), voltsFromRaw(0, .fs_2_048v));
-    try testing.expectApproxEqAbs(
-        @as(f32, 1.024),
-        voltsFromRaw(16384, .fs_2_048v),
-        0.001,
-    );
-    // Negative differentials stay negative; clamping is the caller's business.
-    try testing.expectApproxEqAbs(
-        @as(f32, -2.048),
-        voltsFromRaw(-32768, .fs_2_048v),
-        0.001,
-    );
+test "each gain names the range it covers" {
+    // Only used to pick the setting that clears the supply; nothing scales by it.
+    try testing.expectEqual(@as(f32, 2.048), Gain.fs_2_048v.fullScale());
+    try testing.expectEqual(@as(f32, 4.096), Gain.fs_4_096v.fullScale());
 }

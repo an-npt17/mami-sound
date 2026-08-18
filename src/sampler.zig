@@ -1,6 +1,6 @@
 //! Plant A's flute voice: a pitched multisample player.
 //!
-//! The ECG level picks a target frequency exactly as the drone does. Instead of
+//! The ECG reading picks a target frequency exactly as the drone does. Instead of
 //! filtering noise to that pitch, this finds the recorded note nearest the
 //! target and replays it at a fractional rate so it lands on the target exactly.
 //! Neighbouring recordings sit two to four semitones apart, so the stretch never
@@ -56,6 +56,16 @@ const smooth_tau_s: f32 = 1.0;
 
 /// Gate fade length, long enough to avoid a click at touch and release.
 const gate_ms: f32 = 150.0;
+
+/// How far a new touch jumps toward the reading it finds, before the smoother
+/// takes over for the rest.
+///
+/// The glide is the point of the piece, but at the moment of a touch it is the
+/// wrong shape: the pitch sets off from wherever the last touch left it and
+/// takes over a second to arrive, so the plant reads as not having answered.
+/// Jumping the whole way would answer and then sit still. Three quarters is
+/// enough to hear as a response, and leaves an audible settle behind it.
+const onset_jump: f32 = 0.75;
 
 /// Crossfade between two recordings when the target moves into a new zone.
 const zone_fade_ms: f32 = 50.0;
@@ -234,12 +244,16 @@ pub fn nearestIndex(set: []const Prepared, hz: f32) usize {
     return best;
 }
 
-/// Map ECG volts onto the range the set can actually reach, on a log scale so
-/// equal voltage steps sound like equal pitch steps.
-pub fn targetHz(set: []const Prepared, volts: f32, volts_max: f32) f32 {
+/// Map an ECG reading onto the range the set can actually reach, on a log scale
+/// so equal steps in the count sound like equal pitch steps.
+pub fn targetHz(set: []const Prepared, ecg: i16, ecg_max: i16) f32 {
     const lo = set[0].f0;
     const hi = set[set.len - 1].f0;
-    const t = std.math.clamp(volts / volts_max, 0.0, 1.0);
+    const t = std.math.clamp(
+        @as(f32, @floatFromInt(ecg)) / @as(f32, @floatFromInt(ecg_max)),
+        0.0,
+        1.0,
+    );
     return lo * std.math.pow(f32, hi / lo, t);
 }
 
@@ -289,7 +303,7 @@ const Head = struct {
 pub const Voice = struct {
     set: []const Prepared,
     sample_rate: u32,
-    volts_max: f32,
+    ecg_max: i16,
     alpha: f32,
     gate_step: f32,
     zone_step: f32,
@@ -306,12 +320,12 @@ pub const Voice = struct {
     /// Crossfade progress, 1 when no crossfade is running.
     fade: f32,
 
-    pub fn init(set: []const Prepared, sample_rate: u32, volts_max: f32) Voice {
+    pub fn init(set: []const Prepared, sample_rate: u32, ecg_max: i16) Voice {
         const sr: f32 = @floatFromInt(sample_rate);
         return .{
             .set = set,
             .sample_rate = sample_rate,
-            .volts_max = volts_max,
+            .ecg_max = ecg_max,
             .alpha = 1.0 - @exp(-1.0 / (smooth_tau_s * sr)),
             .gate_step = 1.0 / (gate_ms / 1000.0 * sr),
             .zone_step = 1.0 / (zone_fade_ms / 1000.0 * sr),
@@ -378,16 +392,18 @@ pub const Voice = struct {
 
     /// Add this voice's output into `out`. Never overwrites, so voices mix by
     /// being rendered in sequence into the same block.
-    pub fn render(self: *Voice, out: []f32, ecg_volts: f32, touched: bool) void {
-        const target = targetHz(self.set, ecg_volts, self.volts_max);
+    pub fn render(self: *Voice, out: []f32, ecg: i16, touched: bool) void {
+        const target = targetHz(self.set, ecg, self.ecg_max);
         const gate_target: f32 = if (touched) 1.0 else 0.0;
 
-        // A new touch is a new note: jump the pitch to the current reading
-        // rather than gliding up from wherever the last note ended, and start
-        // at the attack so the breath is heard.
+        // A new touch is a new note: jump most of the way to the current
+        // reading rather than gliding up from wherever the last note ended,
+        // and start at the attack so the breath is heard. The recording is
+        // picked for the pitch that will actually sound, not for the target
+        // the glide is still on its way to.
         if (touched and !self.prev_touch) {
-            self.hz = target;
-            self.head = .{ .idx = nearestIndex(self.set, target), .pos = 0.0 };
+            self.hz += (target - self.hz) * onset_jump;
+            self.head = .{ .idx = nearestIndex(self.set, self.hz), .pos = 0.0 };
             self.fade = 1.0;
         }
         self.prev_touch = touched;
@@ -454,4 +470,29 @@ fn sineSet(gpa: std.mem.Allocator, sample_rate: u32) ![]Prepared {
         slot.* = try prepare(gpa, raw, entry.f0, sample_rate);
     }
     return out;
+}
+
+test "a new note starts most of the way to its pitch, on a recording that suits it" {
+    const gpa = testing.allocator;
+    const set = try sineSet(gpa, 44100);
+    defer free(gpa, set);
+
+    var v = Voice.init(set, 44100, 32767);
+    const ecg: i16 = 30000;
+    const target = targetHz(set, ecg, 32767);
+    const from = v.hz;
+
+    var block: [1]f32 = .{0};
+    v.render(&block, ecg, true);
+
+    const expected = from + (target - from) * onset_jump;
+    try testing.expectApproxEqAbs(expected, v.hz, 1.0);
+    try testing.expect(v.hz < target);
+
+    // The head is on the recording nearest what is sounding now. Picking it for
+    // the target instead would start the note on a zone up to a jump's worth of
+    // pitch away and stretch it back down.
+    try testing.expectEqual(nearestIndex(set, v.hz), v.head.idx);
+    // Seeded at the attack, then advanced by the one sample just rendered.
+    try testing.expect(v.head.pos < 2.0);
 }

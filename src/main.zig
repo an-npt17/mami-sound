@@ -3,10 +3,14 @@
 const std = @import("std");
 const ms = @import("mami_sound");
 
-/// Plant B's clip: a spoken interview.
-const clip_b_path = "phong-van3.mp3";
-/// Plant C's clip: running water.
-const clip_c_path = "am-thanh-tu-nhien.mp3";
+/// Where plants B and C draw their clips from. One file is chosen out of each
+/// folder at start up, so switching the installation on gives a different pair
+/// rather than the same two recordings every day.
+///
+/// A folder rather than a list: dropping a new recording in is all it takes to
+/// put it in the rotation, with nothing here to edit.
+const clip_b_dir = "interview files";
+const clip_c_dir = "field records";
 
 /// Length of the sensor script, which is the only thing that ever ends a run.
 /// The loop keeps going past this until the one-shot clips have finished, so
@@ -24,9 +28,9 @@ const VoiceA = union(ms.cli.Voice) {
     flute: ms.sampler.Voice,
     beep: ms.tone.Tone,
 
-    fn render(self: *VoiceA, block: []f32, ecg_volts: f32, touched: bool) void {
+    fn render(self: *VoiceA, block: []f32, ecg: i16, touched: bool) void {
         switch (self.*) {
-            inline else => |*v| v.render(block, ecg_volts, touched),
+            inline else => |*v| v.render(block, ecg, touched),
         }
     }
 };
@@ -47,8 +51,12 @@ pub fn main(init: std.process.Init) !void {
             error.UnknownVoice => std.debug.print("--voice must be drone, flute or beep.\n\n", .{}),
             error.UnknownTouch => std.debug.print("--touch must be always, script or motion.\n\n", .{}),
             error.InvalidTrigger => std.debug.print(
-                "--trigger takes volts between 0 and {d:.1}, or nothing at all.\n\n",
-                .{ms.sensors.volts_max},
+                "--trigger takes a whole number between 0 and {d}, or nothing at all.\n\n",
+                .{ms.sensors.ecg_max},
+            ),
+            error.InvalidTriggerHold => std.debug.print(
+                "--trigger-hold takes milliseconds between 0 and 5000.\n\n",
+                .{},
             ),
             error.InvalidDevice => std.debug.print("--device needs a name, at most 63 characters.\n\n", .{}),
             error.UnknownFlag => std.debug.print("unknown flag.\n\n", .{}),
@@ -61,9 +69,14 @@ pub fn main(init: std.process.Init) !void {
 
     // A plant that is not playing does not need its clip, so a run of `1` works
     // on a machine with no audio files and no ffmpeg.
-    const clip_b: []const f32 = if (sel[1]) try loadClip(gpa, io, clip_b_path) else &.{};
+    // The engine's own `seed` is fixed so a run sounds identical; which clips a
+    // run draws is the one thing that should not be.
+    var shuffle = std.Random.DefaultPrng.init(shuffleSeed(io));
+    const draw = shuffle.random();
+
+    const clip_b: []const f32 = if (sel[1]) try loadFrom(gpa, io, clip_b_dir, draw) else &.{};
     defer if (clip_b.len != 0) gpa.free(clip_b);
-    const clip_c: []const f32 = if (sel[2]) try loadClip(gpa, io, clip_c_path) else &.{};
+    const clip_c: []const f32 = if (sel[2]) try loadFrom(gpa, io, clip_c_dir, draw) else &.{};
     defer if (clip_c.len != 0) gpa.free(clip_c);
 
     // Likewise the flute set: twelve files to decode, and only when both the
@@ -90,14 +103,29 @@ pub fn main(init: std.process.Init) !void {
         // Falls back to the drone when the flute was asked for but plant A is
         // not playing, in which case nothing was loaded and nothing is heard.
         .flute => if (flute.len != 0)
-            .{ .flute = ms.sampler.Voice.init(flute, ms.sample_rate, ms.sensors.volts_max) }
+            .{ .flute = ms.sampler.Voice.init(flute, ms.sample_rate, ms.sensors.ecg_max) }
         else
             .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed) },
-        .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.volts_max) },
+        .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.ecg_max) },
         .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed) },
     };
-    var voice_b = ms.player.Player.init(clip_b);
-    var voice_c = ms.player.Player.init(clip_c);
+    // B and C answer one probe between them, so they are one voice with two
+    // clips rather than two voices that happen to share a threshold.
+    var voices_bc = ms.player.Sequence.init(
+        .{ clip_b, clip_c },
+        .{ sel[1], sel[2] },
+    );
+
+    // The threshold, debounced. A reading is a vote rather than a decision:
+    // see `trigger.zig` for why one poll of it cannot be trusted.
+    var gate: ?ms.trigger.Trigger = if (opts.trigger_level) |level|
+        ms.trigger.Trigger.init(level, ms.trigger.holdPolls(
+            opts.trigger_hold_ms,
+            ms.sample_rate,
+            ms.sensor_frames,
+        ))
+    else
+        null;
 
     var block: [ms.block_frames]f32 = undefined;
     var pcm: [ms.block_frames]i16 = undefined;
@@ -112,8 +140,7 @@ pub fn main(init: std.process.Init) !void {
 
     while (!scripted or
         rendered < script_frames or
-        voice_b.isPlaying() or
-        voice_c.isPlaying())
+        voices_bc.isPlaying())
     {
         // Voices add into the block, so it starts from silence each time.
         @memset(&block, 0);
@@ -121,7 +148,8 @@ pub fn main(init: std.process.Init) !void {
         // The block is rendered in poll-sized pieces, each one driven by its
         // own sensor reading, so the sound follows the plants at the sensor
         // rate rather than the sound card's.
-        var ecg_volts: f32 = 0.0;
+        var ecg_a: i16 = 0;
+        var ecg_bc: i16 = 0;
         var touch: [ms.sensors.plant_count]bool = undefined;
 
         var offset: usize = 0;
@@ -129,24 +157,50 @@ pub fn main(init: std.process.Init) !void {
             const piece = block[offset..][0..ms.sensor_frames];
 
             const reading = sens.tick(ms.sensor_frames);
-            ecg_volts = reading.ecg_volts;
+            ecg_a = reading.ecg_a;
+            ecg_bc = reading.ecg_bc;
             // Disabled plants read as untouched, so their voices never open.
             touch = ms.select.apply(sel, reading.touch);
 
-            // Plant A's reading can hold the other two shut. Folded into their
-            // touch flags rather than wrapped around `render`: skipping the
-            // call would freeze a clip in place mid-word and resume it later,
-            // where this way the threshold is just another thing that has to be
-            // true for a clip to start, and a started clip still plays through.
-            if (opts.trigger_volts) |threshold| {
-                const open = ecg_volts >= threshold;
-                touch[1] = touch[1] and open;
-                touch[2] = touch[2] and open;
+            // The AIN1 probe *is* the touch for plants B and C: crossing the
+            // threshold plays one clip, and the other waits for the next
+            // crossing. Their motion sensors have no say — a threshold was
+            // asked for, so the threshold is the sensor. Without one there is
+            // nothing to cross, and the plants fall back to being awake.
+            //
+            // Passed as a level rather than wrapped around `render`, because
+            // the clip has to keep running once started: skipping the call
+            // would freeze it mid-word and resume it later, where this way the
+            // threshold only decides when a clip *begins*.
+            const open = if (gate) |*g|
+                g.update(ecg_bc)
+            else
+                touch[1] or touch[2];
+
+            // Plant A hears its own probe, and only that one.
+            voice_a.render(piece, ecg_a, touch[0]);
+
+            // The threshold is tested here, every poll, 344 times a second. The
+            // status line below prints once a second, so a reading that crosses
+            // for a few milliseconds starts a clip and is gone before the next
+            // line — which looks exactly like a clip starting on its own. Say
+            // so at the moment it happens, with the number that did it.
+            const was_idle = !voices_bc.isPlaying();
+            voices_bc.render(piece, open);
+            if (was_idle) {
+                if (voices_bc.playingIndex()) |started| {
+                    std.debug.print("clip {c} started: a1={d}\n", .{
+                        @as(u8, 'B') + @as(u8, @intCast(started)),
+                        ecg_bc,
+                    });
+                }
             }
 
-            voice_a.render(piece, ecg_volts, touch[0]);
-            voice_b.render(piece, touch[1]);
-            voice_c.render(piece, touch[2]);
+            // Report the clip that is actually sounding, not the pair's gate:
+            // under a sequence only one of them can be audible at a time.
+            const sounding = voices_bc.playingIndex();
+            touch[1] = sounding == 0;
+            touch[2] = sounding == 1;
         }
 
         ms.sink.toPcm(&block, &pcm);
@@ -161,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
         rendered += ms.block_frames;
         // The letters report what the voices were told, threshold included, so
         // a line showing `A--` under `--trigger` is the gate doing its job.
-        status.observe(io, ecg_volts, touch, &block, rendered);
+        status.observe(io, ecg_a, ecg_bc, touch, &block, rendered);
     }
 
     try out.finish();
@@ -212,7 +266,9 @@ fn reportSinkDeath(gpa: std.mem.Allocator, io: std.Io, device: []const u8) noret
 ///     wants more, so a healthy run sits at x1.00. Much above that means
 ///     nothing is being paced: the samples are going somewhere that swallows
 ///     them, which is the shape of a wrong `--device`.
-///   * `ecg` and `touch` are the sensors as the voices see them.
+///   * `a0` and `a1` are the two probes and `touch` the motion sensors, all as
+///     the voices see them. `a0` is plant A's pitch; `a1` is the number the
+///     `--trigger` threshold is compared against.
 const Status = struct {
     /// When the last line went out, so each line reports the second it covers
     /// rather than an average since startup. An average would hide a sink that
@@ -236,7 +292,8 @@ const Status = struct {
     fn observe(
         self: *Status,
         io: std.Io,
-        ecg_volts: f32,
+        ecg_a: i16,
+        ecg_bc: i16,
         touched: [ms.sensors.plant_count]bool,
         block: []const f32,
         rendered: usize,
@@ -246,14 +303,11 @@ const Status = struct {
         self.next_frame += period;
 
         const now_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        const wall_s = @as(f64, @floatFromInt(now_ns - self.last_ns)) / std.time.ns_per_s;
         self.last_ns = now_ns;
         const audio_s = @as(f64, @floatFromInt(rendered)) /
             @as(f64, @floatFromInt(ms.sample_rate));
         // Every line covers exactly one second of audio, so the ratio is just
         // how long that second took to hand over.
-        const interval_s = @as(f64, @floatFromInt(period)) /
-            @as(f64, @floatFromInt(ms.sample_rate));
 
         const letters = [ms.sensors.plant_count]u8{ 'A', 'B', 'C' };
         var touch: [ms.sensors.plant_count]u8 = undefined;
@@ -261,14 +315,7 @@ const Status = struct {
             out.* = if (awake) letter else '-';
         }
 
-        std.debug.print("t={d:.0}s ecg={d:.2}V touch={s} peak={d:.2} realtime=x{d:.2}\n", .{
-            audio_s,
-            ecg_volts,
-            &touch,
-            self.peak,
-            // Guarded so a clock that has not moved yet reports nothing absurd.
-            if (wall_s > 0) interval_s / wall_s else 0.0,
-        });
+        std.debug.print("t={d:.0}s a0={d} a1={d} touch={s}\n", .{ audio_s, ecg_a, ecg_bc, &touch });
         self.peak = 0.0;
     }
 };
@@ -279,16 +326,17 @@ const Status = struct {
 fn openSensors(touch: ms.cli.Touch) ms.sensors.Sensors {
     var sens = ms.sensors.Sensors.init(ms.sample_rate, seed);
 
+    // The multiplexer starts on plant A's probe; `sensors` steps it from there.
     if (ms.ads1115.Ads1115.open(
         ms.ads1115.default_bus,
         ms.ads1115.default_address,
-        .{},
+        .{ .mux = ms.sensors.input_a },
     )) |adc| {
         sens.attachAdc(adc);
     } else |err| {
         std.debug.print(
             \\no ADS1115 on {s}: {s}
-            \\Plant A runs on the simulated ECG.
+            \\Both probes run simulated.
             \\
         , .{ ms.ads1115.default_bus, @errorName(err) });
     }
@@ -337,6 +385,46 @@ fn parseArgs(
     }
 
     return ms.cli.parse(list.items);
+}
+
+/// A seed that differs from run to run, taken from the wall clock. Only the
+/// clip draw uses it.
+fn shuffleSeed(io: std.Io) u64 {
+    const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    return @truncate(@as(u96, @bitCast(ns)));
+}
+
+/// Pick a clip out of `dir` and decode it, saying which one it landed on: an
+/// operator who hears something unexpected needs to know what is playing, and
+/// the choice is different every run.
+fn loadFrom(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    draw: std.Random,
+) ![]f32 {
+    const path = ms.library.pick(gpa, io, dir, draw) catch |err| {
+        switch (err) {
+            ms.library.Error.NoAudioFiles => std.debug.print(
+                \\no audio files in ./{s}/
+                \\Put the recordings for that plant there; mp3, wav, ogg and
+                \\flac are all read.
+                \\
+            , .{dir}),
+            else => std.debug.print(
+                \\could not read ./{s}/: {s}
+                \\That folder is where the plant's recordings live.
+                \\
+            , .{ dir, @errorName(err) }),
+        }
+        // A folder that is missing or empty is a setup mistake, the same class
+        // as a bad flag: it has been explained, so leave without a stack trace.
+        std.process.exit(1);
+    };
+    defer gpa.free(path);
+
+    std.debug.print("playing {s}\n", .{path});
+    return loadClip(gpa, io, path);
 }
 
 fn loadClip(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]f32 {
