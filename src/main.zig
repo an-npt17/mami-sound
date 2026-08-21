@@ -159,8 +159,8 @@ pub fn main(init: std.process.Init) !void {
         // The block is rendered in poll-sized pieces, each one driven by its
         // own sensor reading, so the sound follows the plants at the sensor
         // rate rather than the sound card's.
-        var ecg_a: i16 = 0;
-        var ecg_bc: i16 = 0;
+        var raw_a: i16 = 0;
+        var raw_bc: i16 = 0;
         var touch: [ms.sensors.plant_count]bool = undefined;
 
         var offset: usize = 0;
@@ -168,8 +168,8 @@ pub fn main(init: std.process.Init) !void {
             const piece = block[offset..][0..ms.sensor_frames];
 
             const reading = sens.tick(ms.sensor_frames);
-            ecg_a = reading.ecg_a;
-            ecg_bc = reading.ecg_bc;
+            raw_a = reading.raw_a;
+            raw_bc = reading.raw_bc;
             // Disabled plants read as untouched, so their voices never open.
             touch = ms.select.apply(sel, reading.touch);
 
@@ -184,12 +184,12 @@ pub fn main(init: std.process.Init) !void {
             // would freeze it mid-word and resume it later, where this way the
             // threshold only decides when a clip *begins*.
             const open = if (gate) |*g|
-                g.update(ecg_bc)
+                g.update(raw_bc)
             else
                 touch[1] or touch[2];
 
             // Plant A hears its own probe, and only that one.
-            voice_a.render(piece, ecg_a, touch[0]);
+            voice_a.render(piece, raw_a, touch[0]);
 
             // The threshold is tested here, every poll, 344 times a second,
             // while the status line below prints once a second. A reading that
@@ -203,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
             // passes through idle at all.
             const before = voices_bc.starts;
             voices_bc.render(piece, open);
-            if (voices_bc.starts != before) reportStart(&voices_bc, folders, ecg_bc);
+            if (voices_bc.starts != before) reportStart(&voices_bc, folders, raw_bc);
 
             // Report the clip that is actually sounding, not the pair's gate:
             // under a sequence only one of them can be audible at a time.
@@ -224,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
         rendered += ms.block_frames;
         // The letters report what the voices were told, threshold included, so
         // a line showing `A--` under `--trigger` is the gate doing its job.
-        status.observe(io, ecg_a, ecg_bc, touch, &block, rendered);
+        status.observe(io, raw_a, raw_bc, touch, &block, rendered);
     }
 
     try out.finish();
@@ -301,8 +301,8 @@ const Status = struct {
     fn observe(
         self: *Status,
         io: std.Io,
-        ecg_a: i16,
-        ecg_bc: i16,
+        raw_a: i16,
+        raw_bc: i16,
         touched: [ms.sensors.plant_count]bool,
         block: []const f32,
         rendered: usize,
@@ -324,7 +324,7 @@ const Status = struct {
             out.* = if (awake) letter else '-';
         }
 
-        std.debug.print("t={d:.0}s a0={d} a1={d} touch={s}\n", .{ audio_s, ecg_a, ecg_bc, &touch });
+        std.debug.print("t={d:.0}s a0={d} a1={d} touch={s}\n", .{ audio_s, raw_a, raw_bc, &touch });
         self.peak = 0.0;
     }
 };
