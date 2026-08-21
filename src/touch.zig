@@ -168,6 +168,122 @@ pub const Baseline = struct {
     }
 };
 
+/// How many deviations from its own median a probe must read before it counts
+/// as touched. One number for both probes: that is what measuring in
+/// deviations buys.
+pub const default_level: f32 = 6.0;
+
+/// How long the score has to keep saying so.
+pub const default_hold_ms: f32 = 100.0;
+
+/// How long the reading is averaged over before the score sees it.
+pub const default_average_ms: f32 = 200.0;
+
+/// How long the median looks back.
+pub const default_baseline_s: f32 = 60.0;
+
+/// How long the other probe is given to settle after this one is touched,
+/// before its crosstalk level is taken as its temporary rest.
+pub const default_settle_ms: f32 = 300.0;
+
+/// The smallest deviation the score will divide by, in counts.
+///
+/// Probe A is too quiet for its own good: untouched it reads -2049 and -2050
+/// and nothing else, so its true MAD is about half a count and a one-count
+/// wobble would score two deviations. The floor is what stops a probe being
+/// punished for being clean.
+const mad_floor: f32 = 25.0;
+
+pub const Config = struct {
+    sample_rate: u32,
+    poll_frames: usize,
+    level: f32 = default_level,
+    hold_ms: f32 = default_hold_ms,
+    average_ms: f32 = default_average_ms,
+    baseline_s: f32 = default_baseline_s,
+    settle_ms: f32 = default_settle_ms,
+};
+
+/// One probe, judged against itself.
+pub const Detector = struct {
+    mean: Mean,
+    baseline: Baseline,
+    level: f32,
+    /// Polls of agreement needed to change the answer, and where the counter
+    /// sits between 0 and it.
+    hold: u32,
+    count: u32,
+    /// The latched answer, held between the ends of the counter's travel, which
+    /// is what stops a score hovering on the line from chattering.
+    on: bool,
+    /// The last score, kept for the log and the status line.
+    z: f32,
+    /// The last mean, which is what the score and the pitch are both taken
+    /// from.
+    last_mean: i16,
+    /// Set while the other probe has this one pulled off its rest. The score is
+    /// then measured from where the pull left it, so only a further move counts.
+    base_override: ?i16,
+
+    pub fn init(cfg: Config) Detector {
+        return .{
+            .mean = .init(holdPolls(cfg.average_ms, cfg.sample_rate, cfg.poll_frames)),
+            .baseline = .init(cfg.baseline_s, cfg.sample_rate, cfg.poll_frames),
+            .level = cfg.level,
+            .hold = @max(holdPolls(cfg.hold_ms, cfg.sample_rate, cfg.poll_frames), 1),
+            .count = 0,
+            .on = false,
+            .z = 0.0,
+            .last_mean = 0,
+            .base_override = null,
+        };
+    }
+
+    /// What the score is measured from: the crosstalk floor while one is set,
+    /// the learned median otherwise.
+    pub fn base(self: *const Detector) i16 {
+        return self.base_override orelse self.baseline.base;
+    }
+
+    /// How far the probe sits from rest. Unsigned, because this is what the
+    /// drone's pitch is mapped from and a pitch has no sign.
+    pub fn deviation(self: *const Detector) i16 {
+        const delta = @abs(@as(i32, self.last_mean) - @as(i32, self.base()));
+        return @intCast(@min(delta, std.math.maxInt(i16)));
+    }
+
+    /// Feed one poll's signed reading and get the latched answer.
+    pub fn update(self: *Detector, raw: i16) bool {
+        self.last_mean = self.mean.push(raw);
+        self.baseline.push(self.last_mean);
+
+        const denom = @max(self.baseline.mad, mad_floor);
+        self.z = (@as(f32, @floatFromInt(self.last_mean)) -
+            @as(f32, @floatFromInt(self.base()))) / denom;
+
+        // Before the median has anything behind it the score is noise about
+        // noise, and acting on it would start a clip at power-on.
+        if (!self.baseline.ready()) {
+            self.count = 0;
+            self.on = false;
+            return false;
+        }
+
+        if (@abs(self.z) >= self.level) {
+            self.count = @min(self.count + 1, self.hold);
+        } else {
+            self.count -|= 1;
+        }
+
+        if (self.count == self.hold) {
+            self.on = true;
+        } else if (self.count == 0) {
+            self.on = false;
+        }
+        return self.on;
+    }
+};
+
 test "the hold converts to whole polls, never to none" {
     try testing.expectEqual(@as(u32, 34), holdPolls(100.0, 44100, 128));
     try testing.expectEqual(@as(u32, 3), holdPolls(10.0, 44100, 128));
@@ -271,4 +387,107 @@ test "a detector may not answer until the baseline has warmed up" {
     // Three seconds of ten-hertz pushes.
     for (0..34 * 30) |_| b.push(-2049);
     try testing.expect(b.ready());
+}
+
+/// The engine's real rates, with the windows the installation runs.
+fn testConfig() Config {
+    return .{ .sample_rate = 44100, .poll_frames = 128 };
+}
+
+/// Feed a detector one value for `polls` polls and return its last answer.
+fn hold(d: *Detector, raw: i16, polls: usize) bool {
+    var on = false;
+    for (0..polls) |_| on = d.update(raw);
+    return on;
+}
+
+test "a detector says nothing until its baseline has warmed up" {
+    var d = Detector.init(testConfig());
+    // One second of the probe's resting level, which is under the three the
+    // warm-up wants.
+    try testing.expect(!hold(&d, -2049, 344));
+}
+
+test "probe A's pinned idle never latches" {
+    var d = Detector.init(testConfig());
+    // Ten minutes of what the bench capture shows: -2049 and -2050, nothing
+    // else. A MAD of half a count would score that at z = 2 without the floor.
+    var prng = std.Random.DefaultPrng.init(3);
+    const rand = prng.random();
+    for (0..344 * 600) |_| {
+        const raw: i16 = if (rand.boolean()) -2049 else -2050;
+        try testing.expect(!d.update(raw));
+    }
+}
+
+test "probe A's step to touched latches after the hold and not before" {
+    var d = Detector.init(testConfig());
+    _ = hold(&d, -2049, 344 * 10);
+    try testing.expect(!d.on);
+
+    // The hold is 100 ms, 34 polls. The mean window is 200 ms, so the mean
+    // needs a moment to arrive before the vote can even start.
+    _ = hold(&d, 660, 34);
+    try testing.expect(!d.on);
+    _ = hold(&d, 660, 344);
+    try testing.expect(d.on);
+}
+
+test "an isolated spike never latches" {
+    var d = Detector.init(testConfig());
+    for (0..344 * 60) |i| {
+        const raw: i16 = if (i % 500 == 0) 660 else -2049;
+        try testing.expect(!d.update(raw));
+    }
+}
+
+test "probe BC's noisy positive idle never latches" {
+    var d = Detector.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(5);
+    const rand = prng.random();
+    for (0..344 * 300) |_| {
+        try testing.expect(!d.update(@intCast(rand.uintLessThan(u16, 2001))));
+    }
+}
+
+test "probe BC latches on a drop through zero, which no rectified reading could" {
+    var d = Detector.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    for (0..344 * 60) |_| _ = d.update(@intCast(rand.uintLessThan(u16, 2001)));
+    try testing.expect(!d.on);
+
+    // -2049 is 2049 once rectified, which sits inside the idle spread of
+    // 0..2023 the probe was just showing. Signed, it is nowhere near it.
+    _ = hold(&d, -2049, 344);
+    try testing.expect(d.on);
+}
+
+test "it releases when the probe returns to rest" {
+    var d = Detector.init(testConfig());
+    _ = hold(&d, -2049, 344 * 10);
+    _ = hold(&d, 660, 344);
+    try testing.expect(d.on);
+    _ = hold(&d, -2049, 344);
+    try testing.expect(!d.on);
+}
+
+test "an override baseline is what the score is measured from" {
+    var d = Detector.init(testConfig());
+    _ = hold(&d, -2049, 344 * 10);
+    d.base_override = 660;
+    // Long enough for the mean to arrive at the override; a single poll would
+    // still be averaging in the ten seconds of rest before it.
+    _ = hold(&d, 660, 344);
+    // Sitting exactly on the override is no deviation at all, even though it is
+    // a long way from what the median learned.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), d.z, 0.5);
+}
+
+test "deviation is the distance from rest, which is what the pitch wants" {
+    var d = Detector.init(testConfig());
+    _ = hold(&d, -2049, 344 * 10);
+    try testing.expectEqual(@as(i16, 0), d.deviation());
+    _ = hold(&d, 660, 344);
+    try testing.expectEqual(@as(i16, 2709), d.deviation());
 }
