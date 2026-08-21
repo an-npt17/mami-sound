@@ -18,6 +18,16 @@ const std = @import("std");
 
 const testing = std.testing;
 
+/// The distance between two readings, clamped to what an `i16` can carry.
+///
+/// Two readings at opposite ends of the range are 65535 apart, which does not
+/// fit the type they came from, so the subtraction is done wider and the result
+/// saturates rather than wrapping.
+fn clampedAbsDiff(a: i16, b: i16) i16 {
+    const delta = @abs(@as(i32, a) - @as(i32, b));
+    return @intCast(@min(delta, std.math.maxInt(i16)));
+}
+
 /// The longest window worth averaging over, about three seconds of polls.
 pub const max_mean_polls = 1024;
 
@@ -160,8 +170,7 @@ pub const Baseline = struct {
         self.base = self.scratch[n / 2];
 
         for (self.scratch[0..n], self.samples[0..n]) |*out, sample| {
-            const delta = @abs(@as(i32, sample) - @as(i32, self.base));
-            out.* = @intCast(@min(delta, std.math.maxInt(i16)));
+            out.* = clampedAbsDiff(sample, self.base);
         }
         std.mem.sort(i16, self.scratch[0..n], {}, std.sort.asc(i16));
         self.mad = @floatFromInt(self.scratch[n / 2]);
@@ -248,8 +257,7 @@ pub const Detector = struct {
     /// How far the probe sits from rest. Unsigned, because this is what the
     /// drone's pitch is mapped from and a pitch has no sign.
     pub fn deviation(self: *const Detector) i16 {
-        const delta = @abs(@as(i32, self.last_mean) - @as(i32, self.base()));
-        return @intCast(@min(delta, std.math.maxInt(i16)));
+        return clampedAbsDiff(self.last_mean, self.base());
     }
 
     /// Feed one poll's signed reading and get the latched answer.
@@ -281,6 +289,84 @@ pub const Detector = struct {
             self.on = false;
         }
         return self.on;
+    }
+};
+
+/// Which plants are being touched.
+pub const State = enum { none, plant_a, plant_bc, both };
+
+/// Both probes, and the rule that tells a touch from the other probe's shadow.
+///
+/// Probe A is dominant: on the bench, touching plant A drags the other probe
+/// down to about -2049, while touching the other leaves plant A's probe exactly
+/// where it was. So the arbitration is one-directional, and the shadow it has
+/// to see through is the awkward kind — the crosstalk floor is the same value a
+/// genuine touch on the other probe produces, so no level can separate them.
+///
+/// What separates them is that a real touch on top of the crosstalk goes
+/// further still, to about -3900. So when A latches, the other probe is given a
+/// moment to settle and whatever it settles at becomes its rest for as long as
+/// A is held. Sitting on the crosstalk floor is then no deviation at all, and
+/// only a further move counts. Nothing here is a tuned constant: the floor is
+/// measured each time, so it can move with the weather.
+pub const Machine = struct {
+    a: Detector,
+    bc: Detector,
+    /// How long the other probe is given to settle, and how much of that is
+    /// left. While it is running, BC cannot latch: the transition itself is
+    /// exactly the kind of large move that would look like a touch.
+    settle_polls: u32,
+    settle_left: u32,
+    /// Whether the settle now running ends in a re-baselining. It does not when
+    /// BC was already touched before A arrived.
+    rebasing: bool,
+    prev_a: bool,
+
+    pub fn init(cfg: Config) Machine {
+        return .{
+            .a = .init(cfg),
+            .bc = .init(cfg),
+            .settle_polls = holdPolls(cfg.settle_ms, cfg.sample_rate, cfg.poll_frames),
+            .settle_left = 0,
+            .rebasing = false,
+            .prev_a = false,
+        };
+    }
+
+    /// Feed one poll of both probes, signed and unrectified, and get the state.
+    pub fn update(self: *Machine, raw_a: i16, raw_bc: i16) State {
+        const a_on = self.a.update(raw_a);
+
+        // A's edges are handled before BC is updated, so the freeze is in place
+        // before the first crosstalk-poisoned reading could be learned.
+        if (a_on and !self.prev_a and !self.bc.on) {
+            self.rebasing = true;
+            self.settle_left = self.settle_polls;
+            self.bc.baseline.frozen = true;
+        } else if (!a_on and self.prev_a) {
+            self.rebasing = false;
+            self.settle_left = 0;
+            self.bc.base_override = null;
+            self.bc.baseline.frozen = false;
+        }
+        self.prev_a = a_on;
+
+        var bc_on = self.bc.update(raw_bc);
+
+        if (self.settle_left > 0) {
+            self.settle_left -= 1;
+            self.bc.count = 0;
+            self.bc.on = false;
+            bc_on = false;
+            if (self.settle_left == 0 and self.rebasing) {
+                self.bc.base_override = self.bc.last_mean;
+            }
+        }
+
+        if (a_on and bc_on) return .both;
+        if (a_on) return .plant_a;
+        if (bc_on) return .plant_bc;
+        return .none;
     }
 };
 
@@ -355,7 +441,7 @@ test "the median is the reading a steady probe keeps giving" {
 
 test "the median ignores a minority of touched samples" {
     var b = testBaseline(70.0);
-    // Sixty seconds of idle at -2049, then nine seconds of touch at +660: the
+    // Seventy seconds of idle at -2049, then nine seconds of touch at +660: the
     // touch is a minority of the window and the median does not follow it.
     for (0..34 * 700) |_| b.push(-2049);
     for (0..34 * 90) |_| b.push(660);
@@ -458,7 +544,7 @@ test "probe BC latches on a drop through zero, which no rectified reading could"
     try testing.expect(!d.on);
 
     // -2049 is 2049 once rectified, which sits inside the idle spread of
-    // 0..2023 the probe was just showing. Signed, it is nowhere near it.
+    // 0..2000 the probe was just showing. Signed, it is nowhere near it.
     _ = hold(&d, -2049, 344);
     try testing.expect(d.on);
 }
@@ -490,4 +576,97 @@ test "deviation is the distance from rest, which is what the pitch wants" {
     try testing.expectEqual(@as(i16, 0), d.deviation());
     _ = hold(&d, 660, 344);
     try testing.expectEqual(@as(i16, 2709), d.deviation());
+}
+
+/// Feed the machine one pair of readings for `polls` polls, last answer wins.
+fn holdBoth(m: *Machine, raw_a: i16, raw_bc: i16, polls: usize) State {
+    var state: State = .none;
+    for (0..polls) |_| state = m.update(raw_a, raw_bc);
+    return state;
+}
+
+/// The idle rig: probe A pinned, probe BC wandering about the positive half.
+fn idle(m: *Machine, rand: std.Random, polls: usize) State {
+    var state: State = .none;
+    for (0..polls) |_| {
+        state = m.update(-2049, @intCast(rand.uintLessThan(u16, 2001)));
+    }
+    return state;
+}
+
+test "an idle rig reports nothing touched" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    try testing.expectEqual(State.none, idle(&m, prng.random(), 344 * 120));
+}
+
+test "plant A alone" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+    try testing.expectEqual(State.plant_a, holdBoth(&m, 660, 900, 344 * 2));
+}
+
+test "plant BC alone" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+    try testing.expectEqual(State.plant_bc, holdBoth(&m, -2049, -2049, 344 * 2));
+}
+
+test "crosstalk from A does not read as a touch on BC" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+
+    // A is touched and pulls BC down with it. Rectified, BC's -2049 is
+    // indistinguishable from its idle spread; signed, it is a huge move. Only
+    // the re-baselining tells it apart from a real touch.
+    try testing.expectEqual(State.plant_a, holdBoth(&m, 660, -2049, 344 * 5));
+}
+
+test "a real touch on BC while A is held goes further than the crosstalk" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+    _ = holdBoth(&m, 660, -2049, 344 * 5);
+    // The bench capture's simultaneous touch: BC keeps going, past the floor
+    // its crosstalk settled at.
+    try testing.expectEqual(State.both, holdBoth(&m, 660, -3947, 344 * 2));
+}
+
+test "BC touched first is not re-baselined out from under itself" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+
+    try testing.expectEqual(State.plant_bc, holdBoth(&m, -2049, -2049, 344 * 2));
+    // A joins in. BC was already latched, so nothing about it is reinterpreted.
+    try testing.expectEqual(State.both, holdBoth(&m, 660, -2049, 344 * 2));
+}
+
+test "releasing A puts BC back on its learned rest" {
+    var m = Machine.init(testConfig());
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 60);
+    _ = holdBoth(&m, 660, -2049, 344 * 5);
+    try testing.expectEqual(@as(?i16, -2049), m.bc.base_override);
+
+    try testing.expectEqual(State.none, idle(&m, prng.random(), 344 * 3));
+    try testing.expectEqual(@as(?i16, null), m.bc.base_override);
+}
+
+test "a touch longer than half the baseline window reads as released" {
+    // The documented limit of a median baseline. Ten-second window here so the
+    // test does not have to run for minutes; the installation's default is 60.
+    var cfg = testConfig();
+    cfg.baseline_s = 10.0;
+    var m = Machine.init(cfg);
+    var prng = std.Random.DefaultPrng.init(11);
+    _ = idle(&m, prng.random(), 344 * 20);
+
+    try testing.expectEqual(State.plant_a, holdBoth(&m, 660, 900, 344 * 2));
+    // Held past half the window, the median migrates onto the touched level and
+    // the score decays to nothing. Raise --touch-baseline to push this out.
+    try testing.expectEqual(State.none, holdBoth(&m, 660, 900, 344 * 20));
 }
