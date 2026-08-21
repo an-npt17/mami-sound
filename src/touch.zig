@@ -211,6 +211,28 @@ pub const Config = struct {
     average_ms: f32 = default_average_ms,
     baseline_s: f32 = default_baseline_s,
     settle_ms: f32 = default_settle_ms,
+    /// Probe BC's own threshold and hold, when it wants asking a different
+    /// question from A's. `null` gives it A's.
+    ///
+    /// The two probes do different jobs and can afford different answers.
+    /// Plant A's probe is a pitch: a wrong latch there moves a drone that was
+    /// already sounding, and nobody can tell. BC's is a switch that starts a
+    /// recording and runs it for minutes, so a wrong latch there is the fault
+    /// people actually hear. BC can be held to a much larger move than A
+    /// without making A deaf.
+    level_bc: ?f32 = null,
+    hold_bc_ms: ?f32 = null,
+
+    /// This config as probe BC sees it: its own threshold and hold where it was
+    /// given them, A's everywhere else.
+    pub fn forBc(self: Config) Config {
+        var bc = self;
+        bc.level = self.level_bc orelse self.level;
+        bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
+        bc.level_bc = null;
+        bc.hold_bc_ms = null;
+        return bc;
+    }
 };
 
 /// One probe, judged against itself.
@@ -325,7 +347,7 @@ pub const Machine = struct {
     pub fn init(cfg: Config) Machine {
         return .{
             .a = .init(cfg),
-            .bc = .init(cfg),
+            .bc = .init(cfg.forBc()),
             .settle_polls = holdPolls(cfg.settle_ms, cfg.sample_rate, cfg.poll_frames),
             .settle_left = 0,
             .rebasing = false,
@@ -654,6 +676,46 @@ test "releasing A puts BC back on its learned rest" {
 
     try testing.expectEqual(State.none, idle(&m, prng.random(), 344 * 3));
     try testing.expectEqual(@as(?i16, null), m.bc.base_override);
+}
+
+test "BC can be given its own threshold and hold" {
+    const m = Machine.init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .level = 6.0,
+        .hold_ms = 100.0,
+        .level_bc = 20.0,
+        .hold_bc_ms = 30.0,
+    });
+    try testing.expectEqual(@as(f32, 6.0), m.a.level);
+    try testing.expectEqual(@as(f32, 20.0), m.bc.level);
+    // 30 ms of polls against 100 ms of them.
+    try testing.expect(m.bc.hold < m.a.hold);
+}
+
+test "BC is asked A's question when it was given none of its own" {
+    const m = Machine.init(.{ .sample_rate = 44100, .poll_frames = 128, .level = 9.0 });
+    try testing.expectEqual(m.a.level, m.bc.level);
+    try testing.expectEqual(m.a.hold, m.bc.hold);
+}
+
+test "a move that latches BC at A's level is ignored at its own bigger one" {
+    // The same reading through two machines, so what differs is the threshold
+    // and nothing else. BC's deviation here is a few hundred counts, which is
+    // ten-ish deviations: over A's 6, nowhere near 200.
+    var shared = Machine.init(testConfig());
+    var split = Machine.init(Config{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .level_bc = 200.0,
+    });
+    var prng_a = std.Random.DefaultPrng.init(11);
+    var prng_b = std.Random.DefaultPrng.init(11);
+    _ = idle(&shared, prng_a.random(), 344 * 60);
+    _ = idle(&split, prng_b.random(), 344 * 60);
+
+    try testing.expectEqual(State.plant_bc, holdBoth(&shared, -2049, 1470, 344 * 2));
+    try testing.expectEqual(State.none, holdBoth(&split, -2049, 1470, 344 * 2));
 }
 
 test "a touch longer than half the baseline window reads as released" {

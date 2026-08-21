@@ -88,7 +88,7 @@ fn peakOf(touch_state: [3]bool, blocks: usize) !f32 {
     const clip_c = try toneClip(gpa, sample_rate * 2);
     defer gpa.free(clip_c);
 
-    var voice_a = noise.Noise.init(sample_rate, 1, noise.default_span);
+    var voice_a = noise.Noise.init(sample_rate, 1, .{});
     var voice_b = player.Player.init(clip_b);
     var voice_c = player.Player.init(clip_c);
 

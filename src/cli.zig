@@ -19,6 +19,8 @@ pub const Error = error{
     InvalidTouchBaseline,
     InvalidTouchSettle,
     InvalidPitchSpan,
+    InvalidPitchJump,
+    InvalidPitchGlide,
     InvalidLogPath,
     TriggerRetired,
     InvalidInterrupt,
@@ -83,8 +85,19 @@ pub const Options = struct {
     /// How long the other probe is given to settle after this one is touched,
     /// before its crosstalk level is taken as its temporary rest.
     touch_settle_ms: f32 = touch.default_settle_ms,
+    /// Probe BC's own threshold and hold. `null` asks it A's question.
+    ///
+    /// BC starts a recording that then runs for minutes, so a wrong latch
+    /// there is the fault people hear; A's only moves a drone that was already
+    /// sounding. BC can be held to a much larger move without making A deaf.
+    touch_level_bc: ?f32 = null,
+    touch_hold_bc_ms: ?f32 = null,
     /// The deviation that maps to the top of plant A's pitch range.
     pitch_span: i16 = noise.default_span,
+    /// How much of the distance to a new pitch is closed at once, and how long
+    /// the rest takes. Between them, how sharply plant A answers.
+    pitch_jump: f32 = noise.default_jump,
+    pitch_glide_s: f32 = noise.default_glide_s,
     /// How long a clip must have been playing before a fresh touch may cut it
     /// short and draw another, in seconds. Zero lets every clip finish.
     interrupt_s: f32 = default_interrupt_s,
@@ -155,6 +168,29 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidTouchSettle;
             if (!(settle >= 0.0) or settle > 5000.0) return Error.InvalidTouchSettle;
             opts.touch_settle_ms = settle;
+        } else if (std.mem.startsWith(u8, arg, "--touch-level-bc=")) {
+            const level = std.fmt.parseFloat(f32, arg["--touch-level-bc=".len..]) catch
+                return Error.InvalidTouchLevel;
+            if (!(level >= 1.0) or level > 100.0) return Error.InvalidTouchLevel;
+            opts.touch_level_bc = level;
+        } else if (std.mem.startsWith(u8, arg, "--touch-hold-bc=")) {
+            const held = std.fmt.parseFloat(f32, arg["--touch-hold-bc=".len..]) catch
+                return Error.InvalidTouchHold;
+            if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTouchHold;
+            opts.touch_hold_bc_ms = held;
+        } else if (std.mem.startsWith(u8, arg, "--pitch-jump=")) {
+            const jump = std.fmt.parseFloat(f32, arg["--pitch-jump=".len..]) catch
+                return Error.InvalidPitchJump;
+            // A fraction of the distance, so outside 0..1 it means nothing.
+            if (!(jump >= 0.0) or jump > 1.0) return Error.InvalidPitchJump;
+            opts.pitch_jump = jump;
+        } else if (std.mem.startsWith(u8, arg, "--pitch-glide=")) {
+            const glide = std.fmt.parseFloat(f32, arg["--pitch-glide=".len..]) catch
+                return Error.InvalidPitchGlide;
+            // Zero is a step, which is the one thing the piece is built to
+            // avoid; past a minute the pitch stops tracking the plant at all.
+            if (!(glide > 0.0) or glide > 60.0) return Error.InvalidPitchGlide;
+            opts.pitch_glide_s = glide;
         } else if (std.mem.startsWith(u8, arg, "--pitch-span=")) {
             const span = std.fmt.parseInt(i16, arg["--pitch-span=".len..], 10) catch
                 return Error.InvalidPitchSpan;
@@ -195,7 +231,9 @@ pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep]
     \\                 [--touch=probes|always|script|motion] [--touch-level=Z]
     \\                 [--touch-hold=MS] [--touch-average=MS] [--touch-baseline=S]
-    \\                 [--touch-settle=MS] [--pitch-span=COUNTS] [--log-touch=PATH]
+    \\                 [--touch-settle=MS] [--touch-level-bc=Z] [--touch-hold-bc=MS]
+    \\                 [--pitch-span=COUNTS] [--pitch-jump=FRACTION]
+    \\                 [--pitch-glide=SECONDS] [--log-touch=PATH]
     \\                 [--interrupt=SECONDS] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
@@ -249,9 +287,24 @@ pub const usage =
     \\settle, wherever it was dragged to becomes its rest for as long as A is
     \\held, so only a further move counts as a touch of its own.
     \\
+    \\--touch-level-bc and --touch-hold-bc ask probe BC a different question
+    \\from A's, and are the two knobs to reach for when clips start on their
+    \\own. Left out, BC is asked A's. The two probes can afford to differ: a
+    \\wrong latch on A moves a drone that was already sounding and nobody can
+    \\tell, while a wrong latch on BC starts a recording that then runs for
+    \\minutes. Hold BC to a much larger move than A without making A deaf.
+    \\
     \\--pitch-span is the deviation from rest that reaches the top of plant A's
-    \\range, 3000 counts by default. Plant A's touch moves its probe about 2700
-    \\counts, so most of the range is spent on it.
+    \\range, 3000 counts by default. Raise it if the drone slams to the top of
+    \\its range on the smallest touch, which means the probe is moving by more
+    \\counts than the span allows for.
+    \\
+    \\--pitch-jump is how much of the distance to a new pitch is closed the
+    \\instant a touch lands, three quarters by default, and --pitch-glide is
+    \\how long the rest of it takes, one second. Between them they are how
+    \\sharply plant A answers: lower the jump and lengthen the glide and the
+    \\pitch swells into place instead of arriving all at once. A jump of 0 is a
+    \\pure glide, which is the gentlest the piece will go.
     \\
     \\--log-touch writes every poll's numbers to PATH as CSV: both probes' raw
     \\reading, mean, median, deviation, score and latch, and the state they
@@ -397,6 +450,35 @@ test "the old trigger flags say what replaced them" {
     try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger=25000"}));
     try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger-hold=250"}));
     try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger-average=400"}));
+}
+
+test "BC can be told apart from A" {
+    const opts = try parse(&.{ "--touch-level-bc=20", "--touch-hold-bc=30" });
+    try testing.expectEqual(@as(?f32, 20.0), opts.touch_level_bc);
+    try testing.expectEqual(@as(?f32, 30.0), opts.touch_hold_bc_ms);
+}
+
+test "BC is asked A's question when it was given none of its own" {
+    const opts = try parse(&.{"--touch-level=9"});
+    try testing.expectEqual(@as(?f32, null), opts.touch_level_bc);
+    try testing.expectEqual(@as(?f32, null), opts.touch_hold_bc_ms);
+}
+
+test "plant A's rise can be slowed" {
+    const opts = try parse(&.{ "--pitch-jump=0.1", "--pitch-glide=4" });
+    try testing.expectEqual(@as(f32, 0.1), opts.pitch_jump);
+    try testing.expectEqual(@as(f32, 4.0), opts.pitch_glide_s);
+}
+
+test "nonsense on the per-probe and pitch knobs is refused" {
+    try testing.expectError(Error.InvalidTouchLevel, parse(&.{"--touch-level-bc=0"}));
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold-bc=9000"}));
+    // A jump is a fraction of the distance, so outside 0..1 it means nothing.
+    try testing.expectError(Error.InvalidPitchJump, parse(&.{"--pitch-jump=1.5"}));
+    try testing.expectError(Error.InvalidPitchJump, parse(&.{"--pitch-jump=-1"}));
+    // A glide of zero is a step, which is what the piece is built to avoid.
+    try testing.expectError(Error.InvalidPitchGlide, parse(&.{"--pitch-glide=0"}));
+    try testing.expectError(Error.InvalidPitchGlide, parse(&.{"--pitch-glide=120"}));
 }
 
 test "the log path is carried inline so the arguments can be dropped" {

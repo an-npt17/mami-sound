@@ -63,11 +63,11 @@ pub fn main(init: std.process.Init) !void {
                 .{},
             ),
             error.InvalidTouchLevel => std.debug.print(
-                "--touch-level takes deviations between 1 and 100.\n\n",
+                "--touch-level and --touch-level-bc take deviations between 1 and 100.\n\n",
                 .{},
             ),
             error.InvalidTouchHold => std.debug.print(
-                "--touch-hold takes milliseconds between 0 and 5000.\n\n",
+                "--touch-hold and --touch-hold-bc take milliseconds between 0 and 5000.\n\n",
                 .{},
             ),
             error.InvalidTouchAverage => std.debug.print(
@@ -84,6 +84,14 @@ pub fn main(init: std.process.Init) !void {
             ),
             error.InvalidPitchSpan => std.debug.print(
                 "--pitch-span takes a whole number of counts above zero.\n\n",
+                .{},
+            ),
+            error.InvalidPitchJump => std.debug.print(
+                "--pitch-jump takes a fraction between 0 and 1.\n\n",
+                .{},
+            ),
+            error.InvalidPitchGlide => std.debug.print(
+                "--pitch-glide takes seconds between 0 and 60.\n\n",
                 .{},
             ),
             error.InvalidLogPath => std.debug.print(
@@ -138,9 +146,17 @@ pub fn main(init: std.process.Init) !void {
         .flute => if (flute.len != 0)
             .{ .flute = ms.sampler.Voice.init(flute, ms.sample_rate, ms.sensors.ecg_max) }
         else
-            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, opts.pitch_span) },
+            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, .{
+            .span = opts.pitch_span,
+            .jump = opts.pitch_jump,
+            .glide_s = opts.pitch_glide_s,
+        }) },
         .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.ecg_max) },
-        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, opts.pitch_span) },
+        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, .{
+            .span = opts.pitch_span,
+            .jump = opts.pitch_jump,
+            .glide_s = opts.pitch_glide_s,
+        }) },
     };
     // B and C answer one probe between them, so they are one voice with two
     // folders rather than two voices that happen to share a threshold.
@@ -162,6 +178,8 @@ pub fn main(init: std.process.Init) !void {
         .average_ms = opts.touch_average_ms,
         .baseline_s = opts.touch_baseline_s,
         .settle_ms = opts.touch_settle_ms,
+        .level_bc = opts.touch_level_bc,
+        .hold_bc_ms = opts.touch_hold_bc_ms,
     });
 
     // Opened once, so a bad path is a startup failure rather than something

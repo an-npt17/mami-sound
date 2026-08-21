@@ -18,8 +18,9 @@ pub const freq_min: f32 = 80.0;
 pub const freq_max: f32 = 1000.0;
 
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
-/// deviation wiggles faster than this never reach the filter.
-const smooth_tau_s: f32 = 1.0;
+/// deviation wiggles faster than this never reach the filter. Raise it to make
+/// plant A answer more slowly.
+pub const default_glide_s: f32 = 1.0;
 
 /// Gate fade length, long enough to avoid a click at touch and release.
 const gate_ms: f32 = 150.0;
@@ -32,7 +33,21 @@ const gate_ms: f32 = 150.0;
 /// takes over a second to arrive, so the plant reads as not having answered.
 /// Jumping the whole way would answer and then sit still. Three quarters is
 /// enough to hear as a response, and leaves an audible settle behind it.
-const onset_jump: f32 = 0.75;
+///
+/// This is the knob for a rise that arrives too sharply: at three quarters the
+/// pitch is most of the way there before the gate has finished opening, which
+/// on a probe whose touch is worth thousands of counts reads as a jolt rather
+/// than as an answer.
+pub const default_jump: f32 = 0.75;
+
+/// How plant A's pitch answers a touch: how far up the range a deviation
+/// reaches, how much of the remaining distance a new touch closes at once, and
+/// how long the rest of it takes.
+pub const Shape = struct {
+    span: i16 = default_span,
+    jump: f32 = default_jump,
+    glide_s: f32 = default_glide_s,
+};
 
 /// Filter damping, `1 / Q`. Lower is a narrower, more whistle-like band.
 const damping: f32 = 0.08;
@@ -87,6 +102,8 @@ pub const Noise = struct {
     gate_step: f32,
     /// Deviation that reaches `freq_max`.
     span: i16,
+    /// Fraction of the distance a new touch closes at once.
+    jump: f32,
 
     /// Smoothed centre frequency, in Hz.
     fc: f32,
@@ -98,14 +115,15 @@ pub const Noise = struct {
     /// Last block's touch state, so a new touch can be told from a held one.
     prev_touch: bool,
 
-    pub fn init(sample_rate: u32, seed: u64, span: i16) Noise {
+    pub fn init(sample_rate: u32, seed: u64, shape: Shape) Noise {
         const sr = @as(f32, @floatFromInt(sample_rate));
         return .{
             .prng = std.Random.DefaultPrng.init(seed),
             .sample_rate = sample_rate,
-            .alpha = smoothingAlpha(smooth_tau_s, sample_rate),
+            .alpha = smoothingAlpha(shape.glide_s, sample_rate),
             .gate_step = 1.0 / (gate_ms / 1000.0 * sr),
-            .span = span,
+            .span = shape.span,
+            .jump = shape.jump,
             .fc = freq_min,
             .low = 0.0,
             .band = 0.0,
@@ -126,7 +144,7 @@ pub const Noise = struct {
         // walks the rest. Done before the gate has finished opening, so what
         // fades in is already near pitch rather than sliding up under the fade.
         if (touched and !self.prev_touch) {
-            self.fc += (target_fc - self.fc) * onset_jump;
+            self.fc += (target_fc - self.fc) * self.jump;
         }
         self.prev_touch = touched;
 
@@ -179,7 +197,7 @@ test "plant A's touch reaches the top half of the range" {
 }
 
 test "an untouched drone is quieter but never silent" {
-    var n = Noise.init(44100, 1, default_span);
+    var n = Noise.init(44100, 1, .{});
     var block: [4096]f32 = undefined;
     // Long enough for the gate to finish its fade.
     for (0..20) |_| {
@@ -211,8 +229,35 @@ test "a deviation below rest clamps to the bottom of the range" {
     try testing.expectApproxEqAbs(freq_min, freqFromDeviation(std.math.minInt(i16), default_span), 0.01);
 }
 
+test "a gentler onset jump lands nearer where it started" {
+    var sharp = Noise.init(44100, 3, .{ .jump = 0.75 });
+    var gentle = Noise.init(44100, 3, .{ .jump = 0.1 });
+    var block: [1]f32 = .{0};
+    sharp.render(&block, 2200, true);
+    block[0] = 0;
+    gentle.render(&block, 2200, true);
+    // Both answer; the gentle one just does not leap most of the way at once.
+    try testing.expect(gentle.fc < sharp.fc);
+    try testing.expect(gentle.fc > freq_min);
+}
+
+test "a longer glide takes longer to arrive" {
+    // No jump on either, so what is measured is the smoother alone.
+    var quick = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 1.0 });
+    var slow = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 5.0 });
+    var block: [4096]f32 = undefined;
+    for (0..10) |_| {
+        @memset(&block, 0);
+        quick.render(&block, 2200, true);
+        @memset(&block, 0);
+        slow.render(&block, 2200, true);
+    }
+    try testing.expect(slow.fc < quick.fc);
+    try testing.expect(slow.fc > freq_min);
+}
+
 test "smoother converges to its target without overshooting" {
-    const alpha = smoothingAlpha(smooth_tau_s, 44100);
+    const alpha = smoothingAlpha(default_glide_s, 44100);
     var x: f32 = 0.0;
     const target: f32 = 1000.0;
     for (0..44100 * 10) |_| {
@@ -227,7 +272,7 @@ test "smoother converges to its target without overshooting" {
 
 test "filter stays bounded at both pitch extremes" {
     for ([_]i16{ 0, default_span }) |dev| {
-        var n = Noise.init(44100, 99, default_span);
+        var n = Noise.init(44100, 99, .{});
         var block: [512]f32 = undefined;
         for (0..200) |_| {
             @memset(&block, 0);
@@ -240,7 +285,7 @@ test "filter stays bounded at both pitch extremes" {
 }
 
 test "output is audible but not pinned to the clamp" {
-    var n = Noise.init(44100, 4, default_span);
+    var n = Noise.init(44100, 4, .{});
     var block: [512]f32 = undefined;
     var sum_sq: f64 = 0.0;
     var count: usize = 0;
@@ -265,7 +310,7 @@ test "output is audible but not pinned to the clamp" {
 }
 
 test "gate reaches the idle floor and full level in the expected time" {
-    var n = Noise.init(44100, 1, default_span);
+    var n = Noise.init(44100, 1, .{});
     const ramp_frames: usize = @intFromFloat(gate_ms / 1000.0 * 44100.0);
     var block: [64]f32 = undefined;
 
@@ -286,7 +331,7 @@ test "gate reaches the idle floor and full level in the expected time" {
 /// Zero crossings per second, a cheap stand-in for a pitch detector. For noise
 /// through a narrow bandpass this lands near twice the centre frequency.
 fn crossingRate(dev: i16) f32 {
-    var n = Noise.init(44100, 21, default_span);
+    var n = Noise.init(44100, 21, .{});
     var block: [512]f32 = undefined;
 
     // Let the one-second smoother settle before measuring.
@@ -312,21 +357,21 @@ fn crossingRate(dev: i16) f32 {
 }
 
 test "a new touch lands most of the way to its pitch at once" {
-    var n = Noise.init(44100, 3, default_span);
+    var n = Noise.init(44100, 3, .{});
     const dev: i16 = 2200;
     const target = freqFromDeviation(dev, default_span);
     // One sample, so what is measured is the jump and not the glide after it.
     var block: [1]f32 = .{0};
     n.render(&block, dev, true);
 
-    const expected = freq_min + (target - freq_min) * onset_jump;
+    const expected = freq_min + (target - freq_min) * default_jump;
     try testing.expectApproxEqAbs(expected, n.fc, 1.0);
     // Short of the target: the settle has to stay audible.
     try testing.expect(n.fc < target);
 }
 
 test "a held touch glides the rest of the way instead of jumping again" {
-    var n = Noise.init(44100, 3, default_span);
+    var n = Noise.init(44100, 3, .{});
     const dev: i16 = 2200;
     var block: [1]f32 = .{0};
 
@@ -346,7 +391,7 @@ test "a held touch glides the rest of the way instead of jumping again" {
 }
 
 test "releasing re-arms the jump for the next touch" {
-    var n = Noise.init(44100, 3, default_span);
+    var n = Noise.init(44100, 3, .{});
     var block: [1]f32 = .{0};
 
     n.render(&block, 400, true);
@@ -355,5 +400,5 @@ test "releasing re-arms the jump for the next touch" {
 
     n.render(&block, 2800, true);
     const target = freqFromDeviation(2800, default_span);
-    try testing.expectApproxEqAbs(low + (target - low) * onset_jump, n.fc, 1.0);
+    try testing.expectApproxEqAbs(low + (target - low) * default_jump, n.fc, 1.0);
 }
