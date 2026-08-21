@@ -252,6 +252,24 @@ under ~15 s.
 
 This is asserted by a test rather than left to be discovered.
 
+**Measured, 2026-08-22.** Replaying the capture through the finished machine,
+the BC-only touch scores **z = −5.66** against a level of 6.0. It does not
+latch. The replay holds each row for a constant second of polls, so the 200 ms
+mean settles exactly onto the row's value and BC's MAD is the raw spread of the
+rows — 548 counts, with no averaging benefit at all. The rig samples 344 times a
+second, so a real 200 ms mean covers 69 samples and BC's MAD is smaller by
+somewhere between a little and a factor of eight, depending on how correlated
+the noise is. The replay is a zero-smoothing worst case the installation never
+runs in, and no choice of replay rate escapes it, because the captured rows are
+constant.
+
+What this means for the installation: if the real rig smooths as little as the
+fixture does, `--touch-level` must come down to about **5.1** before a BC-only
+touch will fire. Whether it needs to is the first thing a live CSV answers, and
+it now outranks every other open question here. The same measurement is
+reassuring about the other half of the design — BC's score on the crosstalk rows
+came out at −0.00, so the re-baselining silences the pull almost exactly.
+
 A second limitation is smaller but sharper: `both` requires a touch on BC to
 clear the threshold measured from the crosstalk floor, and the margin there
 rests on BC's MAD, which this capture cannot pin down. If it turns out too
@@ -272,7 +290,14 @@ knowing the capture rate, rather than an exact state sequence:
 - the rows where A is held and BC sits on the crosstalk floor produce
   `plant_a`, not `both` — even though those rows read identically to the row
   where BC is genuinely touched alone
-- the single row with A at rest and BC negative produces `plant_bc`
+- the single row with A at rest and BC negative is *seen*: BC's score there is
+  five and a half deviations out, where the rectified reading was 2049 and sat
+  inside the idle spread no threshold could separate. That it does not *latch*
+  is asserted deliberately — see the measurement below
+- BC's score on the crosstalk rows is far smaller in magnitude than its score on
+  that row, which is the arbitration demonstrated on measured data: the same
+  −2049 reading, loud when BC is touched alone and silent when it is only being
+  dragged
 
 The `both` case is left to a synthetic test, where the sample rate is known.
 

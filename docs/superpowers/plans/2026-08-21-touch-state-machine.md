@@ -1822,6 +1822,16 @@ git commit -m "feat(touchlog): write per-poll detection numbers to CSV"
 
 Two things this plan deliberately does not do, both needing the rig rather than the keyboard:
 
+0. **Settle whether `--touch-level = 6` is reachable at all.** This is now the
+   first question, not a confirmation. Replaying the bench capture, a real
+   BC-only touch scored **5.66 deviations** — under the threshold. That replay
+   gets no averaging benefit (its rows are constant, so BC's MAD is the raw
+   spread of 548), while the rig's 200 ms mean covers 69 samples and should
+   shrink it. Run with `--log-touch`, touch plant B alone several times, and
+   read `mad_bc` and `z_bc`. If `mad_bc` on the live rig is not several times
+   smaller than 548, lower `--touch-level` to about 5.1 — or raise
+   `--touch-average`, which shrinks the MAD without loosening plant A.
+
 1. **Confirm `--touch-level = 6` against a live session.** Run with `--log-touch`, touch each plant several times, and check from the CSV that `z_a` and `z_bc` during a touch clear 6 by a comfortable margin and that idle never approaches it. The number is derived from a 96-row capture; it wants a longer one.
 2. **Confirm that `both` is reachable on real hardware.** The `both` state needs a touch on BC to clear six deviations measured from the crosstalk floor A put it on. In simulation BC's idle noise is independent per poll, so the 200 ms mean smooths it and the margin is large; real noise is correlated and the margin will be smaller. From a live CSV, touch A and then also touch B, and read `z_bc` for those polls. If it sits under 6, the honest fix is a longer `--touch-average`, which smooths BC's idle more and shrinks its MAD — not a lower `--touch-level`, which would loosen both probes everywhere.
 3. **Confirm `--touch-baseline = 60` against real visitors.** If people hold a plant longer than about fifteen seconds, raise it — the failure mode is a touch that goes quiet while the hand is still there.
