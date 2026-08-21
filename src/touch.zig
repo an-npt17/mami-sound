@@ -670,3 +670,100 @@ test "a touch longer than half the baseline window reads as released" {
     // the score decays to nothing. Raise --touch-baseline to push this out.
     try testing.expectEqual(State.none, holdBoth(&m, 660, 900, 344 * 20));
 }
+
+const fixture = @embedFile("testdata/touch-sample.txt");
+
+const Row = struct { a: i16, bc: i16 };
+
+/// The bench capture, comment lines dropped.
+fn parseFixture(rows: *[128]Row) usize {
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, fixture, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        var cols = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const a_text = cols.next() orelse continue;
+        const bc_text = cols.next() orelse continue;
+        rows[n] = .{
+            .a = std.fmt.parseInt(i16, a_text, 10) catch continue,
+            .bc = std.fmt.parseInt(i16, bc_text, 10) catch continue,
+        };
+        n += 1;
+    }
+    return n;
+}
+
+test "the bench capture plays through the machine the way it was recorded" {
+    var rows: [128]Row = undefined;
+    const n = parseFixture(&rows);
+    // The capture, minus its comment header. A recount against the checked-in
+    // file (5 comment lines, then data) found 97 data rows, not the 96 the
+    // plan expected; the row-index assertions below were re-verified against
+    // that recount and line up on 0-based indexing, so 97 is what is asserted
+    // here rather than what the plan guessed before the file was final.
+    try testing.expectEqual(@as(usize, 97), n);
+
+    // The capture has no timestamps, so each row is held for a second of polls.
+    // That makes the idle prefix long enough to warm the median and keeps every
+    // touch well under half the baseline window.
+    const polls_per_row = 344;
+    var cfg = testConfig();
+    // The capture takes three rows to show the crosstalk arriving, so the
+    // settle window has to span them.
+    cfg.settle_ms = 4000.0;
+    var m = Machine.init(cfg);
+
+    var states: [128]State = undefined;
+    var z_bc: [128]f32 = undefined;
+    for (rows[0..n], 0..) |row, i| {
+        var state: State = .none;
+        for (0..polls_per_row) |_| state = m.update(row.a, row.bc);
+        states[i] = state;
+        z_bc[i] = m.bc.z;
+    }
+
+    // Rows 0-28 are the untouched rig. Nothing may fire there, and this is the
+    // claim that matters most: every false clip in the room starts here.
+    for (states[0..29]) |state| try testing.expectEqual(State.none, state);
+
+    // Rows 29-31: probe A has jumped to +660 while BC is still showing its
+    // ordinary positive noise.
+    try testing.expectEqual(State.plant_a, states[30]);
+
+    // Rows 33-35: A still held, BC pinned at the crosstalk floor. This is the
+    // claim the whole arbitration exists for — BC must not be reported as
+    // touched on the strength of a pull it did not choose, even though these
+    // rows read exactly like row 44, which is a real touch on BC.
+    for (states[33..36]) |state| try testing.expectEqual(State.plant_a, state);
+
+    // Row 44 is the only row in the capture with A at rest and BC negative: a
+    // touch on BC alone. What is asserted here is that the machine *sees* it —
+    // rectified, this reading was 2049, indistinguishable from the idle spread
+    // of 0..2023 the probe shows untouched, and no threshold could have found
+    // it. Signed, it is five and a half deviations out.
+    //
+    // It is deliberately not asserted that the latch fires. This replay holds
+    // each row for a whole second of polls, so the 200 ms mean settles exactly
+    // onto the row's value and BC's MAD is the raw spread of the rows, 548
+    // counts, with no averaging benefit whatever. The rig samples continuously,
+    // so a real 200 ms mean covers 69 samples and BC's MAD is far smaller. This
+    // is a zero-smoothing worst case the installation never runs in.
+    try testing.expect(z_bc[44] < -5.0);
+
+    // The arbitration's whole reason to exist, on measured data: the same
+    // -2049-ish reading is loud when BC is genuinely touched (row 44) and
+    // quiet when it is only being dragged by A's crosstalk (rows 33-35, scored
+    // against the settled override). If these scores were comparable, nothing
+    // would tell a real BC touch apart from A's shadow.
+    for (z_bc[33..36]) |z| try testing.expect(@abs(z) < @abs(z_bc[44]));
+
+    // Rows 36-37 (-3947, -3766) are what a real touch on BC on top of A's
+    // crosstalk looks like, and `both` is what the machine should say there.
+    // It is deliberately not asserted: the capture carries no timestamps, so
+    // this test holds each row for a second, and at that rate the 200 ms mean
+    // does no smoothing and BC's MAD stays as wide as its raw spread. Whether
+    // -3947 clears six deviations from the -2049 floor depends on a sample rate
+    // this file does not record. The synthetic test in Task 4 covers the rule;
+    // a live CSV settles the margin.
+}
