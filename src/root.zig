@@ -16,6 +16,7 @@ pub const sampler = @import("sampler.zig");
 pub const tone = @import("tone.zig");
 pub const cli = @import("cli.zig");
 pub const trigger = @import("trigger.zig");
+pub const touch = @import("touch.zig");
 pub const library = @import("library.zig");
 
 pub const sample_rate: u32 = 44100;
@@ -60,6 +61,7 @@ test {
     _ = tone;
     _ = cli;
     _ = trigger;
+    _ = touch;
     _ = library;
 }
 
@@ -78,7 +80,7 @@ fn toneClip(gpa: std.mem.Allocator, len: usize) ![]f32 {
 
 /// Render `blocks` blocks with the given touch state held throughout and return
 /// the loudest sample produced. This is the same voice wiring `main` uses.
-fn peakOf(touch: [3]bool, blocks: usize) !f32 {
+fn peakOf(touch_state: [3]bool, blocks: usize) !f32 {
     const gpa = testing.allocator;
 
     const clip_b = try toneClip(gpa, sample_rate * 2);
@@ -95,9 +97,9 @@ fn peakOf(touch: [3]bool, blocks: usize) !f32 {
 
     for (0..blocks) |_| {
         @memset(&block, 0);
-        voice_a.render(&block, 16500, touch[0]);
-        voice_b.render(&block, touch[1]);
-        voice_c.render(&block, touch[2]);
+        voice_a.render(&block, 16500, touch_state[0]);
+        voice_b.render(&block, touch_state[1]);
+        voice_c.render(&block, touch_state[2]);
         for (block) |s| peak = @max(peak, @abs(s));
     }
     return peak;
