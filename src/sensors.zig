@@ -1,18 +1,16 @@
 //! Plant sensors: two ECG-style biopotential probes and one motion sensor per
 //! plant.
 //!
-//! The probes do different jobs. The one on AIN0 is plant A's, and its reading
-//! is a pitch: it is all plant A's voice ever listens to. The one on AIN1 sits
-//! on the other side of the room and is a switch rather than a pitch — crossing
-//! its threshold is what lets plants B and C play their clips. Neither probe
-//! reaches the other's plants.
+//! The probes do different jobs. The one across AIN0 and AIN1 is plant A's, and
+//! its reading is a pitch: it is all plant A's voice ever listens to. The one
+//! across AIN2 and AIN3 sits on the other side of the room and says when plants
+//! B and C may play their clips. Neither probe reaches the other's plants.
 //!
 //! Each input has a real backend and a simulated one, attached or not at start
 //! up: the probes read an ADS1115 over I2C or an imitation of the bench, and
-//! the plants
-//! wake on GPIO motion lines or on a scripted timeline. Nothing downstream can
-//! tell the difference, so the whole engine runs on a machine with no hardware
-//! attached.
+//! the plants wake on GPIO motion lines or on a scripted timeline. Nothing
+//! downstream can tell the difference, so the whole engine runs on a machine
+//! with no hardware attached.
 
 const std = @import("std");
 const ads1115 = @import("ads1115.zig");
@@ -20,10 +18,15 @@ const gpio = @import("gpio.zig");
 
 pub const plant_count = 3;
 
-/// Where each probe is wired. Both are read against ground: these are two
-/// separate probes on one chip, not the two halves of a differential pair.
-pub const input_a: ads1115.Mux = .ain0_gnd;
-pub const input_bc: ads1115.Mux = .ain1_gnd;
+/// Where each probe is wired. Each one is a differential pair rather than a pin
+/// read against ground: the probe sits across the two inputs, so interference
+/// arriving on both of them at once — mains hum, most of all — subtracts away
+/// instead of landing in the reading.
+///
+/// The chip offers four differential combinations and these are the only two
+/// that share no pin, so neither probe sits on the other's reference.
+pub const input_a: ads1115.Mux = .ain0_ain1;
+pub const input_bc: ads1115.Mux = .ain2_ain3;
 
 /// The converter's full scale: 32767 at the configured range, 0 at ground.
 ///
@@ -33,9 +36,15 @@ pub const input_bc: ads1115.Mux = .ain1_gnd;
 /// pitch and need to know how big a count can get.
 pub const ecg_max: i16 = std.math.maxInt(i16);
 
-/// What the untouched rig reads on the bench, which is what the simulation
-/// imitates. Probe A sits below ground and barely moves; probe BC floats and
-/// picks up whatever is in the room, always positive.
+/// What the untouched rig read on the bench, which is what the simulation
+/// imitates. Probe A sat below ground and barely moved; probe BC floated and
+/// picked up whatever was in the room, always positive.
+///
+/// Measured before the probes were moved to differential pairs, so these are
+/// the shape of a reading rather than the rig's current numbers: a probe that
+/// rests off zero and moves further on a touch. Nothing in detection reads
+/// them — it measures each probe against its own median — but they want
+/// re-taking from a live `--log-touch` capture before anyone quotes them.
 const sim_a_rest: i16 = -2049;
 const sim_bc_max: u16 = 2000;
 
@@ -314,9 +323,18 @@ test "the simulation never fakes a touch" {
     }
 }
 
-test "the probes are two single-ended inputs, not a differential pair" {
-    try testing.expectEqual(ads1115.Mux.ain0_gnd, input_a);
-    try testing.expectEqual(ads1115.Mux.ain1_gnd, input_bc);
+test "each probe is a differential pair, not a pin read against ground" {
+    for ([_]ads1115.Mux{ input_a, input_bc }) |mux| {
+        try testing.expect(mux != .ain0_gnd and mux != .ain1_gnd and
+            mux != .ain2_gnd and mux != .ain3_gnd);
+    }
+}
+
+test "the two pairs share no pin" {
+    // The chip offers four differential combinations and these are the only
+    // two that do not overlap, so neither probe sits on the other's reference.
+    try testing.expectEqual(ads1115.Mux.ain0_ain1, input_a);
+    try testing.expectEqual(ads1115.Mux.ain2_ain3, input_bc);
     try testing.expect(input_a != input_bc);
 }
 

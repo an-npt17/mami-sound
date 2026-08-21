@@ -210,7 +210,7 @@ pub const usage =
     \\drawn is printed at start up.
     \\
     \\--voice selects what plant A sounds like. All three take their pitch from
-    \\the probe on AIN0, and nothing else does:
+    \\the probe across AIN0 and AIN1, and nothing else does:
     \\  drone  filtered noise, pitch following the probe (default)
     \\  flute  recorded flute notes, replayed at the probe's pitch
     \\  beep   a bare synthesized sine at the probe's pitch
@@ -228,9 +228,10 @@ pub const usage =
     \\-2049 and one resting at +1000 are both asked the same question.
     \\
     \\--touch-average is how long a reading is averaged over before the score
-    \\sees it, 200 ms by default. Nothing is rectified: this rig's probes rest
-    \\below ground and one of them rises through it when touched, so the sign
-    \\is the signal.
+    \\sees it, 200 ms by default. Nothing is rectified: a probe rests wherever
+    \\its wiring leaves it, above or below zero, and a touch can move it either
+    \\way from there, so the sign is the signal and folding it away would throw
+    \\half of it out.
     \\
     \\--touch-hold is how long the score must keep saying so before it counts,
     \\100 ms by default. The score is tested 344 times a second, so without a
@@ -264,7 +265,8 @@ pub const usage =
     \\it the clip fades out and the next turn begins at once. Pass 0 to let
     \\every clip play to its end.
     \\
-    \\B and C share the probe on AIN1, so they take turns, one clip per touch:
+    \\B and C share the probe across AIN2 and AIN3, so they take turns, one clip
+    \\per touch:
     \\the first touch plays the interview, and when it ends nothing sounds
     \\until the next touch, which plays the waterfall. Then the interview
     \\again, and so on. A clip plays through even if the touch ends, and a
@@ -281,12 +283,17 @@ pub const usage =
     \\until stopped, as the installation does; B and C are one-shots, so they
     \\sound once at the start and plant A carries the rest.
     \\
-    \\Both probes are read against ground on one ADS1115, plant A's on AIN0 and
-    \\plants B and C's on AIN1. Which pin is which is wiring, not a flag. The
-    \\chip has one converter, so it is switched between the two once a block and
-    \\each is sampled every other block. The count is passed on signed and
-    \\unrectified: a probe resting below ground and rising through it when
-    \\touched is exactly what the sign is there to carry.
+    \\Both probes sit on one ADS1115, each across a differential pair rather
+    \\than against ground: plant A's on AIN0-AIN1, plants B and C's on
+    \\AIN2-AIN3. Those are the only two of the chip's four differential
+    \\combinations that share no pin, so neither probe sits on the other's
+    \\reference, and interference reaching both halves of a pair at once —
+    \\mains hum, most of all — subtracts away instead of landing in the
+    \\reading. Which pin is which is wiring, not a flag. The chip has one
+    \\converter, so it is switched between the two probes once a block and each
+    \\is sampled every other block. The count is passed on signed and
+    \\unrectified: which way a probe moves from its rest is exactly what the
+    \\sign is there to carry.
     \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the

@@ -8,8 +8,8 @@ Status: approved design, not yet implemented
 Replace the single absolute threshold that decides when a plant is touched with
 a two-stage state machine that decides *which* plant is touched.
 
-The installation has two biopotential probes on one ADS1115: plant A on AIN0,
-plants B and C sharing one on AIN1. Today a single `--trigger=LEVEL` compares
+The installation has two biopotential probes on one ADS1115: plant A's and one
+shared by plants B and C. Today a single `--trigger=LEVEL` compares
 the rectified AIN1 reading against a number typed on the command line. No number
 has been found that works: it fires on nothing, or refuses to fire on a hand.
 This design says why that is, and replaces the threshold with a per-probe
@@ -19,7 +19,19 @@ that separates a genuine touch from crosstalk.
 ## Why the threshold cannot exist today
 
 Bench capture, two columns of raw ADS1115 counts, column 1 = probe A,
-column 2 = probe BC:
+column 2 = probe BC.
+
+> **Wiring, 2026-08-22.** The capture below was taken with each probe read
+> single-ended against ground, plant A on AIN0 and plants B and C on AIN1. The
+> rig has since been rewired so each probe spans a differential pair instead —
+> A on AIN0-AIN1, BC on AIN2-AIN3 — to reject the mains hum that arrives on
+> both halves of a pair at once. Nothing in this design depends on which it is:
+> every stage measures a probe against its own rolling median, so a resting
+> level is whatever that probe rests at. What the rewiring does invalidate is
+> the *magnitudes* quoted from here on — the −2049 rest, the ≈2700-count touch
+> behind `--pitch-span`, and the 5.66 deviations measured for a BC-only touch.
+> Those want re-taking from a live `--log-touch` capture before they are quoted
+> again.
 
 | probe | untouched | touched |
 |---|---|---|
