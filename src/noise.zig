@@ -20,7 +20,7 @@ pub const freq_max: f32 = 1000.0;
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
 /// deviation wiggles faster than this never reach the filter. Raise it to make
 /// plant A answer more slowly.
-pub const default_glide_s: f32 = 1.0;
+pub const default_glide_s: f32 = 0.5;
 
 /// Gate fade length, long enough to avoid a click at touch and release.
 const gate_ms: f32 = 150.0;
