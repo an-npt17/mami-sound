@@ -93,13 +93,23 @@ pub fn touchAt(t: f32) [plant_count]bool {
 
 /// Fold an ADS1115 reading onto the range the voices expect.
 ///
-/// The probe reads plant health as a level against ground, so a healthy plant
-/// sits somewhere in the positive half of the register and the count passes
-/// straight through. Only the negative half is folded away: a differential
-/// input, or noise around ground, swings below zero and the voices have no
-/// pitch for that. Pure, so the mapping is testable without a chip.
+/// The voices want a level from 0 up, and the register hands over a signed
+/// count that swings both sides of ground. Distance from ground is the level:
+/// the magnitude passes through and the sign is dropped, so a probe sitting
+/// below ground reads as hard at work rather than as silence.
+///
+/// Folding the negative half to zero instead — the obvious reading of "the
+/// voices have no pitch for that" — loses the rig. Measured on the bench, one
+/// probe rests near -2050 counts and the other swings about ground, so a
+/// positive-only fold pins the first channel at silence forever and throws
+/// away every second half-cycle of the other. Full-wave keeps both, and
+/// doubles what `trigger.Average` sees from an AC signal.
+///
+/// `minInt` has no positive twin in an i16 and saturates to `ecg_max`. Pure,
+/// so the mapping is testable without a chip.
 pub fn ecgFromAdc(raw: i16) i16 {
-    return @max(raw, 0);
+    if (raw == std.math.minInt(i16)) return ecg_max;
+    return @intCast(@abs(raw));
 }
 
 /// One step of a simulated probe's random walk. Each probe gets its own draw,
@@ -277,13 +287,17 @@ pub const Sensors = struct {
 const testing = std.testing;
 
 test "adc readings land inside the voice's range" {
-    // The count the chip reports is the number the voices see, untouched.
+    // A positive count is the number the voices see, untouched.
     try testing.expectEqual(@as(i16, 0), ecgFromAdc(0));
     try testing.expectEqual(@as(i16, 16384), ecgFromAdc(16384));
     try testing.expectEqual(ecg_max, ecgFromAdc(ecg_max));
-    // The register swings below ground; the voices' range does not.
-    try testing.expectEqual(@as(i16, 0), ecgFromAdc(-5000));
-    try testing.expectEqual(@as(i16, 0), ecgFromAdc(std.math.minInt(i16)));
+    // The register swings below ground; distance from ground is the level, so
+    // the two halves of a swing read the same rather than one of them reading
+    // as silence.
+    try testing.expectEqual(@as(i16, 5000), ecgFromAdc(-5000));
+    try testing.expectEqual(ecgFromAdc(2049), ecgFromAdc(-2049));
+    // No positive twin for the bottom of the range: it saturates.
+    try testing.expectEqual(ecg_max, ecgFromAdc(std.math.minInt(i16)));
 }
 
 test "by default every plant is awake from the first block" {

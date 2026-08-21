@@ -45,11 +45,13 @@ pub fn holdPolls(hold_ms: f32, sample_rate: u32, poll_frames: usize) u32 {
 /// altogether once the window has passed, where a one-pole would let it decay
 /// away with a long tail.
 ///
-/// The readings have already had their negative half folded to zero by
+/// The readings have already been folded to their magnitude by
 /// `sensors.ecgFromAdc`, which makes this an envelope rather than a mean: a
 /// probe swinging about ground averages to something above zero, in proportion
 /// to how hard it is swinging. That is a level a threshold can be set against,
-/// where the raw samples are half zeroes and half peaks.
+/// where the raw samples cancel to nothing. Full-wave, so the envelope of a
+/// swing is about 0.64 of its peak rather than the 0.32 a positive-only fold
+/// would leave — thresholds carried over from that fold read twice as eager.
 pub const Average = struct {
     window: [max_window_polls]u16,
     /// How many polls the mean is taken over.
@@ -229,8 +231,9 @@ test "the average is an envelope: a signal about ground reads above zero" {
     var a = Average.init(100);
     var mean: i16 = 0;
     for (0..1000) |i| {
-        // What `sensors.ecgFromAdc` hands over for an AC signal: the positive
-        // half, with the negative half folded to zero.
+        // What `sensors.ecgFromAdc` hands over for a signal about ground: the
+        // magnitude, so both halves of the swing arrive as a level. A swing
+        // that spends half its time at the peak and half near ground.
         const reading: i16 = if (i % 2 == 0) 20000 else 0;
         mean = a.push(reading);
     }

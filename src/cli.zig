@@ -199,10 +199,10 @@ pub const usage =
     \\means. Without --trigger they go back to sounding when they are awake.
     \\
     \\--trigger-average is how long the reading is averaged over before LEVEL
-    \\sees it, 200 ms by default. A probe swings about ground and its negative
-    \\half reads as zero, so the raw samples are half nothing and half peaks;
-    \\their average is a level, and that is what LEVEL should be set against.
-    \\Pass 0 to compare raw samples instead.
+    \\sees it, 200 ms by default. A probe swings about ground and is read as
+    \\its distance from ground, so the raw samples run from nothing up to the
+    \\peak twice a cycle; their average is a level, and that is what LEVEL
+    \\should be set against. Pass 0 to compare raw samples instead.
     \\
     \\--trigger-hold is how long the averaged reading must then stay over LEVEL
     \\before it counts
@@ -221,7 +221,8 @@ pub const usage =
     \\Both probes are read against ground on one ADS1115, plant A's on AIN0 and
     \\the trigger probe on AIN1. Which pin is which is wiring, not a flag. The
     \\chip has one converter, so it is switched between the two once a block and
-    \\each is sampled every other block. A probe below ground reads as zero.
+    \\each is sampled every other block. Sign is dropped: a probe below ground
+    \\reads as the same level as one the same distance above it.
     \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
