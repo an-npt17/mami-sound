@@ -49,22 +49,46 @@ pub fn main(init: std.process.Init) !void {
             error.TooManyArguments => std.debug.print("takes at most one plant selection.\n\n", .{}),
             error.InvalidSelection => std.debug.print("PLANTS must be digits 1-3.\n\n", .{}),
             error.UnknownVoice => std.debug.print("--voice must be drone, flute or beep.\n\n", .{}),
-            error.UnknownTouch => std.debug.print("--touch must be always, script or motion.\n\n", .{}),
-            error.InvalidTrigger => std.debug.print(
-                "--trigger takes a whole number between 0 and {d}, or nothing at all.\n\n",
-                .{ms.sensors.ecg_max},
-            ),
+            error.UnknownTouch => std.debug.print("--touch must be probes, always, script or motion.\n\n", .{}),
+            error.TriggerRetired => std.debug.print(
+                \\--trigger is gone. The threshold it set could not exist: the
+                \\reading was rectified before it was compared, which folded one
+                \\probe's touched state onto its untouched one.
+                \\Use --touch-level, which is in deviations and serves both
+                \\probes. See --help.
+                \\
+            , .{}),
             error.InvalidInterrupt => std.debug.print(
                 "--interrupt takes seconds between 0 and 3600.\n\n",
                 .{},
             ),
-            error.InvalidTriggerAverage => std.debug.print(
-                "--trigger-average takes milliseconds between 0 and 3000.\n\n",
+            error.InvalidTouchLevel => std.debug.print(
+                "--touch-level takes deviations between 1 and 100.\n\n",
                 .{},
             ),
-            error.InvalidTriggerHold => std.debug.print(
-                "--trigger-hold takes milliseconds between 0 and 5000.\n\n",
+            error.InvalidTouchHold => std.debug.print(
+                "--touch-hold takes milliseconds between 0 and 5000.\n\n",
                 .{},
+            ),
+            error.InvalidTouchAverage => std.debug.print(
+                "--touch-average takes milliseconds between 0 and 3000.\n\n",
+                .{},
+            ),
+            error.InvalidTouchBaseline => std.debug.print(
+                "--touch-baseline takes seconds between 0 and 100.\n\n",
+                .{},
+            ),
+            error.InvalidTouchSettle => std.debug.print(
+                "--touch-settle takes milliseconds between 0 and 5000.\n\n",
+                .{},
+            ),
+            error.InvalidPitchSpan => std.debug.print(
+                "--pitch-span takes a whole number of counts above zero.\n\n",
+                .{},
+            ),
+            error.InvalidLogPath => std.debug.print(
+                "--log-touch takes a path of up to {d} characters.\n\n",
+                .{ms.cli.path_max},
             ),
             error.InvalidDevice => std.debug.print("--device needs a name, at most 63 characters.\n\n", .{}),
             error.UnknownFlag => std.debug.print("unknown flag.\n\n", .{}),
@@ -114,9 +138,9 @@ pub fn main(init: std.process.Init) !void {
         .flute => if (flute.len != 0)
             .{ .flute = ms.sampler.Voice.init(flute, ms.sample_rate, ms.sensors.ecg_max) }
         else
-            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, ms.noise.default_span) },
+            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, opts.pitch_span) },
         .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.ecg_max) },
-        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, ms.noise.default_span) },
+        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, opts.pitch_span) },
     };
     // B and C answer one probe between them, so they are one voice with two
     // folders rather than two voices that happen to share a threshold.
@@ -127,16 +151,18 @@ pub fn main(init: std.process.Init) !void {
         draw,
     );
 
-    // The threshold, debounced. A reading is a vote rather than a decision:
-    // see `trigger.zig` for why one poll of it cannot be trusted.
-    var gate: ?ms.trigger.Trigger = if (opts.trigger_level) |level|
-        ms.trigger.Trigger.init(
-            level,
-            ms.trigger.holdPolls(opts.trigger_hold_ms, ms.sample_rate, ms.sensor_frames),
-            ms.trigger.holdPolls(opts.trigger_average_ms, ms.sample_rate, ms.sensor_frames),
-        )
-    else
-        null;
+    // Both probes, each judged against its own recent past. A reading is a vote
+    // rather than a decision: see `touch.zig` for why one poll cannot be
+    // trusted, and for what happens to the other probe when this one is held.
+    var machine = ms.touch.Machine.init(.{
+        .sample_rate = ms.sample_rate,
+        .poll_frames = ms.sensor_frames,
+        .level = opts.touch_level,
+        .hold_ms = opts.touch_hold_ms,
+        .average_ms = opts.touch_average_ms,
+        .baseline_s = opts.touch_baseline_s,
+        .settle_ms = opts.touch_settle_ms,
+    });
 
     var block: [ms.block_frames]f32 = undefined;
     var pcm: [ms.block_frames]i16 = undefined;
@@ -161,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
         // rate rather than the sound card's.
         var raw_a: i16 = 0;
         var raw_bc: i16 = 0;
+        var state: ms.touch.State = .none;
         var touch: [ms.sensors.plant_count]bool = undefined;
 
         var offset: usize = 0;
@@ -173,23 +200,33 @@ pub fn main(init: std.process.Init) !void {
             // Disabled plants read as untouched, so their voices never open.
             touch = ms.select.apply(sel, reading.touch);
 
-            // The AIN1 probe *is* the touch for plants B and C: crossing the
-            // threshold plays one clip, and the other waits for the next
-            // crossing. Their motion sensors have no say — a threshold was
-            // asked for, so the threshold is the sensor. Without one there is
-            // nothing to cross, and the plants fall back to being awake.
-            //
-            // Passed as a level rather than wrapped around `render`, because
-            // the clip has to keep running once started: skipping the call
-            // would freeze it mid-word and resume it later, where this way the
-            // threshold only decides when a clip *begins*.
-            const open = if (gate) |*g|
-                g.update(raw_bc)
-            else
-                touch[1] or touch[2];
+            // The machine runs in every mode, not only under `probes`: plant
+            // A's pitch is how far its probe has moved from rest whoever is
+            // deciding when to open the voice, and a machine left unpolled
+            // reports a deviation of zero forever, which pins the drone at the
+            // bottom of its range for the whole of a demonstration.
+            const probed = machine.update(raw_a, raw_bc);
 
-            // Plant A hears its own probe, and only that one.
-            voice_a.render(piece, raw_a, touch[0]);
+            // The probes decide, unless a demonstration asked for something
+            // else. `select` masks a plant that was left out of this run, which
+            // is all it takes to keep its voice shut.
+            state = switch (opts.touch) {
+                .probes => probed,
+                else => stateFrom(touch),
+            };
+            const a_touched = sel[0] and (state == .plant_a or state == .both);
+            const open = (sel[1] or sel[2]) and
+                (state == .plant_bc or state == .both);
+            // So the status line reports what the voice was told rather than
+            // what the motion sensors said, which under `probes` nothing read.
+            touch[0] = a_touched;
+
+            // Plant A hears its own probe, as a distance from that probe's
+            // rest. Untouched that distance is zero, so the drone sits at the
+            // bottom of its range and hums rather than falling silent — and
+            // while the other plant is being touched, plant A holds there too,
+            // with no special case for it.
+            voice_a.render(piece, machine.a.deviation(), a_touched);
 
             // The threshold is tested here, every poll, 344 times a second,
             // while the status line below prints once a second. A reading that
@@ -222,9 +259,10 @@ pub fn main(init: std.process.Init) !void {
         };
 
         rendered += ms.block_frames;
-        // The letters report what the voices were told, threshold included, so
-        // a line showing `A--` under `--trigger` is the gate doing its job.
-        status.observe(io, raw_a, raw_bc, touch, &block, rendered);
+        // The letters report what the voices were told, detection included, so
+        // a line showing `A--` while a hand is on plant A is the arbitration
+        // doing its job.
+        status.observe(io, raw_a, raw_bc, machine.a.z, machine.bc.z, state, touch, &block, rendered);
     }
 
     try out.finish();
@@ -275,9 +313,11 @@ fn reportSinkDeath(gpa: std.mem.Allocator, io: std.Io, device: []const u8) noret
 ///     wants more, so a healthy run sits at x1.00. Much above that means
 ///     nothing is being paced: the samples are going somewhere that swallows
 ///     them, which is the shape of a wrong `--device`.
-///   * `a0` and `a1` are the two probes and `touch` the motion sensors, all as
-///     the voices see them. `a0` is plant A's pitch; `a1` is the number the
-///     `--trigger` threshold is compared against.
+///   * `a0` and `a1` are the two probes as the chip reported them, signed and
+///     unrectified, and `z0` and `z1` are how many deviations from its own
+///     rest each one is reading. `--touch-level` is the line those two scores
+///     are held against. The name after them is the state the pair produced,
+///     and `touch` is what each voice was told.
 const Status = struct {
     /// When the last line went out, so each line reports the second it covers
     /// rather than an average since startup. An average would hide a sink that
@@ -303,6 +343,9 @@ const Status = struct {
         io: std.Io,
         raw_a: i16,
         raw_bc: i16,
+        z_a: f32,
+        z_bc: f32,
+        state: ms.touch.State,
         touched: [ms.sensors.plant_count]bool,
         block: []const f32,
         rendered: usize,
@@ -324,10 +367,22 @@ const Status = struct {
             out.* = if (awake) letter else '-';
         }
 
-        std.debug.print("t={d:.0}s a0={d} a1={d} touch={s}\n", .{ audio_s, raw_a, raw_bc, &touch });
+        std.debug.print("t={d:.0}s a0={d} a1={d} z0={d:.1} z1={d:.1} {s} touch={s}\n", .{
+            audio_s, raw_a, raw_bc, z_a, z_bc, @tagName(state), &touch,
+        });
         self.peak = 0.0;
     }
 };
+
+/// The state a motion-driven or scripted run reports, so the demonstration
+/// modes reach the voices through the same door the probes do.
+fn stateFrom(touched: [ms.sensors.plant_count]bool) ms.touch.State {
+    const bc = touched[1] or touched[2];
+    if (touched[0] and bc) return .both;
+    if (touched[0]) return .plant_a;
+    if (bc) return .plant_bc;
+    return .none;
+}
 
 /// Attach whichever devices are actually present. Each one falls back to its
 /// simulation on its own, so the same binary runs on the finished installation,
@@ -353,7 +408,8 @@ fn openSensors(touch: ms.cli.Touch) ms.sensors.Sensors {
     switch (touch) {
         // The GPIO sensors are only opened when they are asked for, so a run
         // during bring-up neither depends on them nor complains about them.
-        .always => {},
+        // Under `probes` nothing reads them at all.
+        .probes, .always => {},
         .script => sens.useScript(),
         .motion => {
             if (ms.gpio.Lines.openDefault(&ms.gpio.default_offsets, .{})) |lines| {

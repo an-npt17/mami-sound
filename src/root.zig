@@ -15,7 +15,6 @@ pub const select = @import("select.zig");
 pub const sampler = @import("sampler.zig");
 pub const tone = @import("tone.zig");
 pub const cli = @import("cli.zig");
-pub const trigger = @import("trigger.zig");
 pub const touch = @import("touch.zig");
 pub const library = @import("library.zig");
 
@@ -60,7 +59,6 @@ test {
     _ = sampler;
     _ = tone;
     _ = cli;
-    _ = trigger;
     _ = touch;
     _ = library;
 }

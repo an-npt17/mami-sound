@@ -5,24 +5,25 @@
 
 const std = @import("std");
 const select = @import("select.zig");
-const sensors = @import("sensors.zig");
-const trigger = @import("trigger.zig");
+const noise = @import("noise.zig");
+const touch = @import("touch.zig");
 
 pub const Error = error{
     UnknownFlag,
     UnknownVoice,
     UnknownTouch,
     InvalidDevice,
-    InvalidTrigger,
-    InvalidTriggerHold,
-    InvalidTriggerAverage,
+    InvalidTouchLevel,
+    InvalidTouchHold,
+    InvalidTouchAverage,
+    InvalidTouchBaseline,
+    InvalidTouchSettle,
+    InvalidPitchSpan,
+    InvalidLogPath,
+    TriggerRetired,
     InvalidInterrupt,
     TooManyArguments,
 } || select.Error;
-
-/// Threshold `--trigger` means when given no number of its own: the AIN1 probe
-/// pinned at the top of its range.
-pub const default_trigger: i16 = sensors.ecg_max;
 
 /// How long a clip plays before a touch is allowed to cut it short. Long
 /// enough that a visitor hears what they started, short enough that they are
@@ -31,7 +32,11 @@ pub const default_interrupt_s: f32 = 10.0;
 
 /// What decides when a plant is awake.
 pub const Touch = enum {
-    /// Every plant, always. The default while the motion sensors are not wired.
+    /// The probes themselves, each judged against its own recent past. The
+    /// installation.
+    probes,
+    /// Every plant, always. What to use while chasing a fault in the mix or the
+    /// sound card, since it takes detection out of the picture entirely.
     always,
     /// The scripted timeline the piece was built against.
     script,
@@ -47,6 +52,9 @@ pub const default_device = "default";
 /// included.
 pub const device_max = 63;
 
+/// Long enough for any path a log is likely to be pointed at.
+pub const path_max = 255;
+
 /// What renders plant A.
 pub const Voice = enum {
     /// Filtered noise whose pitch follows the ECG. The original installation.
@@ -60,17 +68,23 @@ pub const Voice = enum {
 pub const Options = struct {
     plants: select.Selection = select.all,
     voice: Voice = .drone,
-    touch: Touch = .always,
-    /// The reading the AIN1 probe must reach before plants B and C are allowed
-    /// to sound. `null` lets them sound whenever they are awake, as before.
-    trigger_level: ?i16 = null,
-    /// How long the reading has to stay over the threshold before it counts as
-    /// a touch, in milliseconds. Guards against a single noisy sample starting
-    /// a clip that runs for minutes.
-    trigger_hold_ms: f32 = trigger.default_hold_ms,
-    /// How long the reading is averaged over before the threshold sees it.
-    /// What turns a probe swinging about ground into a level.
-    trigger_average_ms: f32 = trigger.default_window_ms,
+    touch: Touch = .probes,
+    /// How many deviations from its own median a probe must read before it
+    /// counts as touched. One number for both probes.
+    touch_level: f32 = touch.default_level,
+    /// How long the score must keep saying so, in milliseconds.
+    touch_hold_ms: f32 = touch.default_hold_ms,
+    /// How long a reading is averaged over before the score sees it.
+    touch_average_ms: f32 = touch.default_average_ms,
+    /// How far back the median looks, in seconds. Wants to be about four times
+    /// the longest touch expected: a touch filling more than half the window
+    /// teaches the median that it is the resting state.
+    touch_baseline_s: f32 = touch.default_baseline_s,
+    /// How long the other probe is given to settle after this one is touched,
+    /// before its crosstalk level is taken as its temporary rest.
+    touch_settle_ms: f32 = touch.default_settle_ms,
+    /// The deviation that maps to the top of plant A's pitch range.
+    pitch_span: i16 = noise.default_span,
     /// How long a clip must have been playing before a fresh touch may cut it
     /// short and draw another, in seconds. Zero lets every clip finish.
     interrupt_s: f32 = default_interrupt_s,
@@ -80,10 +94,19 @@ pub const Options = struct {
     device_buf: [device_max]u8 = undefined,
     /// Zero means nothing was asked for.
     device_len: usize = 0,
+    /// Where the per-poll CSV goes, carried inline for the same reason the
+    /// device name is.
+    log_path_buf: [path_max]u8 = undefined,
+    log_path_len: usize = 0,
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
         return self.device_buf[0..self.device_len];
+    }
+
+    pub fn logPath(self: *const Options) ?[]const u8 {
+        if (self.log_path_len == 0) return null;
+        return self.log_path_buf[0..self.log_path_len];
     }
 };
 
@@ -96,30 +119,52 @@ pub fn parse(args: []const []const u8) Error!Options {
         if (std.mem.startsWith(u8, arg, "--voice=")) {
             const name = arg["--voice=".len..];
             opts.voice = std.meta.stringToEnum(Voice, name) orelse return Error.UnknownVoice;
-        } else if (std.mem.eql(u8, arg, "--trigger")) {
-            opts.trigger_level = default_trigger;
-        } else if (std.mem.startsWith(u8, arg, "--trigger=")) {
-            // A threshold outside the sensor's range would either never fire or
-            // always fire, which is a typo rather than an intention. The top of
-            // the range is the largest `i16`, so the parse itself rejects
-            // anything above it and only the negative half is left to check.
-            const level = std.fmt.parseInt(i16, arg["--trigger=".len..], 10) catch
-                return Error.InvalidTrigger;
-            if (level < 0) return Error.InvalidTrigger;
-            opts.trigger_level = level;
-        } else if (std.mem.startsWith(u8, arg, "--trigger-hold=")) {
-            const held = std.fmt.parseFloat(f32, arg["--trigger-hold=".len..]) catch
-                return Error.InvalidTriggerHold;
-            // A hold longer than a few seconds is a threshold nobody can cross
-            // on purpose; NaN fails the first test.
-            if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTriggerHold;
-            opts.trigger_hold_ms = held;
-        } else if (std.mem.startsWith(u8, arg, "--trigger-average=")) {
-            const window = std.fmt.parseFloat(f32, arg["--trigger-average=".len..]) catch
-                return Error.InvalidTriggerAverage;
-            // Past a few seconds the average stops tracking a touch at all.
-            if (!(window >= 0.0) or window > 3000.0) return Error.InvalidTriggerAverage;
-            opts.trigger_average_ms = window;
+        } else if (std.mem.eql(u8, arg, "--trigger") or
+            std.mem.startsWith(u8, arg, "--trigger=") or
+            std.mem.startsWith(u8, arg, "--trigger-hold=") or
+            std.mem.startsWith(u8, arg, "--trigger-average="))
+        {
+            // Named rather than swept into UnknownFlag: anyone running the
+            // installation has these in a shell history somewhere.
+            return Error.TriggerRetired;
+        } else if (std.mem.startsWith(u8, arg, "--touch-level=")) {
+            const level = std.fmt.parseFloat(f32, arg["--touch-level=".len..]) catch
+                return Error.InvalidTouchLevel;
+            // Under about two deviations everything is a touch, and past a
+            // hundred nothing is.
+            if (!(level >= 1.0) or level > 100.0) return Error.InvalidTouchLevel;
+            opts.touch_level = level;
+        } else if (std.mem.startsWith(u8, arg, "--touch-hold=")) {
+            const held = std.fmt.parseFloat(f32, arg["--touch-hold=".len..]) catch
+                return Error.InvalidTouchHold;
+            if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTouchHold;
+            opts.touch_hold_ms = held;
+        } else if (std.mem.startsWith(u8, arg, "--touch-average=")) {
+            const window = std.fmt.parseFloat(f32, arg["--touch-average=".len..]) catch
+                return Error.InvalidTouchAverage;
+            if (!(window >= 0.0) or window > 3000.0) return Error.InvalidTouchAverage;
+            opts.touch_average_ms = window;
+        } else if (std.mem.startsWith(u8, arg, "--touch-baseline=")) {
+            const window = std.fmt.parseFloat(f32, arg["--touch-baseline=".len..]) catch
+                return Error.InvalidTouchBaseline;
+            // A hundred seconds is the longest the buffer holds at ten hertz.
+            if (!(window > 0.0) or window > 100.0) return Error.InvalidTouchBaseline;
+            opts.touch_baseline_s = window;
+        } else if (std.mem.startsWith(u8, arg, "--touch-settle=")) {
+            const settle = std.fmt.parseFloat(f32, arg["--touch-settle=".len..]) catch
+                return Error.InvalidTouchSettle;
+            if (!(settle >= 0.0) or settle > 5000.0) return Error.InvalidTouchSettle;
+            opts.touch_settle_ms = settle;
+        } else if (std.mem.startsWith(u8, arg, "--pitch-span=")) {
+            const span = std.fmt.parseInt(i16, arg["--pitch-span=".len..], 10) catch
+                return Error.InvalidPitchSpan;
+            if (span <= 0) return Error.InvalidPitchSpan;
+            opts.pitch_span = span;
+        } else if (std.mem.startsWith(u8, arg, "--log-touch=")) {
+            const path = arg["--log-touch=".len..];
+            if (path.len == 0 or path.len > path_max) return Error.InvalidLogPath;
+            @memcpy(opts.log_path_buf[0..path.len], path);
+            opts.log_path_len = path.len;
         } else if (std.mem.startsWith(u8, arg, "--interrupt=")) {
             const after = std.fmt.parseFloat(f32, arg["--interrupt=".len..]) catch
                 return Error.InvalidInterrupt;
@@ -147,8 +192,10 @@ pub fn parse(args: []const []const u8) Error!Options {
 }
 
 pub const usage =
-    \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep] [--touch=always|script|motion]
-    \\                 [--trigger[=LEVEL]] [--trigger-hold=MS] [--trigger-average=MS]
+    \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep]
+    \\                 [--touch=probes|always|script|motion] [--touch-level=Z]
+    \\                 [--touch-hold=MS] [--touch-average=MS] [--touch-baseline=S]
+    \\                 [--touch-settle=MS] [--pitch-span=COUNTS] [--log-touch=PATH]
     \\                 [--interrupt=SECONDS] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
@@ -169,16 +216,47 @@ pub const usage =
     \\  beep   a bare synthesized sine at the probe's pitch
     \\
     \\--touch decides when a plant is awake and sounding:
-    \\  always  every plant, from the first block on (default)
+    \\  probes  the probes themselves decide (default)
+    \\  always  every plant, from the first block on
     \\  script  the built-in timeline: A holds, B and C tap inside it
     \\  motion  one GPIO motion sensor per plant
     \\
-    \\--trigger holds plants B and C silent until the probe on AIN1 reaches
-    \\LEVEL, so a second probe is what releases their clips. That is the only
-    \\thing this probe does, and plant A's probe on AIN0 has no say in it.
-    \\LEVEL is the ADC's own number, 0 at ground and 32767 at full scale; given
-    \\no number it uses the top of that range. Left out, B and C sound whenever
-    \\they are awake.
+    \\Each probe is judged against its own recent past rather than against a
+    \\number typed here. --touch-level is how many deviations from its own
+    \\rolling median a probe must read before it counts as touched, 6 by
+    \\default, and the same number serves both probes: a probe resting at
+    \\-2049 and one resting at +1000 are both asked the same question.
+    \\
+    \\--touch-average is how long a reading is averaged over before the score
+    \\sees it, 200 ms by default. Nothing is rectified: this rig's probes rest
+    \\below ground and one of them rises through it when touched, so the sign
+    \\is the signal.
+    \\
+    \\--touch-hold is how long the score must keep saying so before it counts,
+    \\100 ms by default. The score is tested 344 times a second, so without a
+    \\hold one noisy poll could start a clip that runs for minutes.
+    \\
+    \\--touch-baseline is how far back the median looks, 60 seconds by
+    \\default. A touch filling more than half that window teaches the median
+    \\that being touched is the resting state, and the plant goes quiet with a
+    \\hand still on it; set this to about four times the longest touch you
+    \\expect.
+    \\
+    \\--touch-settle is how long the other probe is given to settle after this
+    \\one is touched, 300 ms by default. Touching plant A drags the other probe
+    \\with it, to the same reading a real touch on it would give; after the
+    \\settle, wherever it was dragged to becomes its rest for as long as A is
+    \\held, so only a further move counts as a touch of its own.
+    \\
+    \\--pitch-span is the deviation from rest that reaches the top of plant A's
+    \\range, 3000 counts by default. Plant A's touch moves its probe about 2700
+    \\counts, so most of the range is spent on it.
+    \\
+    \\--log-touch writes every poll's numbers to PATH as CSV: both probes' raw
+    \\reading, mean, median, deviation, score and latch, and the state they
+    \\produced. About 20 MB per fifteen minutes. This is how a threshold that
+    \\fires in an empty room gets diagnosed at a desk instead of in the
+    \\gallery.
     \\
     \\--interrupt is how long a clip must have been playing before a fresh
     \\touch cuts it short and draws another, 10 seconds by default. Below that
@@ -186,43 +264,29 @@ pub const usage =
     \\it the clip fades out and the next turn begins at once. Pass 0 to let
     \\every clip play to its end.
     \\
-    \\B and C share that one probe, so they take turns, one clip per touch:
-    \\crossing the threshold plays the interview, and when it ends nothing
-    \\sounds until the next crossing, which plays the waterfall. Then the
-    \\interview again, and so on. A clip plays through even if the reading
-    \\falls away, and a crossing while one is playing is ignored rather than
-    \\queued. A plant left out of PLANTS never takes a turn, so `13` plays the
-    \\waterfall on every touch.
+    \\B and C share the probe on AIN1, so they take turns, one clip per touch:
+    \\the first touch plays the interview, and when it ends nothing sounds
+    \\until the next touch, which plays the waterfall. Then the interview
+    \\again, and so on. A clip plays through even if the touch ends, and a
+    \\touch while one is playing is ignored rather than queued. A plant left
+    \\out of PLANTS never takes a turn, so `13` plays the waterfall on every
+    \\touch.
     \\
-    \\Under --trigger the probe is the only thing that starts B and C: their
-    \\motion sensors are not consulted, since the threshold is what a touch
-    \\means. Without --trigger they go back to sounding when they are awake.
-    \\
-    \\--trigger-average is how long the reading is averaged over before LEVEL
-    \\sees it, 200 ms by default. A probe swings about ground and is read as
-    \\its distance from ground, so the raw samples run from nothing up to the
-    \\peak twice a cycle; their average is a level, and that is what LEVEL
-    \\should be set against. Pass 0 to compare raw samples instead.
-    \\
-    \\--trigger-hold is how long the averaged reading must then stay over LEVEL
-    \\before it counts
-    \\counts, 100 ms by default. The threshold is tested 344 times a second, so
-    \\without this a single noisy sample — mains hum, a brushed pot, static —
-    \\starts a clip that then runs for minutes. Raise it if clips start on
-    \\their own, lower it if a real touch feels slow to answer. It needs the
-    \\reading to be over LEVEL more often than under it, so a probe that only
-    \\peaks over the line will not trigger however long it is held; that is a
-    \\LEVEL set too high, not a hold set too short.
+    \\Under --touch=probes the motion sensors are not consulted at all: the
+    \\probes are what a touch means. The other three modes are for
+    \\demonstrating and for chasing faults, and reach the voices through the
+    \\same door.
     \\
     \\The run ends on its own only under --touch=script. Otherwise it plays
     \\until stopped, as the installation does; B and C are one-shots, so they
     \\sound once at the start and plant A carries the rest.
     \\
     \\Both probes are read against ground on one ADS1115, plant A's on AIN0 and
-    \\the trigger probe on AIN1. Which pin is which is wiring, not a flag. The
+    \\plants B and C's on AIN1. Which pin is which is wiring, not a flag. The
     \\chip has one converter, so it is switched between the two once a block and
-    \\each is sampled every other block. Sign is dropped: a probe below ground
-    \\reads as the same level as one the same distance above it.
+    \\each is sampled every other block. The count is passed on signed and
+    \\unrectified: a probe resting below ground and rising through it when
+    \\touched is exactly what the sign is there to carry.
     \\
     \\--device is the ALSA device aplay opens, `default` unless given. Run
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
@@ -235,10 +299,9 @@ pub const usage =
     \\  mami_sound 1 --voice=beep      plant A as a sine, no files needed
     \\  mami_sound --device=plughw:0,0 play through card 0 whatever else is set
     \\  mami_sound --touch=motion      wake the plants from the GPIO sensors
-    \\  mami_sound --trigger           B then C, once AIN1 reads 32767
-    \\  mami_sound --trigger=25000     and the same at a lower threshold
-    \\  mami_sound --trigger=25000 --trigger-hold=250
-    \\                                 and only if it stays there a quarter second
+    \\  mami_sound --touch-level=5     latch on a smaller move than the default
+    \\  mami_sound --log-touch=/tmp/touch.csv
+    \\                                 record every poll for a look afterwards
     \\
 ;
 
@@ -286,31 +349,52 @@ test "the inputs are wired, not chosen" {
     try testing.expectError(Error.UnknownFlag, parse(&.{"--adc=a2"}));
 }
 
-test "no trigger unless asked for" {
-    try testing.expectEqual(@as(?i16, null), (try parse(&.{})).trigger_level);
+test "the probes decide unless something else was asked for" {
+    const opts = try parse(&.{});
+    try testing.expectEqual(Touch.probes, opts.touch);
+    try testing.expectEqual(touch.default_level, opts.touch_level);
+    try testing.expectEqual(touch.default_baseline_s, opts.touch_baseline_s);
+    try testing.expectEqual(noise.default_span, opts.pitch_span);
+    try testing.expectEqual(@as(?[]const u8, null), opts.logPath());
 }
 
-test "trigger takes the top of the range, or a number" {
-    try testing.expectEqual(
-        @as(?i16, default_trigger),
-        (try parse(&.{"--trigger"})).trigger_level,
-    );
-    try testing.expectEqual(@as(?i16, 25000), (try parse(&.{"--trigger=25000"})).trigger_level);
-    try testing.expectEqual(@as(?i16, 0), (try parse(&.{"--trigger=0"})).trigger_level);
+test "every touch knob takes a number" {
+    const opts = try parse(&.{
+        "--touch-level=8",
+        "--touch-hold=250",
+        "--touch-average=400",
+        "--touch-baseline=90",
+        "--touch-settle=500",
+        "--pitch-span=4000",
+    });
+    try testing.expectEqual(@as(f32, 8.0), opts.touch_level);
+    try testing.expectEqual(@as(f32, 250.0), opts.touch_hold_ms);
+    try testing.expectEqual(@as(f32, 400.0), opts.touch_average_ms);
+    try testing.expectEqual(@as(f32, 90.0), opts.touch_baseline_s);
+    try testing.expectEqual(@as(f32, 500.0), opts.touch_settle_ms);
+    try testing.expectEqual(@as(i16, 4000), opts.pitch_span);
 }
 
-test "rejects a threshold the sensor could never mean" {
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=high"}));
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger="}));
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=-1"}));
-    // Above full scale, so it would never fire.
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=40000"}));
-    // A count is a whole number; there is nothing between two of them.
-    try testing.expectError(Error.InvalidTrigger, parse(&.{"--trigger=2.5"}));
+test "nonsense on the touch knobs is refused rather than rounded" {
+    try testing.expectError(Error.InvalidTouchLevel, parse(&.{"--touch-level=0"}));
+    try testing.expectError(Error.InvalidTouchLevel, parse(&.{"--touch-level=-3"}));
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold=9000"}));
+    try testing.expectError(Error.InvalidTouchAverage, parse(&.{"--touch-average=5000"}));
+    try testing.expectError(Error.InvalidTouchBaseline, parse(&.{"--touch-baseline=0"}));
+    try testing.expectError(Error.InvalidTouchSettle, parse(&.{"--touch-settle=9000"}));
+    try testing.expectError(Error.InvalidPitchSpan, parse(&.{"--pitch-span=0"}));
 }
 
-test "touch defaults to every plant awake" {
-    try testing.expectEqual(Touch.always, (try parse(&.{})).touch);
+test "the old trigger flags say what replaced them" {
+    try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger"}));
+    try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger=25000"}));
+    try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger-hold=250"}));
+    try testing.expectError(Error.TriggerRetired, parse(&.{"--trigger-average=400"}));
+}
+
+test "the log path is carried inline so the arguments can be dropped" {
+    const opts = try parse(&.{"--log-touch=/tmp/touch.csv"});
+    try testing.expectEqualStrings("/tmp/touch.csv", opts.logPath().?);
 }
 
 test "every touch source can be asked for by name" {
@@ -353,26 +437,35 @@ test "bad plant digits still fail" {
     try testing.expectError(select.Error.InvalidSelection, parse(&.{"5"}));
 }
 
-test "the trigger hold defaults to something that rejects a lone sample" {
-    try testing.expectEqual(trigger.default_hold_ms, (try parse(&.{})).trigger_hold_ms);
+test "the touch hold defaults to something that rejects a lone poll" {
+    try testing.expectEqual(touch.default_hold_ms, (try parse(&.{})).touch_hold_ms);
     // Long enough to span many polls, so one noisy reading cannot decide.
-    try testing.expect(trigger.holdPolls(
-        (try parse(&.{})).trigger_hold_ms,
+    try testing.expect(touch.holdPolls(
+        (try parse(&.{})).touch_hold_ms,
         44100,
         128,
     ) > 10);
 }
 
-test "the trigger hold can be tuned on site" {
-    try testing.expectEqual(@as(f32, 250.0), (try parse(&.{"--trigger-hold=250"})).trigger_hold_ms);
-    try testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--trigger-hold=0"})).trigger_hold_ms);
+test "rejects a hold that is not a length of time" {
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold=soon"}));
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold="}));
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold=-1"}));
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold=nan"}));
+    // Nobody holds a plant for six seconds to start a clip.
+    try testing.expectError(Error.InvalidTouchHold, parse(&.{"--touch-hold=6000"}));
 }
 
-test "rejects a hold that is not a length of time" {
-    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=soon"}));
-    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold="}));
-    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=-1"}));
-    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=nan"}));
-    // Nobody holds a plant for six seconds to start a clip.
-    try testing.expectError(Error.InvalidTriggerHold, parse(&.{"--trigger-hold=6000"}));
+test "the baseline window cannot be asked for longer than the ring holds" {
+    // 1024 samples at 10 Hz is 102.4 seconds, and past that `Baseline.init`
+    // clamps: the window would quietly mean something other than what was
+    // typed. Refused at the flag instead.
+    try testing.expectEqual(@as(f32, 100.0), (try parse(&.{"--touch-baseline=100"})).touch_baseline_s);
+    try testing.expectError(Error.InvalidTouchBaseline, parse(&.{"--touch-baseline=101"}));
+}
+
+test "rejects a log path that is empty or too long" {
+    try testing.expectError(Error.InvalidLogPath, parse(&.{"--log-touch="}));
+    const long = "--log-touch=" ++ "x" ** (path_max + 1);
+    try testing.expectError(Error.InvalidLogPath, parse(&.{long}));
 }
