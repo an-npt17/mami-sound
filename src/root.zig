@@ -88,7 +88,7 @@ fn peakOf(touch_state: [3]bool, blocks: usize) !f32 {
     const clip_c = try toneClip(gpa, sample_rate * 2);
     defer gpa.free(clip_c);
 
-    var voice_a = noise.Noise.init(sample_rate, 1);
+    var voice_a = noise.Noise.init(sample_rate, 1, noise.default_span);
     var voice_b = player.Player.init(clip_b);
     var voice_c = player.Player.init(clip_c);
 
@@ -97,7 +97,7 @@ fn peakOf(touch_state: [3]bool, blocks: usize) !f32 {
 
     for (0..blocks) |_| {
         @memset(&block, 0);
-        voice_a.render(&block, 16500, touch_state[0]);
+        voice_a.render(&block, noise.default_span, touch_state[0]);
         voice_b.render(&block, touch_state[1]);
         voice_c.render(&block, touch_state[2]);
         for (block) |s| peak = @max(peak, @abs(s));

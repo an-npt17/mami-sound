@@ -1,21 +1,24 @@
 //! Plant A's voice: white noise pushed through a resonant bandpass filter.
 //!
-//! The filter's centre frequency is what the ear hears as pitch. It follows the
-//! ECG level through a slow one-pole smoother, so the drone tracks the plant's
-//! overall state rather than individual spikes: a healthy plant reads higher and
-//! sounds higher, an unhealthy one reads lower and sounds lower. The pitch
-//! glides and never steps.
+//! The filter's centre frequency is what the ear hears as pitch. It follows how
+//! far the probe has moved from its own rest through a slow one-pole smoother,
+//! so the drone tracks the plant's overall state rather than individual spikes:
+//! a firmer touch reads further out and sounds higher. The pitch glides and
+//! never steps.
 
 const std = @import("std");
-const sensors = @import("sensors.zig");
 
 /// Pitch range. `freq_max` is the first number to retune for a different room
 /// or smaller speakers.
-pub const freq_min: f32 = 20.0;
+///
+/// `freq_min` is where the drone sits with nobody in the room, so it has to be
+/// heard rather than merely felt: 20 Hz was under most speakers and the room
+/// read as switched off.
+pub const freq_min: f32 = 80.0;
 pub const freq_max: f32 = 1000.0;
 
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
-/// ECG wiggles faster than this never reach the filter.
+/// deviation wiggles faster than this never reach the filter.
 const smooth_tau_s: f32 = 1.0;
 
 /// Gate fade length, long enough to avoid a click at touch and release.
@@ -41,11 +44,30 @@ const makeup: f32 = 9.0;
 /// Headroom so three simultaneous voices rarely reach the clamp.
 const voice_gain: f32 = 0.4;
 
-/// Map an ECG reading to centre frequency on a log scale, so equal steps in the
-/// count sound like equal pitch steps.
-pub fn freqFromEcg(ecg: i16) f32 {
+/// Deviation from rest that maps to the top of the pitch range.
+///
+/// Not the sensor's full scale: this rig's whole signal lives inside a few
+/// thousand counts, and mapping across 32767 squashed the entire piece into the
+/// bottom five hertz of the range. Plant A's touch is a move of about 2700
+/// counts, so 3000 spends most of the range on it.
+pub const default_span: i16 = 3000;
+
+/// How loud the drone sits while nobody is touching anything.
+///
+/// The room is never silent: an installation that goes quiet reads as broken
+/// rather than as waiting. A touch is then a swell rather than an entrance.
+const idle_gain: f32 = 0.35;
+
+/// Map a deviation from rest to centre frequency on a log scale, so equal steps
+/// in the deviation sound like equal pitch steps.
+///
+/// Deviation rather than level, because level is meaningless here: probe A
+/// rests at -2049 and reads +660 when touched, so the reading's magnitude
+/// *falls* on a touch. Distance from rest rises on a touch whichever way the
+/// probe happens to move, and it is zero when nobody is there.
+pub fn freqFromDeviation(dev: i16, span: i16) f32 {
     const t = std.math.clamp(
-        @as(f32, @floatFromInt(ecg)) / @as(f32, @floatFromInt(sensors.ecg_max)),
+        @as(f32, @floatFromInt(dev)) / @as(f32, @floatFromInt(@max(span, 1))),
         0.0,
         1.0,
     );
@@ -63,39 +85,42 @@ pub const Noise = struct {
     sample_rate: u32,
     alpha: f32,
     gate_step: f32,
+    /// Deviation that reaches `freq_max`.
+    span: i16,
 
     /// Smoothed centre frequency, in Hz.
     fc: f32,
     /// Chamberlin state-variable filter state.
     low: f32,
     band: f32,
-    /// Gate envelope, 0 when untouched and 1 when held.
+    /// Gate envelope, `idle_gain` when untouched and 1 when held.
     env: f32,
     /// Last block's touch state, so a new touch can be told from a held one.
     prev_touch: bool,
 
-    pub fn init(sample_rate: u32, seed: u64) Noise {
+    pub fn init(sample_rate: u32, seed: u64, span: i16) Noise {
         const sr = @as(f32, @floatFromInt(sample_rate));
         return .{
             .prng = std.Random.DefaultPrng.init(seed),
             .sample_rate = sample_rate,
             .alpha = smoothingAlpha(smooth_tau_s, sample_rate),
             .gate_step = 1.0 / (gate_ms / 1000.0 * sr),
+            .span = span,
             .fc = freq_min,
             .low = 0.0,
             .band = 0.0,
-            .env = 0.0,
+            .env = idle_gain,
             .prev_touch = false,
         };
     }
 
     /// Add this voice's output into `out`. Never overwrites, so voices mix by
     /// being rendered in sequence into the same block.
-    pub fn render(self: *Noise, out: []f32, ecg: i16, touched: bool) void {
-        const target_fc = freqFromEcg(ecg);
+    pub fn render(self: *Noise, out: []f32, dev: i16, touched: bool) void {
+        const target_fc = freqFromDeviation(dev, self.span);
         const sr = @as(f32, @floatFromInt(self.sample_rate));
         const rand = self.prng.random();
-        const gate_target: f32 = if (touched) 1.0 else 0.0;
+        const gate_target: f32 = if (touched) 1.0 else idle_gain;
 
         // A new touch closes most of the distance at once; the smoother below
         // walks the rest. Done before the gate has finished opening, so what
@@ -129,25 +154,61 @@ pub const Noise = struct {
 
 const testing = std.testing;
 
-test "pitch mapping hits both ends and rises with the reading" {
-    try testing.expectApproxEqAbs(freq_min, freqFromEcg(0), 0.01);
-    try testing.expectApproxEqAbs(freq_max, freqFromEcg(sensors.ecg_max), 0.01);
+test "rest is the bottom of the range and a full deviation the top" {
+    try testing.expectApproxEqAbs(freq_min, freqFromDeviation(0, default_span), 0.01);
+    try testing.expectApproxEqAbs(freq_max, freqFromDeviation(default_span, default_span), 0.01);
+    // Past the span it clamps rather than running off the top.
+    try testing.expectApproxEqAbs(freq_max, freqFromDeviation(32767, default_span), 0.01);
+}
 
-    var prev = freqFromEcg(0);
-    var i: u32 = 1;
-    while (i <= 100) : (i += 1) {
-        const ecg: i16 = @intCast(i * @as(u32, @intCast(sensors.ecg_max)) / 100);
-        const f = freqFromEcg(ecg);
-        try testing.expect(f > prev);
-        prev = f;
+test "the pitch rises with the deviation, on a log scale" {
+    var last: f32 = 0.0;
+    for (0..100) |i| {
+        const dev: i16 = @intCast(i * @as(usize, @intCast(default_span)) / 100);
+        const f = freqFromDeviation(dev, default_span);
+        try testing.expect(f > last);
+        last = f;
     }
 }
 
-test "pitch mapping clamps below the sensor range" {
-    // The top needs no clamp: the reading is an i16 and `ecg_max` is its
-    // largest value, so nothing can ask for a pitch above `freq_max`.
-    try testing.expectApproxEqAbs(freq_min, freqFromEcg(-20000), 0.01);
-    try testing.expectApproxEqAbs(freq_min, freqFromEcg(std.math.minInt(i16)), 0.01);
+test "plant A's touch reaches the top half of the range" {
+    // The bench capture: rest -2049, touched +660, so a deviation of 2709
+    // against the default span of 3000.
+    const f = freqFromDeviation(2709, default_span);
+    try testing.expect(f > 500.0);
+}
+
+test "an untouched drone is quieter but never silent" {
+    var n = Noise.init(44100, 1, default_span);
+    var block: [4096]f32 = undefined;
+    // Long enough for the gate to finish its fade.
+    for (0..20) |_| {
+        @memset(&block, 0);
+        n.render(&block, 0, false);
+    }
+    var peak: f32 = 0.0;
+    for (block) |s| peak = @max(peak, @abs(s));
+    try testing.expect(peak > 0.0);
+
+    var touched_peak: f32 = 0.0;
+    for (0..20) |_| {
+        @memset(&block, 0);
+        n.render(&block, 2709, true);
+    }
+    for (block) |s| touched_peak = @max(touched_peak, @abs(s));
+    try testing.expect(touched_peak > peak);
+}
+
+test "rest is audible rather than felt" {
+    // 20 Hz was under most speakers; the room has to hum while nobody is there.
+    try testing.expect(freq_min >= 60.0);
+}
+
+test "a deviation below rest clamps to the bottom of the range" {
+    // `Machine` never emits a negative deviation, but nothing in the type stops
+    // one, and a negative `t` would run the pitch under `freq_min`.
+    try testing.expectApproxEqAbs(freq_min, freqFromDeviation(-2000, default_span), 0.01);
+    try testing.expectApproxEqAbs(freq_min, freqFromDeviation(std.math.minInt(i16), default_span), 0.01);
 }
 
 test "smoother converges to its target without overshooting" {
@@ -165,12 +226,12 @@ test "smoother converges to its target without overshooting" {
 }
 
 test "filter stays bounded at both pitch extremes" {
-    for ([_]i16{ 0, sensors.ecg_max }) |ecg| {
-        var n = Noise.init(44100, 99);
+    for ([_]i16{ 0, default_span }) |dev| {
+        var n = Noise.init(44100, 99, default_span);
         var block: [512]f32 = undefined;
         for (0..200) |_| {
             @memset(&block, 0);
-            n.render(&block, ecg, true);
+            n.render(&block, dev, true);
             try testing.expect(std.math.isFinite(n.band));
             try testing.expect(std.math.isFinite(n.low));
             try testing.expect(@abs(n.band) < 100.0);
@@ -179,7 +240,7 @@ test "filter stays bounded at both pitch extremes" {
 }
 
 test "output is audible but not pinned to the clamp" {
-    var n = Noise.init(44100, 4);
+    var n = Noise.init(44100, 4, default_span);
     var block: [512]f32 = undefined;
     var sum_sq: f64 = 0.0;
     var count: usize = 0;
@@ -188,7 +249,7 @@ test "output is audible but not pinned to the clamp" {
     // Skip the gate ramp, then measure.
     for (0..100) |i| {
         @memset(&block, 0);
-        n.render(&block, 16500, true);
+        n.render(&block, 2709, true);
         if (i < 20) continue;
         for (block) |s| {
             sum_sq += @as(f64, s) * @as(f64, s);
@@ -203,34 +264,35 @@ test "output is audible but not pinned to the clamp" {
     try testing.expect(clipped * 1000 < count);
 }
 
-test "gate reaches silence and full level in the expected time" {
-    var n = Noise.init(44100, 1);
+test "gate reaches the idle floor and full level in the expected time" {
+    var n = Noise.init(44100, 1, default_span);
     const ramp_frames: usize = @intFromFloat(gate_ms / 1000.0 * 44100.0);
     var block: [64]f32 = undefined;
 
     for (0..(ramp_frames / 64 + 2)) |_| {
         @memset(&block, 0);
-        n.render(&block, 16500, true);
+        n.render(&block, 2709, true);
     }
     try testing.expectEqual(@as(f32, 1.0), n.env);
 
     for (0..(ramp_frames / 64 + 2)) |_| {
         @memset(&block, 0);
-        n.render(&block, 16500, false);
+        n.render(&block, 2709, false);
     }
-    try testing.expectEqual(@as(f32, 0.0), n.env);
+    // The drone falls back to the idle floor, not to silence.
+    try testing.expectEqual(idle_gain, n.env);
 }
 
 /// Zero crossings per second, a cheap stand-in for a pitch detector. For noise
 /// through a narrow bandpass this lands near twice the centre frequency.
-fn crossingRate(ecg: i16) f32 {
-    var n = Noise.init(44100, 21);
+fn crossingRate(dev: i16) f32 {
+    var n = Noise.init(44100, 21, default_span);
     var block: [512]f32 = undefined;
 
     // Let the one-second smoother settle before measuring.
     for (0..44100 * 5 / 512) |_| {
         @memset(&block, 0);
-        n.render(&block, ecg, true);
+        n.render(&block, dev, true);
     }
 
     var crossings: usize = 0;
@@ -238,7 +300,7 @@ fn crossingRate(ecg: i16) f32 {
     var prev: f32 = 0.0;
     for (0..44100 * 2 / 512) |_| {
         @memset(&block, 0);
-        n.render(&block, ecg, true);
+        n.render(&block, dev, true);
         for (block) |s| {
             if ((s >= 0.0) != (prev >= 0.0)) crossings += 1;
             prev = s;
@@ -250,12 +312,12 @@ fn crossingRate(ecg: i16) f32 {
 }
 
 test "a new touch lands most of the way to its pitch at once" {
-    var n = Noise.init(44100, 3);
-    const ecg: i16 = 24000;
-    const target = freqFromEcg(ecg);
+    var n = Noise.init(44100, 3, default_span);
+    const dev: i16 = 2200;
+    const target = freqFromDeviation(dev, default_span);
     // One sample, so what is measured is the jump and not the glide after it.
     var block: [1]f32 = .{0};
-    n.render(&block, ecg, true);
+    n.render(&block, dev, true);
 
     const expected = freq_min + (target - freq_min) * onset_jump;
     try testing.expectApproxEqAbs(expected, n.fc, 1.0);
@@ -264,13 +326,13 @@ test "a new touch lands most of the way to its pitch at once" {
 }
 
 test "a held touch glides the rest of the way instead of jumping again" {
-    var n = Noise.init(44100, 3);
-    const ecg: i16 = 24000;
+    var n = Noise.init(44100, 3, default_span);
+    const dev: i16 = 2200;
     var block: [1]f32 = .{0};
 
-    n.render(&block, ecg, true);
+    n.render(&block, dev, true);
     const after_jump = n.fc;
-    n.render(&block, ecg, true);
+    n.render(&block, dev, true);
     // One sample of a one-second smoother, not another quarter of the distance.
     try testing.expectApproxEqAbs(after_jump, n.fc, 1.0);
 
@@ -278,20 +340,20 @@ test "a held touch glides the rest of the way instead of jumping again" {
     var long: [512]f32 = undefined;
     for (0..44100 * 8 / 512) |_| {
         @memset(&long, 0);
-        n.render(&long, ecg, true);
+        n.render(&long, dev, true);
     }
-    try testing.expectApproxEqAbs(freqFromEcg(ecg), n.fc, 1.0);
+    try testing.expectApproxEqAbs(freqFromDeviation(dev, default_span), n.fc, 1.0);
 }
 
 test "releasing re-arms the jump for the next touch" {
-    var n = Noise.init(44100, 3);
+    var n = Noise.init(44100, 3, default_span);
     var block: [1]f32 = .{0};
 
-    n.render(&block, 4000, true);
+    n.render(&block, 400, true);
     const low = n.fc;
-    n.render(&block, 4000, false);
+    n.render(&block, 400, false);
 
-    n.render(&block, 30000, true);
-    const target = freqFromEcg(30000);
+    n.render(&block, 2800, true);
+    const target = freqFromDeviation(2800, default_span);
     try testing.expectApproxEqAbs(low + (target - low) * onset_jump, n.fc, 1.0);
 }

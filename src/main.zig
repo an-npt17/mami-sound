@@ -114,9 +114,9 @@ pub fn main(init: std.process.Init) !void {
         .flute => if (flute.len != 0)
             .{ .flute = ms.sampler.Voice.init(flute, ms.sample_rate, ms.sensors.ecg_max) }
         else
-            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed) },
+            .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, ms.noise.default_span) },
         .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.ecg_max) },
-        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed) },
+        .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, ms.noise.default_span) },
     };
     // B and C answer one probe between them, so they are one voice with two
     // folders rather than two voices that happen to share a threshold.
