@@ -16,6 +16,7 @@ pub const sampler = @import("sampler.zig");
 pub const tone = @import("tone.zig");
 pub const cli = @import("cli.zig");
 pub const touch = @import("touch.zig");
+pub const touchlog = @import("touchlog.zig");
 pub const library = @import("library.zig");
 
 pub const sample_rate: u32 = 44100;
@@ -60,6 +61,7 @@ test {
     _ = tone;
     _ = cli;
     _ = touch;
+    _ = touchlog;
     _ = library;
 }
 

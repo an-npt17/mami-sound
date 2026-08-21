@@ -164,6 +164,17 @@ pub fn main(init: std.process.Init) !void {
         .settle_ms = opts.touch_settle_ms,
     });
 
+    // Opened once, so a bad path is a startup failure rather than something
+    // discovered an hour into a recording.
+    var log: ?ms.touchlog.Log = if (opts.logPath()) |path|
+        ms.touchlog.Log.create(io, path) catch |err| blk: {
+            std.debug.print("could not write {s}: {s}\n", .{ path, @errorName(err) });
+            break :blk null;
+        }
+    else
+        null;
+    defer if (log) |*l| l.close(io);
+
     var block: [ms.block_frames]f32 = undefined;
     var pcm: [ms.block_frames]i16 = undefined;
 
@@ -214,6 +225,12 @@ pub fn main(init: std.process.Init) !void {
                 .probes => probed,
                 else => stateFrom(touch),
             };
+            if (log) |*l| {
+                const t_s = @as(f64, @floatFromInt(rendered + offset)) /
+                    @as(f64, @floatFromInt(ms.sample_rate));
+                l.row(io, t_s, raw_a, &machine.a, raw_bc, &machine.bc, state);
+            }
+
             const a_touched = sel[0] and (state == .plant_a or state == .both);
             const open = (sel[1] or sel[2]) and
                 (state == .plant_bc or state == .both);
@@ -257,6 +274,8 @@ pub fn main(init: std.process.Init) !void {
             error.BrokenPipe => reportSinkDeath(gpa, io, opts.device()),
             else => return err,
         };
+
+        if (log) |*l| l.flush(io);
 
         rendered += ms.block_frames;
         // The letters report what the voices were told, detection included, so
