@@ -1,0 +1,21 @@
+[Unit]
+Description=Mami sound installation
+Wants=dev-snd-pcmC0D0p.device
+After=dev-snd-pcmC0D0p.device sound.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 8
+WorkingDirectory=/home/pi/mami-sound
+ExecStart=/home/pi/mami-sound/zig-out/bin/mami_sound --device=plughw:0,0
+--touch-level-bc=20 --touch-hold-bc=30 --pitch-jump=0.15 --pitch-glide=4
+Restart=always
+RestartSec=3
+User=pi
+SupplementaryGroups=audio i2c gpio
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
