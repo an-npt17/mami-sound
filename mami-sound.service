@@ -14,8 +14,10 @@ ExecStart=/home/pi/mami-sound/zig-out/bin/mami_sound \
     --device=plughw:0,0 \
     --touch-level-bc=20 \
     --touch-hold-bc=30 \
+    --touch-window-bc=1000 \
     --pitch-jump=0.15 \
-    --pitch-glide=4
+    --pitch-glide=4 \
+    --pitch-release=0.5
 
 # Ride out a transient card hiccup, but give up after 3 tries in 2 min
 # so the box sits idle and sshable instead of looping ffmpeg decodes.

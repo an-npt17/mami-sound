@@ -82,6 +82,22 @@ pub fn main(init: std.process.Init) !void {
                 "--touch-settle takes milliseconds between 0 and 5000.\n\n",
                 .{},
             ),
+            error.UnknownTouchModel => std.debug.print(
+                "--touch-model must be deviation or steady.\n\n",
+                .{},
+            ),
+            error.InvalidTouchBand => std.debug.print(
+                "--touch-band takes LO:HI in counts, with LO below HI.\n\n",
+                .{},
+            ),
+            error.InvalidTouchJitter => std.debug.print(
+                "--touch-jitter takes a whole number of counts, zero or above.\n\n",
+                .{},
+            ),
+            error.InvalidTouchDrop => std.debug.print(
+                "--touch-drop takes milliseconds between 0 and 5000.\n\n",
+                .{},
+            ),
             error.InvalidTouchCounts => std.debug.print(
                 "--touch-counts-bc takes a whole number of counts above zero.\n\n",
                 .{},
@@ -187,6 +203,13 @@ pub fn main(init: std.process.Init) !void {
     var machine = ms.touch.Machine.init(.{
         .sample_rate = ms.sample_rate,
         .poll_frames = ms.sensor_frames,
+        .model = opts.touch_model,
+        .band_lo = opts.touch_band_lo,
+        .band_hi = opts.touch_band_hi,
+        .jitter = opts.touch_jitter,
+        .band_lo_bc = opts.touch_band_lo_bc,
+        .band_hi_bc = opts.touch_band_hi_bc,
+        .drop_ms = opts.touch_drop_ms,
         .level = opts.touch_level,
         .hold_ms = opts.touch_hold_ms,
         .average_ms = opts.touch_average_ms,

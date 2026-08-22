@@ -19,6 +19,10 @@ pub const Error = error{
     InvalidTouchBaseline,
     InvalidTouchSettle,
     InvalidTouchCounts,
+    UnknownTouchModel,
+    InvalidTouchBand,
+    InvalidTouchJitter,
+    InvalidTouchDrop,
     InvalidTouchWindow,
     InvalidPitchSpan,
     InvalidPitchJump,
@@ -72,6 +76,21 @@ pub const Voice = enum {
 
 pub const Options = struct {
     plants: select.Selection = select.all,
+    /// What question the probes are asked. The rigs need opposite ones: see
+    /// `touch.Model`.
+    touch_model: touch.Model = .deviation,
+    /// Where a clamped probe reads, how far it may move between readings and
+    /// still count as clamped, and how long the stillness must be gone before
+    /// the touch is. All three are `steady` only.
+    touch_band_lo: ?i16 = touch.default_band_lo,
+    touch_band_hi: ?i16 = touch.default_band_hi,
+    touch_jitter: i16 = touch.default_jitter,
+    /// Probe BC's own band. `null` puts it in A's. On the floating rig a hand
+    /// on plant A holds its probe at 650-750 while a hand on plant B holds BC
+    /// at about 1, so one band cannot serve both.
+    touch_band_lo_bc: ?i16 = null,
+    touch_band_hi_bc: ?i16 = null,
+    touch_drop_ms: f32 = touch.default_drop_ms,
     voice: Voice = .drone,
     touch: Touch = .probes,
     /// How many deviations from its own median a probe must read before it
@@ -190,6 +209,44 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidTouchHold;
             if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTouchHold;
             opts.touch_hold_bc_ms = held;
+        } else if (std.mem.startsWith(u8, arg, "--touch-model=")) {
+            const name = arg["--touch-model=".len..];
+            opts.touch_model = std.meta.stringToEnum(touch.Model, name) orelse
+                return Error.UnknownTouchModel;
+        } else if (std.mem.startsWith(u8, arg, "--touch-band=")) {
+            const text = arg["--touch-band=".len..];
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse
+                return Error.InvalidTouchBand;
+            const lo = std.fmt.parseInt(i16, text[0..colon], 10) catch
+                return Error.InvalidTouchBand;
+            const hi = std.fmt.parseInt(i16, text[colon + 1 ..], 10) catch
+                return Error.InvalidTouchBand;
+            // A band the wrong way round, or one no reading can be inside, is
+            // a probe that can never be touched.
+            if (lo >= hi) return Error.InvalidTouchBand;
+            opts.touch_band_lo = lo;
+            opts.touch_band_hi = hi;
+        } else if (std.mem.startsWith(u8, arg, "--touch-band-bc=")) {
+            const text = arg["--touch-band-bc=".len..];
+            const colon = std.mem.indexOfScalar(u8, text, ':') orelse
+                return Error.InvalidTouchBand;
+            const lo = std.fmt.parseInt(i16, text[0..colon], 10) catch
+                return Error.InvalidTouchBand;
+            const hi = std.fmt.parseInt(i16, text[colon + 1 ..], 10) catch
+                return Error.InvalidTouchBand;
+            if (lo >= hi) return Error.InvalidTouchBand;
+            opts.touch_band_lo_bc = lo;
+            opts.touch_band_hi_bc = hi;
+        } else if (std.mem.startsWith(u8, arg, "--touch-jitter=")) {
+            const jitter = std.fmt.parseInt(i16, arg["--touch-jitter=".len..], 10) catch
+                return Error.InvalidTouchJitter;
+            if (jitter < 0) return Error.InvalidTouchJitter;
+            opts.touch_jitter = jitter;
+        } else if (std.mem.startsWith(u8, arg, "--touch-drop=")) {
+            const drop = std.fmt.parseFloat(f32, arg["--touch-drop=".len..]) catch
+                return Error.InvalidTouchDrop;
+            if (!(drop >= 0.0) or drop > 5000.0) return Error.InvalidTouchDrop;
+            opts.touch_drop_ms = drop;
         } else if (std.mem.startsWith(u8, arg, "--touch-counts-bc=")) {
             const counts = std.fmt.parseInt(i16, arg["--touch-counts-bc=".len..], 10) catch
                 return Error.InvalidTouchCounts;
@@ -258,7 +315,10 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep]
-    \\                 [--touch=probes|always|script|motion] [--touch-level=Z]
+    \\                 [--touch=probes|always|script|motion]
+    \\                 [--touch-model=deviation|steady] [--touch-band=LO:HI]
+    \\                 [--touch-band-bc=LO:HI] [--touch-jitter=COUNTS]
+    \\                 [--touch-drop=MS] [--touch-level=Z]
     \\                 [--touch-hold=MS] [--touch-average=MS] [--touch-baseline=S]
     \\                 [--touch-settle=MS] [--touch-level-bc=Z] [--touch-hold-bc=MS]
     \\                 [--touch-counts-bc=COUNTS] [--touch-window-bc=MS]
@@ -289,6 +349,54 @@ pub const usage =
     \\  always  every plant, from the first block on
     \\  script  the built-in timeline: A holds, B and C tap inside it
     \\  motion  one GPIO motion sensor per plant
+    \\
+    \\--touch-model is which question the probes are asked, and the two rigs
+    \\this has run on need opposite ones:
+    \\  deviation  how far has the probe moved from its own recent past
+    \\  steady     has the probe stopped moving, at any level or in a band
+    \\
+    \\On the first rig a probe rests somewhere and a touch moves it, so how far
+    \\it has moved is the whole answer. On the second the electrode floats: with
+    \\nobody on it the reading flails over the whole range and slams the rails
+    \\from one poll to the next, and a hand clamps it to about 660 counts and
+    \\holds it there. There the touch is the quiet, and a rolling median of the
+    \\flailing is a number about nothing — which is why `deviation` on that rig
+    \\hears nothing at all, however low the threshold is set.
+    \\
+    \\--touch-jitter is how far a probe may move between readings and still
+    \\count as held, 8 counts by default. Judged on the raw reading rather than
+    \\on the average: averaging is what destroys the stillness that is the
+    \\signal here.
+    \\
+    \\--touch-band is optional, and left out any level will do so long as it
+    \\holds still. That is usually what is wanted, because the two probes clamp
+    \\to quite different levels — plant A's to 650-750, plant B's to about 1 —
+    \\and a level that is a touch on one is the untouched reading of the other.
+    \\
+    \\Set a band to widen the margin: untouched readings are then thrown out on
+    \\level before stillness is asked about, leaving only a probe parked inside
+    \\the band to argue with. --touch-band-bc gives BC a band of its own, and
+    \\left out BC is asked A's.
+    \\
+    \\With no band, --touch-hold is the only thing telling a held probe from an
+    \\untouched one that has gone quiet for a moment, and it wants sizing from
+    \\a capture. In `testdata/touch-floating.txt` an untouched probe holds still
+    \\for as long as eight polls at a stretch and the shortest real touch holds
+    \\for twelve, so the hold belongs between them: about 30 ms at 344 polls a
+    \\second. The 100 ms default is a deviation-model number and is long enough
+    \\here to drop a real touch on the floor.
+    \\
+    \\--touch-drop is how long the stillness must be gone before the touch is,
+    \\90 ms by default, against --touch-hold on the way in. Longer on purpose:
+    \\contact drops out for a few polls in the middle of a real touch, and
+    \\releasing on that ends a clip, or with --touch-window-bc starts one.
+    \\
+    \\Under `steady` plant A's pitch is where in the band the probe sits rather
+    \\than how far it has moved, so --pitch-span wants to be about the width of
+    \\the band. That is a few counts of travel against a jitter allowance of
+    \\eight, so expect the pitch to wander inside the band on its own.
+    \\--touch-counts-bc, --touch-baseline and --touch-settle are all
+    \\deviation-model ideas and do nothing here.
     \\
     \\Each probe is judged against its own recent past rather than against a
     \\number typed here. --touch-level is how many deviations from its own
@@ -517,6 +625,53 @@ test "BC is asked A's question when it was given none of its own" {
     const opts = try parse(&.{"--touch-level=9"});
     try testing.expectEqual(@as(?f32, null), opts.touch_level_bc);
     try testing.expectEqual(@as(?f32, null), opts.touch_hold_bc_ms);
+}
+
+test "the steady model and its band are parsed" {
+    const opts = try parse(&.{ "--touch-model=steady", "--touch-band=550:800", "--touch-jitter=12", "--touch-drop=120" });
+    try testing.expectEqual(touch.Model.steady, opts.touch_model);
+    try testing.expectEqual(@as(i16, 550), opts.touch_band_lo);
+    try testing.expectEqual(@as(i16, 800), opts.touch_band_hi);
+    try testing.expectEqual(@as(i16, 12), opts.touch_jitter);
+    try testing.expectEqual(@as(f32, 120.0), opts.touch_drop_ms);
+}
+
+test "the deviation model is what a run gets when it asks for nothing" {
+    const opts = try parse(&.{});
+    try testing.expectEqual(touch.Model.deviation, opts.touch_model);
+    try testing.expectEqual(touch.default_band_lo, opts.touch_band_lo);
+    try testing.expectEqual(touch.default_jitter, opts.touch_jitter);
+    try testing.expectEqual(touch.default_drop_ms, opts.touch_drop_ms);
+}
+
+test "no band is asked for by default, so any steady level is a touch" {
+    const opts = try parse(&.{"--touch-model=steady"});
+    try testing.expectEqual(@as(?i16, null), opts.touch_band_lo);
+    try testing.expectEqual(@as(?i16, null), opts.touch_band_hi);
+    try testing.expectEqual(@as(?i16, null), opts.touch_band_lo_bc);
+}
+
+test "BC can be given a band of its own" {
+    const opts = try parse(&.{ "--touch-band=650:750", "--touch-band-bc=-5:5" });
+    try testing.expectEqual(@as(i16, 650), opts.touch_band_lo);
+    try testing.expectEqual(@as(i16, 750), opts.touch_band_hi);
+    try testing.expectEqual(@as(?i16, -5), opts.touch_band_lo_bc);
+    try testing.expectEqual(@as(?i16, 5), opts.touch_band_hi_bc);
+    // Left out, BC is put in A's, which `touch` reads as null.
+    const shared = try parse(&.{"--touch-band=650:750"});
+    try testing.expectEqual(@as(?i16, null), shared.touch_band_lo_bc);
+}
+
+test "nonsense on the steady knobs is refused" {
+    try testing.expectError(Error.UnknownTouchModel, parse(&.{"--touch-model=quiet"}));
+    // A band the wrong way round can never contain a reading.
+    try testing.expectError(Error.InvalidTouchBand, parse(&.{"--touch-band=800:200"}));
+    try testing.expectError(Error.InvalidTouchBand, parse(&.{"--touch-band=600"}));
+    try testing.expectError(Error.InvalidTouchBand, parse(&.{"--touch-band=six:hundred"}));
+    try testing.expectError(Error.InvalidTouchJitter, parse(&.{"--touch-jitter=-1"}));
+    try testing.expectError(Error.InvalidTouchBand, parse(&.{"--touch-band-bc=5:-5"}));
+    try testing.expectError(Error.InvalidTouchBand, parse(&.{"--touch-band-bc=zero"}));
+    try testing.expectError(Error.InvalidTouchDrop, parse(&.{"--touch-drop=9000"}));
 }
 
 test "BC's counts gate and window are parsed" {

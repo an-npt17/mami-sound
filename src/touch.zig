@@ -203,9 +203,56 @@ pub const default_settle_ms: f32 = 300.0;
 /// punished for being clean.
 const mad_floor: f32 = 25.0;
 
+/// What question a probe is asked.
+///
+/// The two rigs this has run on need opposite questions. On the first, a probe
+/// rests somewhere and a touch moves it, so the question is how far it has
+/// moved from its own recent past. On the second the electrode floats: nobody
+/// on it and it flails over the whole range and slams the rails, and a hand
+/// clamps it to about 660 counts and holds it there. There the touch is the
+/// quiet, and a rolling median of the flailing is a number about nothing.
+pub const Model = enum { deviation, steady };
+
+/// Where a clamped probe sits, in counts, when a level is worth insisting on.
+/// Unset by default: a probe that has gone still has been taken hold of
+/// whatever level it went still at, and the two probes on the floating rig
+/// clamp to quite different ones — plant A's to 650-750, plant B's to about 1.
+///
+/// A band is worth setting when the margin needs widening. Untouched readings
+/// are then thrown out on level before stillness is asked about at all, which
+/// leaves only the stillness of a probe parked inside the band to argue with.
+pub const default_band_lo: ?i16 = null;
+pub const default_band_hi: ?i16 = null;
+
+/// How far a clamped probe may move between readings and still count as still.
+/// In the capture it moves by one count, occasionally seven.
+pub const default_jitter: i16 = 8;
+
+/// How long the readings must stop being still before a touch is called off,
+/// in milliseconds. Longer than the attack on purpose: contact drops out for a
+/// few polls in the middle of a real touch, and releasing on that would end a
+/// clip, or with `--touch-window-bc` start one.
+pub const default_drop_ms: f32 = 90.0;
+
 pub const Config = struct {
     sample_rate: u32,
     poll_frames: usize,
+    model: Model = .deviation,
+    /// The band a clamped probe reads in, and how far it may move between
+    /// readings and still count as clamped. `steady` only.
+    band_lo: ?i16 = default_band_lo,
+    band_hi: ?i16 = default_band_hi,
+    jitter: i16 = default_jitter,
+    /// Probe BC's own band. `null` puts it in A's.
+    ///
+    /// The two probes clamp to different levels on the floating rig: a hand on
+    /// plant A holds its probe at 650-750, a hand on plant B holds BC at about
+    /// 1. Same question, different answer, which is what a band per probe is
+    /// for — and why one band for both cannot work here.
+    band_lo_bc: ?i16 = null,
+    band_hi_bc: ?i16 = null,
+    /// How long the stillness must be gone before the touch is. `steady` only.
+    drop_ms: f32 = default_drop_ms,
     level: f32 = default_level,
     hold_ms: f32 = default_hold_ms,
     average_ms: f32 = default_average_ms,
@@ -249,6 +296,10 @@ pub const Config = struct {
         var bc = self;
         bc.level = self.level_bc orelse self.level;
         bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
+        if (self.band_lo_bc) |lo| bc.band_lo = lo;
+        if (self.band_hi_bc) |hi| bc.band_hi = hi;
+        bc.band_lo_bc = null;
+        bc.band_hi_bc = null;
         bc.counts = self.counts_bc orelse self.counts;
         bc.window_ms = self.window_bc_ms orelse self.window_ms;
         bc.level_bc = null;
@@ -294,6 +345,23 @@ pub const Detector = struct {
     blocked: bool,
     /// This poll's answer in window mode: true on the one poll the tap ends.
     pulse: bool,
+    /// Which question this probe is asked.
+    model: Model,
+    /// The band and the jitter allowance, in counts. `steady` only, and the
+    /// band is optional: unset, any level will do so long as it holds still.
+    band_lo: ?i16,
+    band_hi: ?i16,
+    jitter: i16,
+    /// Polls of lost stillness that call a touch off, and how many have come
+    /// in a row. `steady` only.
+    drop: u32,
+    dropped: u32,
+    /// The previous raw reading, which is what the jitter is measured against.
+    /// `null` before the first. `steady` only.
+    prev_raw: ?i16,
+    /// Whether the probe is at rest as this model sees it: back inside the
+    /// deviation model's release band, or no longer still in the steady one.
+    at_rest: bool,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -315,6 +383,14 @@ pub const Detector = struct {
             .armed = false,
             .blocked = false,
             .pulse = false,
+            .model = cfg.model,
+            .band_lo = cfg.band_lo,
+            .band_hi = cfg.band_hi,
+            .jitter = cfg.jitter,
+            .drop = @max(holdPolls(cfg.drop_ms, cfg.sample_rate, cfg.poll_frames), 1),
+            .dropped = 0,
+            .prev_raw = null,
+            .at_rest = true,
         };
     }
 
@@ -327,6 +403,7 @@ pub const Detector = struct {
         self.armed = false;
         self.blocked = false;
         self.pulse = false;
+        self.dropped = 0;
     }
 
     /// What the score is measured from: the crosstalk floor while one is set,
@@ -337,20 +414,76 @@ pub const Detector = struct {
 
     /// How far the probe sits from rest. Unsigned, because this is what the
     /// drone's pitch is mapped from and a pitch has no sign.
+    ///
+    /// In the steady model there is no rest to be far from, so what the pitch
+    /// gets instead is the level the probe went still at, measured from the
+    /// bottom of the band where there is one and from zero where there is not.
+    /// A held probe moves by five to nine counts against a jitter allowance of
+    /// eight, so `--pitch-span` wants to be about that much travel and the
+    /// pitch will wander inside it on its own.
     pub fn deviation(self: *const Detector) i16 {
-        return clampedAbsDiff(self.last_mean, self.base());
+        return switch (self.model) {
+            .deviation => clampedAbsDiff(self.last_mean, self.base()),
+            .steady => @max(self.last_mean - (self.band_lo orelse 0), 0),
+        };
     }
 
-    /// Feed one poll's signed reading and get this poll's answer: the latched
-    /// state, or in window mode the single poll a tap ends on.
-    pub fn update(self: *Detector, raw: i16) bool {
+    /// Whether this reading is a clamped probe: inside the band and no further
+    /// than the jitter allowance from the one before it.
+    fn isStill(self: *const Detector, raw: i16) bool {
+        if (self.band_lo) |lo| if (raw < lo) return false;
+        if (self.band_hi) |hi| if (raw > hi) return false;
+        const prev = self.prev_raw orelse return true;
+        return clampedAbsDiff(raw, prev) <= self.jitter;
+    }
+
+    /// One poll of the steady model, which sets `on` and `at_rest`.
+    ///
+    /// Judged on the raw reading, never on the mean. The mean is an average of
+    /// the flailing, which is a plausible-looking number about nothing, and
+    /// averaging is exactly what destroys the stillness that is the signal
+    /// here. The mean is still kept, from the still readings only, because the
+    /// pitch wants something that does not step and holds through a dropout.
+    fn stepSteady(self: *Detector, raw: i16) void {
+        const still = self.isStill(raw);
+        self.prev_raw = raw;
+        self.at_rest = !still;
+
+        // The score has no meaning here; what the log and the status line get
+        // instead is the move that was judged, in jitter allowances.
+        self.z = @as(f32, @floatFromInt(self.deviation())) /
+            @as(f32, @floatFromInt(@max(self.jitter, 1)));
+
+        if (self.blocked) {
+            if (self.at_rest) self.blocked = false;
+            self.count = 0;
+            self.on = false;
+            return;
+        }
+
+        if (still) {
+            self.last_mean = self.mean.push(raw);
+            self.dropped = 0;
+            self.count = @min(self.count + 1, self.hold);
+            if (self.count == self.hold) self.on = true;
+        } else {
+            self.count = 0;
+            self.dropped += 1;
+            if (self.dropped >= self.drop) self.on = false;
+        }
+    }
+
+    /// One poll of the deviation model, which sets `on` and `at_rest`.
+    ///
+    /// Returns false when the baseline has nothing behind it yet, which is the
+    /// one case where this model cannot answer at all.
+    fn stepDeviation(self: *Detector, raw: i16) bool {
         self.last_mean = self.mean.push(raw);
         self.baseline.push(self.last_mean);
 
         const denom = @max(self.baseline.mad, mad_floor);
         self.z = (@as(f32, @floatFromInt(self.last_mean)) -
             @as(f32, @floatFromInt(self.base()))) / denom;
-        self.pulse = false;
 
         // Before the median has anything behind it the score is noise about
         // noise, and acting on it would start a clip at power-on.
@@ -368,12 +501,15 @@ pub const Detector = struct {
         // the line arm and disarm on alternate polls.
         const back = @abs(self.z) < self.level / 2.0 and
             (self.counts == null or dev < @divTrunc(self.counts.?, 2));
+        self.at_rest = back;
 
         // A hand that outlasted the window is still on the plant, and reads as
         // over the threshold for as long as it stays. Nothing may start again
         // until the probe has been back at rest.
         if (self.blocked) {
             if (back) self.blocked = false;
+            self.count = 0;
+            self.on = false;
             return false;
         }
 
@@ -390,13 +526,28 @@ pub const Detector = struct {
             self.count -|= 1;
         }
 
-        const was_on = self.on;
         if (self.count == self.hold) {
             self.on = true;
         } else if (self.count == 0) {
             self.on = false;
         }
+        return true;
+    }
 
+    /// Feed one poll's signed reading and get this poll's answer: the latched
+    /// state, or in window mode the single poll a tap ends on.
+    pub fn update(self: *Detector, raw: i16) bool {
+        self.pulse = false;
+        const was_on = self.on;
+
+        switch (self.model) {
+            .deviation => if (!self.stepDeviation(raw)) return false,
+            .steady => self.stepSteady(raw),
+        }
+
+        // The tap layer is the same question of either model: did the state go
+        // on and back off again soon enough to have been a gesture rather than
+        // a hand left where it was?
         const window = self.window orelse return self.on;
 
         if (self.on) {
@@ -408,6 +559,7 @@ pub const Detector = struct {
             if (self.over_polls > window) {
                 self.count = 0;
                 self.on = false;
+                self.dropped = 0;
                 self.armed = false;
                 self.blocked = true;
             }
@@ -465,6 +617,19 @@ pub const Machine = struct {
     /// Feed one poll of both probes, signed and unrectified, and get the state.
     pub fn update(self: *Machine, raw_a: i16, raw_bc: i16) State {
         const a_on = self.a.update(raw_a);
+
+        // The shadow is a deviation-model problem. On the floating rig a hand
+        // on A leaves BC flipping between zero and the rail, nowhere near the
+        // band, so there is nothing to see through — and freezing a baseline
+        // the steady model never reads, or resetting BC's stillness for a third
+        // of a second every time A latches, would only lose real touches.
+        if (self.bc.model == .steady) {
+            const bc_on = self.bc.update(raw_bc);
+            if (a_on and bc_on) return .both;
+            if (a_on) return .plant_a;
+            if (bc_on) return .plant_bc;
+            return .none;
+        }
 
         // A's edges are handled before BC is updated, so the freeze is in place
         // before the first crosstalk-poisoned reading could be learned.
@@ -934,6 +1099,282 @@ test "a touch longer than half the baseline window reads as released" {
     // Held past half the window, the median migrates onto the touched level and
     // the score decays to nothing. Raise --touch-baseline to push this out.
     try testing.expectEqual(State.none, holdBoth(&m, 660, 900, 344 * 20));
+}
+
+const floating = @embedFile("testdata/touch-floating.txt");
+
+/// The floating-probe capture, split into the blocks its comment lines mark
+/// out: 0 both probes flailing, 1 a hand on A, 2 flailing again, 3 a hand on BC
+/// with the contact dropping in and out, 4 a hand on BC throughout.
+fn floatingSection(want: usize, rows: *[128][2]i16) usize {
+    var block: usize = 0;
+    var n: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, floating, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') {
+            // A comment only ends a block that had something in it; the header
+            // is a run of them with no readings between.
+            if (n != 0) {
+                if (block == want) return n;
+                block += 1;
+                n = 0;
+            }
+            continue;
+        }
+        var cols = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const a_text = cols.next() orelse continue;
+        const bc_text = cols.next() orelse continue;
+        rows[n] = .{
+            std.fmt.parseInt(i16, a_text, 10) catch continue,
+            std.fmt.parseInt(i16, bc_text, 10) catch continue,
+        };
+        n += 1;
+        if (n == rows.len) return n;
+    }
+    return if (block == want) n else 0;
+}
+
+/// The capture was taken at 860 SPS shared between the probes. The engine polls
+/// each one every 128 frames of 44100, which is close enough that a poll is a
+/// poll; what the fixture is for is the shape, not the clock.
+fn steadyConfig() Config {
+    return .{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .model = .steady,
+        // Ten polls of attack, thirty of release. Ten is the floor: untouched,
+        // BC sits dead still at 1 for as long as eight polls at a stretch, and
+        // with no band to throw those out on level the attack is the only thing
+        // that tells them from a hand. Twelve is the shortest real touch in the
+        // capture, so there is not much room above it either.
+        .hold_ms = 30.0,
+        .drop_ms = 87.0,
+    };
+}
+
+/// Feed one probe's column through a detector and report how it answered.
+fn steadyRun(d: *Detector, rows: []const [2]i16, probe: usize) struct { on: usize, edges: usize } {
+    var on: usize = 0;
+    var edges: usize = 0;
+    var prev = false;
+    for (rows) |row| {
+        const now = d.update(row[probe]);
+        if (now) on += 1;
+        if (now and !prev) edges += 1;
+        prev = now;
+    }
+    return .{ .on = on, .edges = edges };
+}
+
+test "the steady model is not put through the crosstalk settle" {
+    // Both probes on the floating rig, played through the machine as recorded:
+    // A latches on its own block and BC on both of its, and A's edges do not
+    // reach into BC.
+    var rows: [128][2]i16 = undefined;
+    var m = Machine.init(steadyConfig());
+
+    const flail = floatingSection(0, &rows);
+    for (rows[0..flail]) |row| try testing.expectEqual(State.none, m.update(row[0], row[1]));
+
+    const a_held = floatingSection(1, &rows);
+    var seen_a = false;
+    for (rows[0..a_held]) |row| {
+        const st = m.update(row[0], row[1]);
+        if (st == .plant_a) seen_a = true;
+        try testing.expect(st != .plant_bc and st != .both);
+    }
+    try testing.expect(seen_a);
+
+    const bc_held = floatingSection(4, &rows);
+    var seen_bc = false;
+    for (rows[0..bc_held]) |row| {
+        if (m.update(row[0], row[1]) == .plant_bc) seen_bc = true;
+    }
+    try testing.expect(seen_bc);
+}
+
+test "the deviation model cannot see a touch on a floating probe" {
+    // The section where a hand is on probe A. Its median is a median of
+    // flailing and its MAD is thousands, so a hand clamping the probe to a
+    // quiet 670 scores nothing at all. This is the rig the steady model is for.
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(1, &rows);
+    var d = Detector.init(testConfig());
+    const answer = steadyRun(&d, rows[0..n], 0);
+    try testing.expectEqual(@as(usize, 0), answer.on);
+}
+
+test "the steady model latches on a probe that has gone quiet" {
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(1, &rows);
+    try testing.expect(n > 60);
+
+    var d = Detector.init(steadyConfig());
+    const answer = steadyRun(&d, rows[0..n], 0);
+    // Latched within the first handful of polls and stayed there, once.
+    try testing.expectEqual(@as(usize, 1), answer.edges);
+    try testing.expect(answer.on > n - 14);
+}
+
+test "the steady model reads the other probe as untouched at the same time" {
+    // While a hand is on A, BC is flipping between zero and the rail. Nothing
+    // in that is inside the band.
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(1, &rows);
+    var d = Detector.init(steadyConfig());
+    const answer = steadyRun(&d, rows[0..n], 1);
+    try testing.expectEqual(@as(usize, 0), answer.on);
+}
+
+test "a flailing probe never latches the steady model" {
+    for ([_]usize{ 0, 2 }) |section| {
+        var rows: [128][2]i16 = undefined;
+        const n = floatingSection(section, &rows);
+        try testing.expect(n > 10);
+        for ([_]usize{ 0, 1 }) |probe| {
+            var d = Detector.init(steadyConfig());
+            const answer = steadyRun(&d, rows[0..n], probe);
+            try testing.expectEqual(@as(usize, 0), answer.on);
+        }
+    }
+}
+
+test "a dropout in the middle of a touch does not end it" {
+    // The patchy section: BC is held throughout, but contact is lost for a few
+    // polls at a time. A release as quick as the attack lets go on every one of
+    // them and the touch is reported in pieces.
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(3, &rows);
+
+    var patient = Detector.init(steadyConfig());
+    const held = steadyRun(&patient, rows[0..n], 1);
+
+    var cfg = steadyConfig();
+    cfg.drop_ms = 15.0;
+    var hasty = Detector.init(cfg);
+    const flickered = steadyRun(&hasty, rows[0..n], 1);
+
+    try testing.expectEqual(@as(usize, 1), held.edges);
+    try testing.expect(held.on > flickered.on * 3);
+}
+
+test "the steady model's pitch is the level the probe went still at" {
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(4, &rows);
+
+    // With no band, the pitch is measured from zero: the clean BC block reads
+    // 658-663 and that is what the drone gets.
+    var bare = Detector.init(steadyConfig());
+    _ = steadyRun(&bare, rows[0..n], 1);
+    try testing.expect(bare.deviation() >= 650);
+    try testing.expect(bare.deviation() <= 670);
+
+    // Given a band, it is measured from the bottom of it instead, which is the
+    // travel a hand can actually produce rather than where the rig happens to
+    // clamp.
+    var cfg = steadyConfig();
+    cfg.band_lo = 600;
+    cfg.band_hi = 750;
+    var banded = Detector.init(cfg);
+    _ = steadyRun(&banded, rows[0..n], 1);
+    try testing.expect(banded.deviation() >= 50);
+    try testing.expect(banded.deviation() <= 70);
+}
+
+test "BC can be given a band of its own, which is what the rig needs" {
+    const m = Machine.init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .model = .steady,
+        .band_lo = 650,
+        .band_hi = 750,
+        .band_lo_bc = -5,
+        .band_hi_bc = 5,
+    });
+    try testing.expectEqual(@as(i16, 650), m.a.band_lo);
+    try testing.expectEqual(@as(i16, 750), m.a.band_hi);
+    try testing.expectEqual(@as(i16, -5), m.bc.band_lo);
+    try testing.expectEqual(@as(i16, 5), m.bc.band_hi);
+}
+
+test "BC is put in A's band when it was given none of its own" {
+    const m = Machine.init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .model = .steady,
+        .band_lo = 650,
+        .band_hi = 750,
+    });
+    try testing.expectEqual(m.a.band_lo, m.bc.band_lo);
+    try testing.expectEqual(m.a.band_hi, m.bc.band_hi);
+}
+
+test "a zero band on BC needs an attack longer than its untouched parking" {
+    // Untouched, BC does not flail evenly: it bounces off zero and the rail,
+    // and it sits dead still at 1 for as long as nine polls at a stretch. A
+    // zero band with a short attack calls each of those a touch.
+    var rows: [128][2]i16 = undefined;
+    var cfg = steadyConfig();
+    cfg.band_lo_bc = -5;
+    cfg.band_hi_bc = 5;
+
+    var hasty = cfg;
+    hasty.hold_bc_ms = 15.0;
+    var patient = cfg;
+    patient.hold_bc_ms = 100.0;
+
+    var hasty_on: usize = 0;
+    var patient_on: usize = 0;
+    for ([_]usize{ 0, 1, 2, 3 }) |section| {
+        const n = floatingSection(section, &rows);
+        var h = Detector.init(hasty.forBc());
+        var q = Detector.init(patient.forBc());
+        for (rows[0..n]) |row| {
+            if (h.update(row[1])) hasty_on += 1;
+            if (q.update(row[1])) patient_on += 1;
+        }
+    }
+    // Not one poll of it at a hundred milliseconds, against a hold that lasts
+    // seconds when a hand is really there.
+    try testing.expectEqual(@as(usize, 0), patient_on);
+    try testing.expect(hasty_on > 100);
+}
+
+test "a probe clamped to zero is a touch, with or without a band to say so" {
+    // The rig's other answer: a hand on plant B holds BC at about 1. With no
+    // band that is a touch like any other stillness, which is the whole reason
+    // the band is optional.
+    var bare = Detector.init(steadyConfig().forBc());
+    for (0..11) |_| _ = bare.update(1);
+    try testing.expect(bare.on);
+
+    var cfg = steadyConfig();
+    cfg.band_lo_bc = -5;
+    cfg.band_hi_bc = 5;
+    cfg.hold_bc_ms = 100.0;
+    var banded = Detector.init(cfg.forBc());
+    for (0..34) |_| _ = banded.update(1);
+    try testing.expect(banded.on);
+
+    // Held to plant A's band, the same readings are nothing at all: this is
+    // what a band buys, and what it costs.
+    var a_band = steadyConfig();
+    a_band.band_lo = 600;
+    a_band.band_hi = 750;
+    var in_a = Detector.init(a_band);
+    for (0..344) |_| try testing.expect(!in_a.update(1));
+}
+
+test "a reading outside the band is never still, however little it moved" {
+    var cfg = steadyConfig();
+    cfg.band_lo = 600;
+    cfg.band_hi = 750;
+    var d = Detector.init(cfg);
+    // Rock steady at 1, and inside this band it is not a touch.
+    for (0..344) |_| try testing.expect(!d.update(1));
+    try testing.expect(!d.on);
 }
 
 const fixture = @embedFile("testdata/touch-sample.txt");
