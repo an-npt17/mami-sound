@@ -11,8 +11,8 @@
 const std = @import("std");
 
 /// Pitch range, matching the drone voice so the two can be compared by ear.
-pub const freq_min: f32 = 120.0;
-pub const freq_max: f32 = 2000.0;
+pub const freq_min: f32 = 50.0;
+pub const freq_max: f32 = 1000.0;
 
 /// Time constant of the pitch smoother, matching every other voice: this is
 /// what turns a per-block sensor reading into a glide.

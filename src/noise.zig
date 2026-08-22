@@ -14,13 +14,24 @@ const std = @import("std");
 /// `freq_min` is where the drone sits with nobody in the room, so it has to be
 /// heard rather than merely felt: 20 Hz was under most speakers and the room
 /// read as switched off.
-pub const freq_min: f32 = 80.0;
+pub const freq_min: f32 = 30.0;
 pub const freq_max: f32 = 1000.0;
 
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
 /// deviation wiggles faster than this never reach the filter. Raise it to make
 /// plant A answer more slowly.
 pub const default_glide_s: f32 = 0.5;
+
+/// Time constant of the fall back to `freq_min` once nobody is touching, when
+/// it wants to differ from the glide. `null` gives it the glide's.
+///
+/// The glide is set by how the pitch should answer a hand that is on the plant,
+/// and a glide slow enough to be expressive there leaves the drone sinking for
+/// seconds after the hand has gone, which reads as the plant not having noticed
+/// the room empty. The release is gated on the touch state rather than on the
+/// pitch falling: a fall *during* a touch is the plant answering a lighter
+/// grip and belongs at glide speed.
+pub const default_release_s: ?f32 = null;
 
 /// Gate fade length, long enough to avoid a click at touch and release.
 const gate_ms: f32 = 150.0;
@@ -41,12 +52,14 @@ const gate_ms: f32 = 150.0;
 pub const default_jump: f32 = 0.75;
 
 /// How plant A's pitch answers a touch: how far up the range a deviation
-/// reaches, how much of the remaining distance a new touch closes at once, and
-/// how long the rest of it takes.
+/// reaches, how much of the remaining distance a new touch closes at once, how
+/// long the rest of it takes, and how long the fall home takes once the hand
+/// has gone.
 pub const Shape = struct {
     span: i16 = default_span,
     jump: f32 = default_jump,
     glide_s: f32 = default_glide_s,
+    release_s: ?f32 = default_release_s,
 };
 
 /// Filter damping, `1 / Q`. Lower is a narrower, more whistle-like band.
@@ -99,6 +112,9 @@ pub const Noise = struct {
     prng: std.Random.DefaultPrng,
     sample_rate: u32,
     alpha: f32,
+    /// The smoother's rate while nobody is touching, which is what carries the
+    /// pitch home to `freq_min`.
+    alpha_release: f32,
     gate_step: f32,
     /// Deviation that reaches `freq_max`.
     span: i16,
@@ -121,6 +137,7 @@ pub const Noise = struct {
             .prng = std.Random.DefaultPrng.init(seed),
             .sample_rate = sample_rate,
             .alpha = smoothingAlpha(shape.glide_s, sample_rate),
+            .alpha_release = smoothingAlpha(shape.release_s orelse shape.glide_s, sample_rate),
             .gate_step = 1.0 / (gate_ms / 1000.0 * sr),
             .span = shape.span,
             .jump = shape.jump,
@@ -148,8 +165,13 @@ pub const Noise = struct {
         }
         self.prev_touch = touched;
 
+        // Held, the smoother is the piece and runs at the glide. Released, it
+        // is only the way home and runs at the release, which is the same rate
+        // unless the command line asked for another.
+        const alpha = if (touched) self.alpha else self.alpha_release;
+
         for (out) |*sample| {
-            self.fc += (target_fc - self.fc) * self.alpha;
+            self.fc += (target_fc - self.fc) * alpha;
 
             // Chamberlin state-variable filter, bandpass tap.
             const f = 2.0 * @sin(std.math.pi * self.fc / sr);
@@ -401,4 +423,57 @@ test "releasing re-arms the jump for the next touch" {
     n.render(&block, 2800, true);
     const target = freqFromDeviation(2800, default_span);
     try testing.expectApproxEqAbs(low + (target - low) * default_jump, n.fc, 1.0);
+}
+
+test "a short release falls home faster than the glide would" {
+    // Same glide on both, so what is measured is the release alone. No jump,
+    // so both start the fall from the same pitch.
+    var slow = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 4.0 });
+    var quick = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 4.0, .release_s = 0.5 });
+    var block: [4096]f32 = undefined;
+
+    // A second of touch to lift both off the bottom, identically.
+    for (0..10) |_| {
+        @memset(&block, 0);
+        slow.render(&block, 2200, true);
+        @memset(&block, 0);
+        quick.render(&block, 2200, true);
+    }
+    try testing.expectApproxEqAbs(slow.fc, quick.fc, 0.01);
+
+    // Then the hand goes.
+    for (0..10) |_| {
+        @memset(&block, 0);
+        slow.render(&block, 0, false);
+        @memset(&block, 0);
+        quick.render(&block, 0, false);
+    }
+    try testing.expect(quick.fc < slow.fc);
+}
+
+test "the release leaves a held touch gliding at the glide" {
+    // Falling *during* a touch is the plant answering a lighter grip, and is
+    // not what the release is for.
+    var plain = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 4.0 });
+    var released = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 4.0, .release_s = 0.01 });
+    var block: [4096]f32 = undefined;
+    for (0..10) |_| {
+        @memset(&block, 0);
+        plain.render(&block, 2200, true);
+        @memset(&block, 0);
+        released.render(&block, 2200, true);
+    }
+    // A hand still there, reading lower than it was.
+    for (0..10) |_| {
+        @memset(&block, 0);
+        plain.render(&block, 200, true);
+        @memset(&block, 0);
+        released.render(&block, 200, true);
+    }
+    try testing.expectApproxEqAbs(plain.fc, released.fc, 0.01);
+}
+
+test "no release given leaves the fall at the glide" {
+    const shaped = Noise.init(44100, 3, .{ .jump = 0.0, .glide_s = 4.0 });
+    try testing.expectEqual(shaped.alpha, shaped.alpha_release);
 }

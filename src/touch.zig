@@ -222,6 +222,26 @@ pub const Config = struct {
     /// without making A deaf.
     level_bc: ?f32 = null,
     hold_bc_ms: ?f32 = null,
+    /// A second threshold, in counts from the probe's own rest, that a touch
+    /// must also clear. `null` asks the score alone.
+    ///
+    /// The score divides by how much the probe normally wanders, so a probe
+    /// that goes quiet scores enormous deviations on a move that is, in counts,
+    /// nothing at all. `mad_floor` is the crude guard against that; this is the
+    /// one that can be set from the room, and it says how big a move has to be
+    /// in the units the probe actually reads.
+    counts: ?i16 = null,
+    counts_bc: ?i16 = null,
+    /// How long a touch may last and still count. `null` latches instead: the
+    /// state stays on for as long as the probe reads touched.
+    ///
+    /// A tap is a move out and a move back. An excursion that never comes back
+    /// is a hand left resting, a probe that has drifted or wiring settling
+    /// after power-on, and none of those is somebody asking for a recording.
+    /// Timed from the moment the hold has been satisfied, so the whole gesture
+    /// may last the hold plus this.
+    window_ms: ?f32 = null,
+    window_bc_ms: ?f32 = null,
 
     /// This config as probe BC sees it: its own threshold and hold where it was
     /// given them, A's everywhere else.
@@ -229,8 +249,12 @@ pub const Config = struct {
         var bc = self;
         bc.level = self.level_bc orelse self.level;
         bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
+        bc.counts = self.counts_bc orelse self.counts;
+        bc.window_ms = self.window_bc_ms orelse self.window_ms;
         bc.level_bc = null;
         bc.hold_bc_ms = null;
+        bc.counts_bc = null;
+        bc.window_bc_ms = null;
         return bc;
     }
 };
@@ -255,6 +279,21 @@ pub const Detector = struct {
     /// Set while the other probe has this one pulled off its rest. The score is
     /// then measured from where the pull left it, so only a further move counts.
     base_override: ?i16,
+    /// A move in counts that a touch must also clear, on top of the score.
+    counts: ?i16,
+    /// Polls an excursion may last and still be a tap. `null` latches instead.
+    window: ?u32,
+    /// Polls the current excursion has been latched for.
+    over_polls: u32,
+    /// Whether the excursion under way is still eligible to fire on its way
+    /// out. Cleared when it outlasts the window.
+    armed: bool,
+    /// Set when an excursion outlasted the window, and held until the probe
+    /// comes back to rest. Without it a hand left on the plant sits at the
+    /// threshold and re-arms on every poll.
+    blocked: bool,
+    /// This poll's answer in window mode: true on the one poll the tap ends.
+    pulse: bool,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -267,7 +306,27 @@ pub const Detector = struct {
             .z = 0.0,
             .last_mean = 0,
             .base_override = null,
+            .counts = cfg.counts,
+            .window = if (cfg.window_ms) |ms|
+                @max(holdPolls(ms, cfg.sample_rate, cfg.poll_frames), 1)
+            else
+                null,
+            .over_polls = 0,
+            .armed = false,
+            .blocked = false,
+            .pulse = false,
         };
+    }
+
+    /// Forget the excursion under way, latch and all. What the settle and the
+    /// warmup both need: the readings either side of them are not one gesture.
+    pub fn reset(self: *Detector) void {
+        self.count = 0;
+        self.on = false;
+        self.over_polls = 0;
+        self.armed = false;
+        self.blocked = false;
+        self.pulse = false;
     }
 
     /// What the score is measured from: the crosstalk floor while one is set,
@@ -282,7 +341,8 @@ pub const Detector = struct {
         return clampedAbsDiff(self.last_mean, self.base());
     }
 
-    /// Feed one poll's signed reading and get the latched answer.
+    /// Feed one poll's signed reading and get this poll's answer: the latched
+    /// state, or in window mode the single poll a tap ends on.
     pub fn update(self: *Detector, raw: i16) bool {
         self.last_mean = self.mean.push(raw);
         self.baseline.push(self.last_mean);
@@ -290,27 +350,74 @@ pub const Detector = struct {
         const denom = @max(self.baseline.mad, mad_floor);
         self.z = (@as(f32, @floatFromInt(self.last_mean)) -
             @as(f32, @floatFromInt(self.base()))) / denom;
+        self.pulse = false;
 
         // Before the median has anything behind it the score is noise about
         // noise, and acting on it would start a clip at power-on.
         if (!self.baseline.ready()) {
-            self.count = 0;
-            self.on = false;
+            self.reset();
             return false;
         }
 
-        if (@abs(self.z) >= self.level) {
+        const dev = self.deviation();
+        const over = @abs(self.z) >= self.level and
+            (self.counts == null or dev >= self.counts.?);
+
+        // Back at rest is half of whatever it took to leave it, in both units.
+        // Requiring the same number both ways would let a reading sitting on
+        // the line arm and disarm on alternate polls.
+        const back = @abs(self.z) < self.level / 2.0 and
+            (self.counts == null or dev < @divTrunc(self.counts.?, 2));
+
+        // A hand that outlasted the window is still on the plant, and reads as
+        // over the threshold for as long as it stays. Nothing may start again
+        // until the probe has been back at rest.
+        if (self.blocked) {
+            if (back) self.blocked = false;
+            return false;
+        }
+
+        // On the score alone, releasing as soon as the reading is not over is
+        // what this has always done, and the test bears it. Once there is a
+        // second threshold in play the reading spends time between the two,
+        // and decaying there chatters the latch off and straight back on —
+        // which, on a probe that starts recordings, is heard as clip after
+        // clip. So anything with a band waits to be back at rest.
+        const banded = self.window != null or self.counts != null;
+        if (over) {
             self.count = @min(self.count + 1, self.hold);
-        } else {
+        } else if (!banded or back) {
             self.count -|= 1;
         }
 
+        const was_on = self.on;
         if (self.count == self.hold) {
             self.on = true;
         } else if (self.count == 0) {
             self.on = false;
         }
-        return self.on;
+
+        const window = self.window orelse return self.on;
+
+        if (self.on) {
+            if (!was_on) {
+                self.over_polls = 0;
+                self.armed = true;
+            }
+            self.over_polls += 1;
+            if (self.over_polls > window) {
+                self.count = 0;
+                self.on = false;
+                self.armed = false;
+                self.blocked = true;
+            }
+        } else if (was_on and self.armed) {
+            // The move out was big enough and the move back came in time: this
+            // was a tap, and it is reported the instant it ends.
+            self.pulse = true;
+            self.armed = false;
+        }
+        return self.pulse;
     }
 };
 
@@ -377,8 +484,7 @@ pub const Machine = struct {
 
         if (self.settle_left > 0) {
             self.settle_left -= 1;
-            self.bc.count = 0;
-            self.bc.on = false;
+            self.bc.reset();
             bc_on = false;
             if (self.settle_left == 0 and self.rebasing) {
                 self.bc.base_override = self.bc.last_mean;
@@ -580,6 +686,90 @@ test "it releases when the probe returns to rest" {
     try testing.expect(!d.on);
 }
 
+/// Feed a detector one value for `polls` polls and count the taps it reported.
+fn taps(d: *Detector, raw: i16, polls: usize) usize {
+    var fired: usize = 0;
+    for (0..polls) |_| {
+        if (d.update(raw)) fired += 1;
+    }
+    return fired;
+}
+
+fn windowConfig(window_ms: f32) Config {
+    return .{ .sample_rate = 44100, .poll_frames = 128, .window_ms = window_ms };
+}
+
+test "in window mode a tap fires once, on the way out" {
+    var d = Detector.init(windowConfig(1000.0));
+    _ = taps(&d, 660, 344 * 10);
+
+    // Half a second of hand. Being touched is not the answer in window mode:
+    // nothing has been asked for until the hand comes off.
+    try testing.expectEqual(@as(usize, 0), taps(&d, -2049, 172));
+    try testing.expect(d.on);
+
+    // And off again. One poll of it, not one per poll of rest afterwards.
+    try testing.expectEqual(@as(usize, 1), taps(&d, 660, 344));
+}
+
+test "in window mode a hand left on the plant never fires" {
+    var d = Detector.init(windowConfig(1000.0));
+    _ = taps(&d, 660, 344 * 10);
+
+    // Five seconds, well past the window.
+    try testing.expectEqual(@as(usize, 0), taps(&d, -2049, 344 * 5));
+    // And taking it off is not a tap either: the gesture was disqualified
+    // while it was still under way, not at its end.
+    try testing.expectEqual(@as(usize, 0), taps(&d, 660, 344 * 2));
+}
+
+test "a disqualified hand can tap again once the probe is back at rest" {
+    var d = Detector.init(windowConfig(1000.0));
+    _ = taps(&d, 660, 344 * 10);
+    _ = taps(&d, -2049, 344 * 5);
+    _ = taps(&d, 660, 344 * 2);
+
+    try testing.expectEqual(@as(usize, 0), taps(&d, -2049, 172));
+    try testing.expectEqual(@as(usize, 1), taps(&d, 660, 344));
+}
+
+test "the window does not replace the hold: a move too brief to count fires nothing" {
+    var d = Detector.init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .hold_ms = 1000.0,
+        .window_ms = 2000.0,
+    });
+    _ = taps(&d, 660, 344 * 10);
+    // Half a second of hand against a hold of a whole one: never latched, so
+    // there is no excursion for the way out to end.
+    try testing.expectEqual(@as(usize, 0), taps(&d, -2049, 172));
+    try testing.expect(!d.on);
+    try testing.expectEqual(@as(usize, 0), taps(&d, 660, 344 * 2));
+}
+
+test "the counts gate ignores a move that only scores big because the probe is quiet" {
+    // A probe reading two values and nothing else has a MAD at the floor, so a
+    // move of 200 counts scores eight deviations and latches on the score
+    // alone. In counts it is a tenth of what a touch on this rig is worth.
+    var quiet = Detector.init(testConfig());
+    var gated = Detector.init(.{ .sample_rate = 44100, .poll_frames = 128, .counts = 1000 });
+    for (0..344 * 10) |i| {
+        const raw: i16 = if (i % 2 == 0) -2049 else -2050;
+        _ = quiet.update(raw);
+        _ = gated.update(raw);
+    }
+
+    _ = hold(&quiet, -1849, 344);
+    _ = hold(&gated, -1849, 344);
+    try testing.expect(quiet.on);
+    try testing.expect(!gated.on);
+
+    // The move a real touch makes still gets through.
+    _ = hold(&gated, 660, 344);
+    try testing.expect(gated.on);
+}
+
 test "an override baseline is what the score is measured from" {
     var d = Detector.init(testConfig());
     _ = hold(&d, -2049, 344 * 10);
@@ -691,6 +881,19 @@ test "BC can be given its own threshold and hold" {
     try testing.expectEqual(@as(f32, 20.0), m.bc.level);
     // 30 ms of polls against 100 ms of them.
     try testing.expect(m.bc.hold < m.a.hold);
+}
+
+test "BC can be given a counts gate and a window of its own" {
+    const m = Machine.init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .counts_bc = 1500,
+        .window_bc_ms = 1000.0,
+    });
+    try testing.expectEqual(@as(?i16, null), m.a.counts);
+    try testing.expectEqual(@as(?u32, null), m.a.window);
+    try testing.expectEqual(@as(?i16, 1500), m.bc.counts);
+    try testing.expectEqual(holdPolls(1000.0, 44100, 128), m.bc.window.?);
 }
 
 test "BC is asked A's question when it was given none of its own" {

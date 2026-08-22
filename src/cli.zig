@@ -18,9 +18,12 @@ pub const Error = error{
     InvalidTouchAverage,
     InvalidTouchBaseline,
     InvalidTouchSettle,
+    InvalidTouchCounts,
+    InvalidTouchWindow,
     InvalidPitchSpan,
     InvalidPitchJump,
     InvalidPitchGlide,
+    InvalidPitchRelease,
     InvalidLogPath,
     TriggerRetired,
     InvalidInterrupt,
@@ -92,12 +95,21 @@ pub const Options = struct {
     /// sounding. BC can be held to a much larger move without making A deaf.
     touch_level_bc: ?f32 = null,
     touch_hold_bc_ms: ?f32 = null,
+    /// A move in counts that probe BC must also clear before it counts as
+    /// touched. `null` asks the score alone.
+    touch_counts_bc: ?i16 = null,
+    /// How long a touch on BC may last and still count as one. `null` latches
+    /// instead, so BC is on for as long as a hand is on it.
+    touch_window_bc_ms: ?f32 = null,
     /// The deviation that maps to the top of plant A's pitch range.
     pitch_span: i16 = noise.default_span,
     /// How much of the distance to a new pitch is closed at once, and how long
     /// the rest takes. Between them, how sharply plant A answers.
     pitch_jump: f32 = noise.default_jump,
     pitch_glide_s: f32 = noise.default_glide_s,
+    /// How long the fall back to the bottom of the range takes once nobody is
+    /// touching. `null` gives it the glide's.
+    pitch_release_s: ?f32 = noise.default_release_s,
     /// How long a clip must have been playing before a fresh touch may cut it
     /// short and draw another, in seconds. Zero lets every clip finish.
     interrupt_s: f32 = default_interrupt_s,
@@ -178,6 +190,18 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidTouchHold;
             if (!(held >= 0.0) or held > 5000.0) return Error.InvalidTouchHold;
             opts.touch_hold_bc_ms = held;
+        } else if (std.mem.startsWith(u8, arg, "--touch-counts-bc=")) {
+            const counts = std.fmt.parseInt(i16, arg["--touch-counts-bc=".len..], 10) catch
+                return Error.InvalidTouchCounts;
+            if (counts <= 0) return Error.InvalidTouchCounts;
+            opts.touch_counts_bc = counts;
+        } else if (std.mem.startsWith(u8, arg, "--touch-window-bc=")) {
+            const window = std.fmt.parseFloat(f32, arg["--touch-window-bc=".len..]) catch
+                return Error.InvalidTouchWindow;
+            // Under the hold nothing could ever fire; past ten seconds the
+            // window is no longer telling a tap from a hand left resting.
+            if (!(window > 0.0) or window > 10000.0) return Error.InvalidTouchWindow;
+            opts.touch_window_bc_ms = window;
         } else if (std.mem.startsWith(u8, arg, "--pitch-jump=")) {
             const jump = std.fmt.parseFloat(f32, arg["--pitch-jump=".len..]) catch
                 return Error.InvalidPitchJump;
@@ -191,6 +215,11 @@ pub fn parse(args: []const []const u8) Error!Options {
             // avoid; past a minute the pitch stops tracking the plant at all.
             if (!(glide > 0.0) or glide > 60.0) return Error.InvalidPitchGlide;
             opts.pitch_glide_s = glide;
+        } else if (std.mem.startsWith(u8, arg, "--pitch-release=")) {
+            const release = std.fmt.parseFloat(f32, arg["--pitch-release=".len..]) catch
+                return Error.InvalidPitchRelease;
+            if (!(release > 0.0) or release > 60.0) return Error.InvalidPitchRelease;
+            opts.pitch_release_s = release;
         } else if (std.mem.startsWith(u8, arg, "--pitch-span=")) {
             const span = std.fmt.parseInt(i16, arg["--pitch-span=".len..], 10) catch
                 return Error.InvalidPitchSpan;
@@ -232,8 +261,10 @@ pub const usage =
     \\                 [--touch=probes|always|script|motion] [--touch-level=Z]
     \\                 [--touch-hold=MS] [--touch-average=MS] [--touch-baseline=S]
     \\                 [--touch-settle=MS] [--touch-level-bc=Z] [--touch-hold-bc=MS]
+    \\                 [--touch-counts-bc=COUNTS] [--touch-window-bc=MS]
     \\                 [--pitch-span=COUNTS] [--pitch-jump=FRACTION]
-    \\                 [--pitch-glide=SECONDS] [--log-touch=PATH]
+    \\                 [--pitch-glide=SECONDS] [--pitch-release=SECONDS]
+    \\                 [--log-touch=PATH]
     \\                 [--interrupt=SECONDS] [--device=NAME]
     \\
     \\PLANTS is the digits of the plants to play, in any order:
@@ -294,6 +325,23 @@ pub const usage =
     \\tell, while a wrong latch on BC starts a recording that then runs for
     \\minutes. Hold BC to a much larger move than A without making A deaf.
     \\
+    \\--touch-counts-bc is a second threshold BC must also clear, in counts from
+    \\its own rest rather than in deviations. The score divides by how much the
+    \\probe normally wanders, so a probe that has gone quiet scores enormous
+    \\deviations on a move that is, in counts, nothing at all; this is the
+    \\threshold that says how big a move has to be in the units the probe
+    \\actually reads. Left out, the score decides alone.
+    \\
+    \\--touch-window-bc is how long a touch on BC may last and still count as
+    \\one. With it, BC starts a clip on the *end* of a touch rather than on the
+    \\start: the probe has to go past the threshold and come back inside the
+    \\window, which is what a tap looks like. An excursion that never comes back
+    \\is a hand left resting, a drifting probe or wiring still settling, and it
+    \\starts nothing, and nothing else can start until the probe has been back
+    \\at rest. The clock starts once the hold is satisfied, so the whole gesture
+    \\may last --touch-hold-bc plus this. Left out, BC latches as before and is
+    \\on for as long as a hand is on it.
+    \\
     \\--pitch-span is the deviation from rest that reaches the top of plant A's
     \\range, 3000 counts by default. Raise it if the drone slams to the top of
     \\its range on the smallest touch, which means the probe is moving by more
@@ -305,6 +353,13 @@ pub const usage =
     \\sharply plant A answers: lower the jump and lengthen the glide and the
     \\pitch swells into place instead of arriving all at once. A jump of 0 is a
     \\pure glide, which is the gentlest the piece will go.
+    \\
+    \\--pitch-release is how long the fall back to the bottom of the range takes
+    \\once nobody is touching, and it is only the way home: a fall while a hand
+    \\is still on the plant is the plant answering a lighter grip, and keeps the
+    \\glide. A glide slow enough to be expressive under a hand leaves the drone
+    \\sinking for seconds after the room has emptied, which reads as the plant
+    \\not having noticed. Left out, the fall takes the glide.
     \\
     \\--log-touch writes every poll's numbers to PATH as CSV: both probes' raw
     \\reading, mean, median, deviation, score and latch, and the state they
@@ -462,6 +517,37 @@ test "BC is asked A's question when it was given none of its own" {
     const opts = try parse(&.{"--touch-level=9"});
     try testing.expectEqual(@as(?f32, null), opts.touch_level_bc);
     try testing.expectEqual(@as(?f32, null), opts.touch_hold_bc_ms);
+}
+
+test "BC's counts gate and window are parsed" {
+    const opts = try parse(&.{ "--touch-counts-bc=1500", "--touch-window-bc=1000" });
+    try testing.expectEqual(@as(?i16, 1500), opts.touch_counts_bc);
+    try testing.expectEqual(@as(?f32, 1000.0), opts.touch_window_bc_ms);
+}
+
+test "BC latches as before when neither the counts gate nor the window is asked for" {
+    const opts = try parse(&.{"--touch-level-bc=20"});
+    try testing.expectEqual(@as(?i16, null), opts.touch_counts_bc);
+    try testing.expectEqual(@as(?f32, null), opts.touch_window_bc_ms);
+}
+
+test "a counts gate or a window outside its range is refused" {
+    try testing.expectError(Error.InvalidTouchCounts, parse(&.{"--touch-counts-bc=0"}));
+    try testing.expectError(Error.InvalidTouchCounts, parse(&.{"--touch-counts-bc=-5"}));
+    try testing.expectError(Error.InvalidTouchCounts, parse(&.{"--touch-counts-bc=soon"}));
+    // Zero would be a window nothing could ever come back inside.
+    try testing.expectError(Error.InvalidTouchWindow, parse(&.{"--touch-window-bc=0"}));
+    try testing.expectError(Error.InvalidTouchWindow, parse(&.{"--touch-window-bc=20000"}));
+}
+
+test "plant A's fall home can be shortened without touching its rise" {
+    const opts = try parse(&.{ "--pitch-glide=4", "--pitch-release=0.5" });
+    try testing.expectEqual(@as(f32, 4.0), opts.pitch_glide_s);
+    try testing.expectEqual(@as(?f32, 0.5), opts.pitch_release_s);
+    // Left out, the fall takes the glide, which `noise` reads as null.
+    try testing.expectEqual(@as(?f32, null), (try parse(&.{"--pitch-glide=4"})).pitch_release_s);
+    try testing.expectError(Error.InvalidPitchRelease, parse(&.{"--pitch-release=0"}));
+    try testing.expectError(Error.InvalidPitchRelease, parse(&.{"--pitch-release=120"}));
 }
 
 test "plant A's rise can be slowed" {

@@ -82,6 +82,14 @@ pub fn main(init: std.process.Init) !void {
                 "--touch-settle takes milliseconds between 0 and 5000.\n\n",
                 .{},
             ),
+            error.InvalidTouchCounts => std.debug.print(
+                "--touch-counts-bc takes a whole number of counts above zero.\n\n",
+                .{},
+            ),
+            error.InvalidTouchWindow => std.debug.print(
+                "--touch-window-bc takes milliseconds between 0 and 10000.\n\n",
+                .{},
+            ),
             error.InvalidPitchSpan => std.debug.print(
                 "--pitch-span takes a whole number of counts above zero.\n\n",
                 .{},
@@ -92,6 +100,10 @@ pub fn main(init: std.process.Init) !void {
             ),
             error.InvalidPitchGlide => std.debug.print(
                 "--pitch-glide takes seconds between 0 and 60.\n\n",
+                .{},
+            ),
+            error.InvalidPitchRelease => std.debug.print(
+                "--pitch-release takes seconds between 0 and 60.\n\n",
                 .{},
             ),
             error.InvalidLogPath => std.debug.print(
@@ -150,12 +162,14 @@ pub fn main(init: std.process.Init) !void {
             .span = opts.pitch_span,
             .jump = opts.pitch_jump,
             .glide_s = opts.pitch_glide_s,
+            .release_s = opts.pitch_release_s,
         }) },
         .beep => .{ .beep = ms.tone.Tone.init(ms.sample_rate, ms.sensors.ecg_max) },
         .drone => .{ .drone = ms.noise.Noise.init(ms.sample_rate, seed, .{
             .span = opts.pitch_span,
             .jump = opts.pitch_jump,
             .glide_s = opts.pitch_glide_s,
+            .release_s = opts.pitch_release_s,
         }) },
     };
     // B and C answer one probe between them, so they are one voice with two
@@ -180,6 +194,8 @@ pub fn main(init: std.process.Init) !void {
         .settle_ms = opts.touch_settle_ms,
         .level_bc = opts.touch_level_bc,
         .hold_bc_ms = opts.touch_hold_bc_ms,
+        .counts_bc = opts.touch_counts_bc,
+        .window_bc_ms = opts.touch_window_bc_ms,
     });
 
     // Opened once, so a bad path is a startup failure rather than something
