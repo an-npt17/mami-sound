@@ -1,21 +1,26 @@
 [Unit]
 Description=Mami sound installation
-Wants=dev-snd-pcmC0D0p.device
-After=dev-snd-pcmC0D0p.device sound.target
-StartLimitIntervalSec=300
-StartLimitBurst=20
+After=sound.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 8
-WorkingDirectory=/home/pi/mami-sound
-ExecStart=/home/pi/mami-sound/zig-out/bin/mami_sound --device=plughw:0,0
---touch-level-bc=20 --touch-hold-bc=30 --pitch-jump=0.15 --pitch-glide=4
-Restart=always
-RestartSec=3
 User=pi
 SupplementaryGroups=audio i2c gpio
-Nice=-5
+WorkingDirectory=/home/pi/mami-sound
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/pi/mami-sound/zig-out/bin/mami_sound \
+    --device=plughw:0,0 \
+    --touch-level-bc=20 \
+    --touch-hold-bc=30 \
+    --pitch-jump=0.15 \
+    --pitch-glide=4
+
+# Ride out a transient card hiccup, but give up after 3 tries in 2 min
+# so the box sits idle and sshable instead of looping ffmpeg decodes.
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
