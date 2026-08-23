@@ -1,8 +1,7 @@
 //! Which plants take part in a run.
 //!
-//! The command line takes one argument: the digits of the plants to enable,
-//! in any order. `1` is plant A alone and `12` enables both plants. No argument
-//! means all of them, so the default run is unchanged.
+//! The command line takes one argument: `1`, `2`, or `12` to choose the plants.
+//! No argument means all of them, so the default run is unchanged.
 //!
 //! Parsing is pure so the flag can be tested without touching audio.
 
@@ -19,19 +18,15 @@ pub const Selection = plant.Selection;
 
 pub const all: Selection = plant.all;
 
-/// Parse the digit string. `null` (no argument given) selects every plant.
+/// Parse one of the allowed digit strings. `null` selects every plant.
 pub fn parse(text: ?[]const u8) Error!Selection {
     const digits = text orelse return all;
     if (digits.len == 0) return Error.InvalidSelection;
 
-    var sel: Selection = .{false} ** plant.count;
-    for (digits) |c| {
-        // '1'-based on the command line because the plants are named A and B
-        // to visitors and 1, 2 on the panel; nobody counts from zero there.
-        if (c < '1' or c > '0' + plant.count) return Error.InvalidSelection;
-        sel[c - '1'] = true;
-    }
-    return sel;
+    if (std.mem.eql(u8, digits, "1")) return .{ true, false };
+    if (std.mem.eql(u8, digits, "2")) return .{ false, true };
+    if (std.mem.eql(u8, digits, "12")) return all;
+    return Error.InvalidSelection;
 }
 
 /// Mask a sensor reading's touches so disabled plants read as untouched. That
@@ -59,5 +54,32 @@ pub const usage =
 test "plant selection has only A and B" {
     try std.testing.expectEqual(@as(usize, 2), plant.count);
     try std.testing.expectEqual(plant.Selection{ true, true }, plant.all);
-    try std.testing.expectError(Error.InvalidSelection, parse("3"));
+    try std.testing.expectEqual(plant.all, try parse(null));
+    try std.testing.expectEqual(Selection{ true, false }, try parse("1"));
+    try std.testing.expectEqual(Selection{ false, true }, try parse("2"));
+    try std.testing.expectEqual(plant.all, try parse("12"));
+}
+
+test "plant selection rejects duplicates and other orderings" {
+    for ([_][]const u8{ "3", "11", "22", "21", "1212" }) |digits| {
+        try std.testing.expectError(Error.InvalidSelection, parse(digits));
+    }
+}
+
+test "apply masks disabled plant touches" {
+    try std.testing.expectEqual(
+        Selection{ true, false },
+        apply(Selection{ true, false }, Selection{ true, true }),
+    );
+}
+
+test "apply preserves both enabled plant touches" {
+    try std.testing.expectEqual(
+        Selection{ true, false },
+        apply(plant.all, Selection{ true, false }),
+    );
+    try std.testing.expectEqual(
+        Selection{ false, true },
+        apply(plant.all, Selection{ false, true }),
+    );
 }

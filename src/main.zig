@@ -47,9 +47,9 @@ pub fn main(init: std.process.Init) !void {
         switch (err) {
             error.HelpRequested => {},
             error.TooManyArguments => std.debug.print("takes at most one plant selection.\n\n", .{}),
-            error.InvalidSelection => std.debug.print("PLANTS must be digits 1-3.\n\n", .{}),
+            error.InvalidSelection => std.debug.print("PLANTS must be 1, 2 or 12.\n\n", .{}),
             error.UnknownVoice => std.debug.print("--voice must be drone, flute or beep.\n\n", .{}),
-            error.UnknownTouch => std.debug.print("--touch must be probes, always, script or motion.\n\n", .{}),
+            error.UnknownTouch => std.debug.print("--touch must be probes, always or motion.\n\n", .{}),
             error.TriggerRetired => std.debug.print(
                 \\--trigger is gone. The threshold it set could not exist: the
                 \\reading was rectified before it was compared, which folded one

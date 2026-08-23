@@ -315,7 +315,7 @@ pub fn parse(args: []const []const u8) Error!Options {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--voice=drone|flute|beep]
-    \\                 [--touch=probes|always|script|motion]
+    \\                 [--touch=probes|always|motion]
     \\                 [--touch-model=deviation|steady] [--touch-band=LO:HI]
     \\                 [--touch-band-bc=LO:HI] [--touch-jitter=COUNTS]
     \\                 [--touch-drop=MS] [--touch-level=Z]
@@ -327,9 +327,10 @@ pub const usage =
     \\                 [--log-touch=PATH]
     \\                 [--interrupt=SECONDS] [--device=NAME]
     \\
-    \\PLANTS is the digits of the plants to play, in any order:
+    \\PLANTS must be one of these selections:
     \\  1  plant A, the sensor-driven voice
     \\  2  plant B, an interview
+    \\  12 both plants
     \\
     \\B draws one clip from ./interview files/, chosen at random when the program
     \\starts, so a run is different from the last one. Drop a recording into a
@@ -346,7 +347,6 @@ pub const usage =
     \\--touch decides when a plant is awake and sounding:
     \\  probes  the probes themselves decide (default)
     \\  always  every plant, from the first block on
-    \\  script  the built-in timeline: A holds, B taps inside it
     \\  motion  one GPIO motion sensor per plant
     \\
     \\--touch-model is which question the probes are asked, and the two rigs
@@ -480,26 +480,13 @@ pub const usage =
     \\it the clip fades out and the next turn begins at once. Pass 0 to let
     \\every clip play to its end.
     \\
-    \\B and C share the probe across AIN2 and AIN3, so they take turns, one clip
-    \\per touch:
-    \\the first touch plays the interview, and when it ends nothing sounds
-    \\until the next touch, which plays the waterfall. Then the interview
-    \\again, and so on. A clip plays through even if the touch ends, and a
-    \\touch while one is playing is ignored rather than queued. A plant left
-    \\out of PLANTS never takes a turn, so `13` plays the waterfall on every
-    \\touch.
-    \\
     \\Under --touch=probes the motion sensors are not consulted at all: the
-    \\probes are what a touch means. The other three modes are for
+    \\probes are what a touch means. The other modes are for
     \\demonstrating and for chasing faults, and reach the voices through the
     \\same door.
     \\
-    \\The run ends on its own only under --touch=script. Otherwise it plays
-    \\until stopped, as the installation does; B and C are one-shots, so they
-    \\sound once at the start and plant A carries the rest.
-    \\
     \\Both probes sit on one ADS1115, each across a differential pair rather
-    \\than against ground: plant A's on AIN0-AIN1, plants B and C's on
+    \\than against ground: plant A's on AIN0-AIN1, plant B's on
     \\AIN2-AIN3. Those are the only two of the chip's four differential
     \\combinations that share no pin, so neither probe sits on the other's
     \\reference, and interference reaching both halves of a pair at once —
@@ -514,7 +501,7 @@ pub const usage =
     \\`aplay -l` to see the cards; card 0 device 0 is `plughw:0,0`, and the
     \\plug prefix is what resamples when the card cannot do 44100 Hz itself.
     \\
-    \\  mami_sound                     all three plants, drone voice
+    \\  mami_sound                     both plants, drone voice
     \\  mami_sound 1                   plant A alone
     \\  mami_sound 12                  plants A and B blended
     \\  mami_sound 1 --voice=flute     plant A as a flute
