@@ -4,9 +4,9 @@
 //! tested without a process.
 
 const std = @import("std");
-const select = @import("select.zig");
-const noise = @import("noise.zig");
-const touch = @import("touch.zig");
+const select = @import("core/select.zig");
+const noise = @import("core/noise.zig");
+const touch = @import("core/touch.zig");
 
 pub const Error = error{
     UnknownFlag,
@@ -330,15 +330,14 @@ pub const usage =
     \\PLANTS is the digits of the plants to play, in any order:
     \\  1  plant A, the sensor-driven voice
     \\  2  plant B, an interview
-    \\  3  plant C, a field recording
     \\
-    \\B and C draw one clip each from ./interview files/ and ./field records/,
-    \\chosen at random when the program starts, so a run is a different pair
-    \\from the last one. Drop a recording into a folder to put it in the
-    \\rotation; mp3, wav, ogg and flac are all read. The name of what was
+    \\B draws one clip from ./interview files/, chosen at random when the program
+    \\starts, so a run is different from the last one. Drop a recording into a
+    \\folder to put it in the rotation; mp3, wav, ogg and flac are all read.
+    \\The name of what was
     \\drawn is printed at start up.
     \\
-    \\--voice selects what plant A sounds like. All three take their pitch from
+    \\--voice selects what plant A sounds like. Both take their pitch from
     \\the probe across AIN0 and AIN1, and nothing else does:
     \\  drone  filtered noise, pitch following the probe (default)
     \\  flute  recorded flute notes, replayed at the probe's pitch
@@ -347,7 +346,7 @@ pub const usage =
     \\--touch decides when a plant is awake and sounding:
     \\  probes  the probes themselves decide (default)
     \\  always  every plant, from the first block on
-    \\  script  the built-in timeline: A holds, B and C tap inside it
+    \\  script  the built-in timeline: A holds, B taps inside it
     \\  motion  one GPIO motion sensor per plant
     \\
     \\--touch-model is which question the probes are asked, and the two rigs
@@ -538,7 +537,7 @@ test "no arguments gives every plant and the drone" {
 
 test "plant digits are read as before" {
     try testing.expectEqual(
-        select.Selection{ true, true, false },
+        select.Selection{ true, true },
         (try parse(&.{"12"})).plants,
     );
 }
@@ -546,11 +545,11 @@ test "plant digits are read as before" {
 test "voice can be chosen, in either order" {
     const a = try parse(&.{ "1", "--voice=flute" });
     try testing.expectEqual(Voice.flute, a.voice);
-    try testing.expectEqual(select.Selection{ true, false, false }, a.plants);
+    try testing.expectEqual(select.Selection{ true, false }, a.plants);
 
     const b = try parse(&.{ "--voice=flute", "1" });
     try testing.expectEqual(Voice.flute, b.voice);
-    try testing.expectEqual(select.Selection{ true, false, false }, b.plants);
+    try testing.expectEqual(select.Selection{ true, false }, b.plants);
 }
 
 test "every voice can be asked for by name" {

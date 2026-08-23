@@ -7,24 +7,26 @@ const std = @import("std");
 pub const sensors = @import("sensors.zig");
 pub const ads1115 = @import("ads1115.zig");
 pub const gpio = @import("gpio.zig");
-pub const noise = @import("noise.zig");
+pub const plant = @import("core/plant.zig");
+pub const constants = @import("core/constants.zig");
+pub const noise = @import("core/noise.zig");
 pub const player = @import("player.zig");
 pub const decode = @import("decode.zig");
 pub const sink = @import("sink.zig");
-pub const select = @import("select.zig");
+pub const select = @import("core/select.zig");
 pub const sampler = @import("sampler.zig");
 pub const tone = @import("tone.zig");
 pub const cli = @import("cli.zig");
-pub const touch = @import("touch.zig");
+pub const touch = @import("core/touch.zig");
 pub const touchlog = @import("touchlog.zig");
 pub const library = @import("library.zig");
 
-pub const sample_rate: u32 = 44100;
-pub const channels: u32 = 1;
+pub const sample_rate = constants.sample_rate;
+pub const channels = constants.channels;
 
 /// ~11.6 ms per block. This is the unit handed to `aplay`, so it sets how
 /// often the program talks to the sound card and nothing else.
-pub const block_frames: usize = 512;
+pub const block_frames = constants.block_frames;
 
 /// ~2.9 ms per poll: the sensors are read four times inside every block, and
 /// the voices are rendered in the same four pieces so each one hears its own
@@ -35,11 +37,9 @@ pub const block_frames: usize = 512;
 /// poll means the ECG is followed closely enough that a touch or a spike is
 /// caught rather than averaged away. The floor is the I2C transaction itself,
 /// around half a millisecond on a 100 kHz bus.
-pub const sensor_frames: usize = 128;
+pub const sensor_frames = constants.sensor_frames;
 
 comptime {
-    // The render loop walks the block in whole polls.
-    std.debug.assert(block_frames % sensor_frames == 0);
     // The polls inside a block happen back to back — the whole block is
     // rendered in tens of microseconds and the sink blocks for the rest of it —
     // so the only wall-clock gap the ADC can count on is a block boundary.
@@ -52,6 +52,8 @@ test {
     _ = sensors;
     _ = ads1115;
     _ = gpio;
+    _ = plant;
+    _ = constants;
     _ = noise;
     _ = player;
     _ = decode;

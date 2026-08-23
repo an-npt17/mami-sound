@@ -10,7 +10,7 @@
 //! filesystem.
 
 const std = @import("std");
-const touch = @import("touch.zig");
+const touch = @import("core/touch.zig");
 
 /// Enough for a poll's worth of columns, with room for the widest float.
 const row_max = 256;
