@@ -33,6 +33,9 @@ pub const Adapter = struct {
     frames_since_switch: u64,
     raw_a: i16,
     raw_bc: i16,
+    io_context: *anyopaque,
+    read_op: *const fn (*Adapter) ads1115.Error!i16,
+    select_op: *const fn (*Adapter, ads1115.Mux) ads1115.Error!void,
 
     pub fn open(bus: [*:0]const u8, address: u16) ads1115.Error!Adapter {
         const adc = try ads1115.Ads1115.open(bus, address, .{ .mux = input_a });
@@ -42,6 +45,9 @@ pub const Adapter = struct {
             .frames_since_switch = 0,
             .raw_a = 0,
             .raw_bc = 0,
+            .io_context = undefined,
+            .read_op = readAdc,
+            .select_op = selectAdc,
         };
     }
 
@@ -62,12 +68,12 @@ pub const Adapter = struct {
 
         // A failed ADC read keeps the last real value, so a bus glitch does not
         // turn into an audible zero or move the value to the wrong probe.
-        storeResult(self.adc.readRaw(), self.selected, &self.raw_a, &self.raw_bc);
+        storeResult(self.read_op(self), self.selected, &self.raw_a, &self.raw_bc);
 
         self.frames_since_switch += frames;
         if (self.frames_since_switch >= switch_frames) {
             const next = self.selected.other();
-            if (self.adc.selectInput(next.mux())) |_| {
+            if (self.select_op(self, next.mux())) |_| {
                 advanceTiming(&self.selected, &self.frames_since_switch, 0, true);
             } else |_| {
                 // The low-level driver caches the requested mux before the
@@ -78,6 +84,14 @@ pub const Adapter = struct {
         }
 
         return .{ .raw_a = self.raw_a, .raw_bc = self.raw_bc };
+    }
+
+    fn readAdc(self: *Adapter) ads1115.Error!i16 {
+        return self.adc.readRaw();
+    }
+
+    fn selectAdc(self: *Adapter, mux: ads1115.Mux) ads1115.Error!void {
+        return self.adc.selectInput(mux);
     }
 
     fn deinitFn(context: *anyopaque) void {
@@ -110,6 +124,101 @@ test "the probe inputs are the two non-overlapping differential pairs" {
     try testing.expectEqual(ads1115.Mux.ain0_ain1, input_a);
     try testing.expectEqual(ads1115.Mux.ain2_ain3, input_bc);
     try testing.expect(input_a != input_bc);
+}
+
+const FakeAdc = struct {
+    reads: []const ads1115.Error!i16,
+    next_read: usize = 0,
+    selections: [1]ads1115.Mux = undefined,
+    selection_count: usize = 0,
+    fail_switch: bool = false,
+
+    fn read(adapter: *Adapter) ads1115.Error!i16 {
+        const self: *FakeAdc = @ptrCast(@alignCast(adapter.io_context));
+        const result = self.reads[self.next_read];
+        self.next_read += 1;
+        return result;
+    }
+
+    fn select(adapter: *Adapter, mux: ads1115.Mux) ads1115.Error!void {
+        const self: *FakeAdc = @ptrCast(@alignCast(adapter.io_context));
+        self.selections[self.selection_count] = mux;
+        self.selection_count += 1;
+        adapter.adc.cfg.mux = mux;
+        if (self.fail_switch) return error.WriteFailed;
+    }
+};
+
+fn testAdapter(fake: *FakeAdc) Adapter {
+    return .{
+        .adc = .{ .fd = -1, .cfg = .{ .mux = input_a } },
+        .selected = .a,
+        .frames_since_switch = 0,
+        .raw_a = 0,
+        .raw_bc = 0,
+        .io_context = fake,
+        .read_op = FakeAdc.read,
+        .select_op = FakeAdc.select,
+    };
+}
+
+test "a partial source read keeps A selected" {
+    const reads = [_]ads1115.Error!i16{ -10 };
+    var fake = FakeAdc{ .reads = &reads };
+    var adapter = testAdapter(&fake);
+    var source = adapter.source();
+
+    try testing.expectEqual(
+        ports.Reading{ .raw_a = -10, .raw_bc = 0 },
+        source.read(128),
+    );
+    try testing.expectEqual(Probe.a, adapter.selected);
+    try testing.expectEqual(@as(u64, 128), adapter.frames_since_switch);
+    try testing.expectEqual(@as(usize, 0), fake.selection_count);
+}
+
+test "a full source read switches A to BC" {
+    const reads = [_]ads1115.Error!i16{ -10 };
+    var fake = FakeAdc{ .reads = &reads };
+    var adapter = testAdapter(&fake);
+    var source = adapter.source();
+
+    _ = source.read(512);
+
+    try testing.expectEqual(Probe.bc, adapter.selected);
+    try testing.expectEqual(@as(u64, 0), adapter.frames_since_switch);
+    try testing.expectEqual(input_bc, adapter.adc.cfg.mux);
+    try testing.expectEqual(@as(usize, 1), fake.selection_count);
+    try testing.expectEqual(input_bc, fake.selections[0]);
+}
+
+test "a failed source read preserves both last-real values" {
+    const reads = [_]ads1115.Error!i16{ -10, 20, error.ReadFailed };
+    var fake = FakeAdc{ .reads = &reads };
+    var adapter = testAdapter(&fake);
+    var source = adapter.source();
+
+    _ = source.read(512);
+    _ = source.read(128);
+    const reading = source.read(128);
+
+    try testing.expectEqual(@as(i16, -10), reading.raw_a);
+    try testing.expectEqual(@as(i16, 20), reading.raw_bc);
+}
+
+test "a failed source switch preserves selection timing and cached mux" {
+    const reads = [_]ads1115.Error!i16{ -10 };
+    var fake = FakeAdc{ .reads = &reads, .fail_switch = true };
+    var adapter = testAdapter(&fake);
+    var source = adapter.source();
+
+    _ = source.read(512);
+
+    try testing.expectEqual(Probe.a, adapter.selected);
+    try testing.expectEqual(@as(u64, 512), adapter.frames_since_switch);
+    try testing.expectEqual(input_a, adapter.adc.cfg.mux);
+    try testing.expectEqual(@as(usize, 1), fake.selection_count);
+    try testing.expectEqual(input_bc, fake.selections[0]);
 }
 
 test "the adapter steps between the two probe inputs" {

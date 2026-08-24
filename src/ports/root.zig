@@ -14,11 +14,14 @@ pub const StatusSink = status_sink.StatusSink;
 const FakeProbe = struct {
     readings: []const probe_source.Reading,
     next: usize = 0,
+    frames: [2]usize = undefined,
+    frame_count: usize = 0,
     deinit_count: usize = 0,
 
     fn read(context: *anyopaque, frames: usize) probe_source.Reading {
         const self: *FakeProbe = @ptrCast(@alignCast(context));
-        _ = frames;
+        self.frames[self.frame_count] = frames;
+        self.frame_count += 1;
         const reading = self.readings[self.next];
         self.next += 1;
         return reading;
@@ -72,6 +75,8 @@ test "probe port dispatches reads and deinitialization" {
 
     try testing.expectEqual(readings[0], source.read(512));
     try testing.expectEqual(readings[1], source.read(128));
+    try testing.expectEqual(@as(usize, 512), fake.frames[0]);
+    try testing.expectEqual(@as(usize, 128), fake.frames[1]);
     source.deinit();
     try testing.expectEqual(@as(usize, 1), fake.deinit_count);
 }
@@ -115,6 +120,13 @@ test "status port dispatches semantic snapshots" {
     sink.observe(snapshot);
 
     try testing.expectEqual(@as(usize, 1), fake.observed);
+    try testing.expectEqual(snapshot.raw_a, fake.last_state.?.raw_a);
+    try testing.expectEqual(snapshot.raw_bc, fake.last_state.?.raw_bc);
+    try testing.expectEqual(snapshot.z_a, fake.last_state.?.z_a);
+    try testing.expectEqual(snapshot.z_bc, fake.last_state.?.z_bc);
     try testing.expectEqual(snapshot.state, fake.last_state.?.state);
+    try testing.expect(fake.last_state.?.touched[0]);
+    try testing.expect(!fake.last_state.?.touched[1]);
+    try testing.expectEqualSlices(f32, snapshot.block, fake.last_state.?.block);
     try testing.expectEqual(snapshot.rendered, fake.last_state.?.rendered);
 }
