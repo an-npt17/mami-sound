@@ -43,7 +43,21 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const run_core_tests = b.addRunArtifact(core_tests);
 
+    const adapter_test_mod = b.addModule("mami_sound_adapters_test", .{
+        .root_source_file = b.path("src/task4_adapter_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const adapter_tests = b.addTest(.{ .root_module = adapter_test_mod });
+    const run_adapter_tests = b.addRunArtifact(adapter_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_core_tests.step);
+
+    const adapter_test_step = b.step(
+        "test-adapters",
+        "Run core, port, and adapter tests from the src-root harness",
+    );
+    adapter_test_step.dependOn(&run_adapter_tests.step);
 }

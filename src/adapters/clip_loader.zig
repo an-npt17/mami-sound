@@ -8,20 +8,67 @@ const testing = std.testing;
 pub const LoadedPool = struct {
     clips: []const []const f32,
     names: [][]u8,
+    clip_capacity: usize = 0,
+    name_capacity: usize = 0,
 
     pub const empty: LoadedPool = .{ .clips = &.{}, .names = &.{} };
 
     pub fn deinit(self: *LoadedPool, gpa: std.mem.Allocator) void {
         for (self.clips) |clip| gpa.free(clip);
         for (self.names) |name| gpa.free(name);
-        if (self.clips.len != 0) gpa.free(@constCast(self.clips));
-        if (self.names.len != 0) gpa.free(self.names);
+        if (self.clip_capacity != 0) {
+            gpa.free(@constCast(self.clips.ptr[0..self.clip_capacity]));
+        }
+        if (self.name_capacity != 0) {
+            gpa.free(self.names.ptr[0..self.name_capacity]);
+        }
         self.* = .empty;
     }
 };
 
+fn nextCapacity(current: usize, needed: usize) usize {
+    if (current >= needed) return current;
+    if (current == 0) return @max(@as(usize, 4), needed);
+    if (current > std.math.maxInt(usize) / 2) return needed;
+    return @max(current * 2, needed);
+}
+
+fn ensureClipCapacity(
+    gpa: std.mem.Allocator,
+    pool: *LoadedPool,
+    needed: usize,
+) !void {
+    if (needed <= pool.clip_capacity) return;
+
+    const capacity = nextCapacity(pool.clip_capacity, needed);
+    const next = try gpa.alloc([]const f32, capacity);
+    @memcpy(next[0..pool.clips.len], pool.clips);
+    if (pool.clip_capacity != 0) {
+        gpa.free(@constCast(pool.clips.ptr[0..pool.clip_capacity]));
+    }
+    pool.clips = next[0..pool.clips.len];
+    pool.clip_capacity = capacity;
+}
+
+fn ensureNameCapacity(
+    gpa: std.mem.Allocator,
+    pool: *LoadedPool,
+    needed: usize,
+) !void {
+    if (needed <= pool.name_capacity) return;
+
+    const capacity = nextCapacity(pool.name_capacity, needed);
+    const next = try gpa.alloc([]u8, capacity);
+    @memcpy(next[0..pool.names.len], pool.names);
+    if (pool.name_capacity != 0) {
+        gpa.free(pool.names.ptr[0..pool.name_capacity]);
+    }
+    pool.names = next[0..pool.names.len];
+    pool.name_capacity = capacity;
+}
+
 /// Append one decoded clip and its display name, transferring both allocations
-/// to `pool`. The input allocations are released if the outer arrays grow fails.
+/// to `pool`. The outer arrays grow geometrically instead of per clip.
 pub fn appendLoaded(
     gpa: std.mem.Allocator,
     pool: *LoadedPool,
@@ -34,20 +81,12 @@ pub fn appendLoaded(
     }
 
     const next_len = pool.clips.len + 1;
-    const next_clips = try gpa.alloc([]const f32, next_len);
-    errdefer gpa.free(next_clips);
-    @memcpy(next_clips[0..pool.clips.len], pool.clips);
-    next_clips[next_len - 1] = clip;
-
-    const next_names = try gpa.alloc([]u8, next_len);
-    errdefer gpa.free(next_names);
-    @memcpy(next_names[0..pool.names.len], pool.names);
-    next_names[next_len - 1] = name;
-
-    if (pool.clips.len != 0) gpa.free(@constCast(pool.clips));
-    if (pool.names.len != 0) gpa.free(pool.names);
-    pool.clips = next_clips;
-    pool.names = next_names;
+    try ensureClipCapacity(gpa, pool, next_len);
+    try ensureNameCapacity(gpa, pool, next_len);
+    pool.clips = pool.clips.ptr[0..next_len];
+    @constCast(pool.clips)[next_len - 1] = clip;
+    pool.names = pool.names.ptr[0..next_len];
+    pool.names[next_len - 1] = name;
 }
 
 /// Decode every Plant B clip in a fixed folder order. Names are retained for
@@ -96,4 +135,6 @@ test "appendLoaded preserves source order and deinit releases owned clips" {
     try testing.expectEqualSlices(f32, &.{ -0.3, 0.4, -0.5 }, pool.clips[1]);
     try testing.expectEqualStrings("interview files/first.mp3", pool.names[0]);
     try testing.expectEqualStrings("field records/second.mp3", pool.names[1]);
+    try testing.expect(pool.clip_capacity >= pool.clips.len);
+    try testing.expect(pool.name_capacity >= pool.names.len);
 }

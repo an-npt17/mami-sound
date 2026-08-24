@@ -156,3 +156,28 @@ test "the queues in front of the card stay inside a playable delay" {
     try testing.expectEqual(@as(u32, 512), period_frames);
     try testing.expectEqual(@as(u32, 0), buffer_frames % period_frames);
 }
+
+test "the adapter port dispatches writes through its function table" {
+    var adapter = Adapter{
+        .io = undefined,
+        .child = std.mem.zeroes(std.process.Child),
+    };
+    var sink = adapter.port();
+
+    try testing.expectError(error.SinkClosed, sink.write(&.{}));
+}
+
+test "the adapter port dispatches finish through its function table" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/run/current-system/sw/bin/cat", "-" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+    var sink = adapter.port();
+
+    try sink.finish();
+}

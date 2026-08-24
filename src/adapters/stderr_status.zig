@@ -29,15 +29,28 @@ pub const Adapter = struct {
         };
     }
 
+    fn updatePeak(self: *Adapter, block: []const f32) void {
+        for (block) |sample| self.peak = @max(self.peak, @abs(sample));
+    }
+
+    fn reportDue(self: *Adapter, rendered: usize) bool {
+        if (rendered < self.next_frame) return false;
+        self.next_frame += period;
+        return true;
+    }
+
+    fn resetPeak(self: *Adapter) void {
+        self.peak = 0.0;
+    }
+
     fn observePort(context: *anyopaque, snapshot: ports.Snapshot) void {
         const self: *Adapter = @ptrCast(@alignCast(context));
         self.observe(snapshot);
     }
 
     fn observe(self: *Adapter, snapshot: ports.Snapshot) void {
-        for (snapshot.block) |sample| self.peak = @max(self.peak, @abs(sample));
-        if (snapshot.rendered < self.next_frame) return;
-        self.next_frame += period;
+        self.updatePeak(snapshot.block);
+        if (!self.reportDue(snapshot.rendered)) return;
 
         self.last_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         const audio_s = @as(f64, @floatFromInt(snapshot.rendered)) /
@@ -45,7 +58,7 @@ pub const Adapter = struct {
         var line_buf: [128]u8 = undefined;
         const line = formatLine(&line_buf, snapshot, audio_s) catch return;
         std.debug.print("{s}", .{line});
-        self.peak = 0.0;
+        self.resetPeak();
     }
 };
 
@@ -91,4 +104,27 @@ test "status line formats signed readings, state, and both plant flags" {
         "t=1s a0=-10 a1=20 z0=1.5 z1=-2.0 plant_a touch=A-\n",
         line,
     );
+}
+
+test "status schedules each completed second and resets the accumulated peak" {
+    var status = Adapter{
+        .io = undefined,
+        .last_ns = 0,
+        .next_frame = Adapter.period,
+        .peak = 0.0,
+    };
+
+    status.updatePeak(&.{ 0.25, -0.75 });
+    try testing.expectEqual(@as(f32, 0.75), status.peak);
+    try testing.expect(!status.reportDue(Adapter.period - 1));
+    try testing.expectEqual(Adapter.period, status.next_frame);
+    try testing.expect(status.reportDue(Adapter.period));
+    try testing.expectEqual(Adapter.period * 2, status.next_frame);
+
+    status.resetPeak();
+    try testing.expectEqual(@as(f32, 0.0), status.peak);
+    status.updatePeak(&.{-0.5});
+    try testing.expectEqual(@as(f32, 0.5), status.peak);
+    try testing.expect(!status.reportDue(Adapter.period * 2 - 1));
+    try testing.expect(status.reportDue(Adapter.period * 2));
 }
