@@ -41,7 +41,7 @@ pub fn apply(sel: plant.Selection, touch: plant.Selection) plant.Selection {
 pub const usage =
     \\usage: mami_sound [PLANTS]
     \\
-    \\PLANTS is the digits of the plants to play, in any order:
+    \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A, the ECG drone
     \\  2  plant B, the interview clip
     \\
