@@ -1,4 +1,5 @@
 pub const plant = @import("plant.zig");
+pub const plant_b = @import("plant_b.zig");
 pub const constants = @import("constants.zig");
 pub const sample_rate = constants.sample_rate;
 pub const channels = constants.channels;
@@ -10,6 +11,7 @@ pub const noise = @import("noise.zig");
 
 test {
     _ = plant;
+    _ = plant_b;
     _ = constants;
     _ = select;
     _ = touch;
