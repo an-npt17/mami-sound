@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Play 15 seconds of the installation through aplay");
+    const run_step = b.step("run", "Play the installation through aplay");
     run_step.dependOn(&run_cmd.step);
 
     const mod_tests = b.addTest(.{ .root_module = mod });
@@ -43,21 +43,31 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = core_mod });
     const run_core_tests = b.addRunArtifact(core_tests);
 
-    const adapter_test_mod = b.addModule("mami_sound_adapters_test", .{
-        .root_source_file = b.path("src/task4_adapter_test_root.zig"),
+    const application_mod = b.addModule("mami_sound_application", .{
+        .root_source_file = b.path("src/application_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const adapter_tests = b.addTest(.{ .root_module = adapter_test_mod });
-    const run_adapter_tests = b.addRunArtifact(adapter_tests);
+    const application_tests = b.addTest(.{ .root_module = application_mod });
+    const run_application_tests = b.addRunArtifact(application_tests);
+
+    const adapters_mod = b.addModule("mami_sound_adapters", .{
+        .root_source_file = b.path("src/adapters_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const adapters_tests = b.addTest(.{ .root_module = adapters_mod });
+    const run_adapters_tests = b.addRunArtifact(adapters_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_application_tests.step);
+    test_step.dependOn(&run_adapters_tests.step);
 
     const adapter_test_step = b.step(
         "test-adapters",
-        "Run core, port, and adapter tests from the src-root harness",
+        "Run adapter tests from the adapter root",
     );
-    adapter_test_step.dependOn(&run_adapter_tests.step);
+    adapter_test_step.dependOn(&run_adapters_tests.step);
 }
