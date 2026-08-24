@@ -10,7 +10,7 @@
 //! entries and it plays that instrument instead.
 
 const std = @import("std");
-const decode = @import("decode.zig");
+const decode = @import("adapters/decode.zig");
 
 /// One recorded note.
 pub const Sample = struct {

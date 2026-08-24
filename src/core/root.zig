@@ -8,6 +8,7 @@ pub const sensor_frames = constants.sensor_frames;
 pub const select = @import("select.zig");
 pub const touch = @import("touch.zig");
 pub const noise = @import("noise.zig");
+pub const pcm = @import("pcm.zig");
 
 test {
     _ = plant;
@@ -16,4 +17,5 @@ test {
     _ = select;
     _ = touch;
     _ = noise;
+    _ = pcm;
 }
