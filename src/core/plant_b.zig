@@ -77,7 +77,7 @@ test "a new touch hard-switches the current clip" {
 }
 
 test "a held touch does not retrigger every poll" {
-    const clips = [_][]const f32{ &.{ 1.0, 1.0 } };
+    const clips = [_][]const f32{&.{ 1.0, 1.0 }};
     var prng = std.Random.DefaultPrng.init(5);
     var player = ClipPlayer.init(&clips, prng.random());
     var out: [1]f32 = .{0};

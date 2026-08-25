@@ -163,7 +163,7 @@ fn testAdapter(fake: *FakeAdc) Adapter {
 }
 
 test "a partial source read keeps A selected" {
-    const reads = [_]ads1115.Error!i16{ -10 };
+    const reads = [_]ads1115.Error!i16{-10};
     var fake = FakeAdc{ .reads = &reads };
     var adapter = testAdapter(&fake);
     var source = adapter.source();
@@ -178,7 +178,7 @@ test "a partial source read keeps A selected" {
 }
 
 test "a full source read switches A to BC" {
-    const reads = [_]ads1115.Error!i16{ -10 };
+    const reads = [_]ads1115.Error!i16{-10};
     var fake = FakeAdc{ .reads = &reads };
     var adapter = testAdapter(&fake);
     var source = adapter.source();
@@ -207,7 +207,7 @@ test "a failed source read preserves both last-real values" {
 }
 
 test "a failed source switch preserves selection timing and cached mux" {
-    const reads = [_]ads1115.Error!i16{ -10 };
+    const reads = [_]ads1115.Error!i16{-10};
     var fake = FakeAdc{ .reads = &reads, .fail_switch = true };
     var adapter = testAdapter(&fake);
     var source = adapter.source();
