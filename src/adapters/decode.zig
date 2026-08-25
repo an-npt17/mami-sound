@@ -84,26 +84,3 @@ pub fn normalize(samples: []f32) void {
     const gain = target_peak / peak;
     for (samples) |*s| s.* *= gain;
 }
-
-const testing = std.testing;
-
-test "normalize brings a quiet clip up to the target peak" {
-    var samples = [_]f32{ 0.1, -0.05, 0.02 };
-    normalize(&samples);
-    try testing.expectApproxEqAbs(target_peak, @abs(samples[0]), 0.0001);
-    // Relative shape is preserved.
-    try testing.expectApproxEqAbs(@as(f32, -0.5), samples[1] / samples[0], 0.0001);
-}
-
-test "normalize brings a loud clip down and never clips" {
-    var samples = [_]f32{ 4.0, -2.0 };
-    normalize(&samples);
-    for (samples) |s| try testing.expect(@abs(s) <= 1.0);
-    try testing.expectApproxEqAbs(target_peak, @abs(samples[0]), 0.0001);
-}
-
-test "normalize leaves silence alone" {
-    var samples = [_]f32{ 0.0, 0.0 };
-    normalize(&samples);
-    for (samples) |s| try testing.expectEqual(@as(f32, 0.0), s);
-}

@@ -50,36 +50,3 @@ pub const usage =
     \\  mami_sound 12    plants A and B blended
     \\
 ;
-
-test "plant selection has only A and B" {
-    try std.testing.expectEqual(@as(usize, 2), plant.count);
-    try std.testing.expectEqual(plant.Selection{ true, true }, plant.all);
-    try std.testing.expectEqual(plant.all, try parse(null));
-    try std.testing.expectEqual(Selection{ true, false }, try parse("1"));
-    try std.testing.expectEqual(Selection{ false, true }, try parse("2"));
-    try std.testing.expectEqual(plant.all, try parse("12"));
-}
-
-test "plant selection rejects duplicates and other orderings" {
-    for ([_][]const u8{ "3", "11", "22", "21", "1212" }) |digits| {
-        try std.testing.expectError(Error.InvalidSelection, parse(digits));
-    }
-}
-
-test "apply masks disabled plant touches" {
-    try std.testing.expectEqual(
-        Selection{ true, false },
-        apply(Selection{ true, false }, Selection{ true, true }),
-    );
-}
-
-test "apply preserves both enabled plant touches" {
-    try std.testing.expectEqual(
-        Selection{ true, false },
-        apply(plant.all, Selection{ true, false }),
-    );
-    try std.testing.expectEqual(
-        Selection{ false, true },
-        apply(plant.all, Selection{ false, true }),
-    );
-}

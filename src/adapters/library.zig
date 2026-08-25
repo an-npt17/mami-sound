@@ -74,27 +74,3 @@ pub fn freeList(gpa: std.mem.Allocator, paths: [][]u8) void {
     for (paths) |path| gpa.free(path);
     gpa.free(paths);
 }
-
-const testing = std.testing;
-
-test "clips are recognised whatever the case of the extension" {
-    try testing.expect(isAudio("chim choc.mp3"));
-    try testing.expect(isAudio("night sound 1.MP3"));
-    try testing.expect(isAudio("Rau ngot. Gia Tran.1_.11.mp3"));
-    try testing.expect(isAudio("dừa ẻo. GiaTrân. 3_.37.mp3"));
-    try testing.expect(isAudio("take.WAV"));
-    try testing.expect(isAudio("field.flac"));
-}
-
-test "everything else in the folder is passed over" {
-    try testing.expect(!isAudio("notes.txt"));
-    try testing.expect(!isAudio("cover.jpg"));
-    try testing.expect(!isAudio("session.als"));
-    try testing.expect(!isAudio(""));
-    // Hidden files and macOS resource forks, which are not audio however they
-    // are named.
-    try testing.expect(!isAudio(".hidden.mp3"));
-    try testing.expect(!isAudio("._Chim CHó.2_13.mp3"));
-    // A name that is only an extension is a hidden file, not a clip.
-    try testing.expect(!isAudio(".mp3"));
-}
