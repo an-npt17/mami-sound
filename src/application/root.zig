@@ -88,6 +88,13 @@ fn primeBc(engine_under_test: *engine.Engine) void {
     engine_under_test.machine.bc.armed = true;
 }
 
+fn hasNonZero(samples: []const i16) bool {
+    for (samples) |sample| {
+        if (sample != 0) return true;
+    }
+    return false;
+}
+
 test "production config keeps the fixed installation tuning" {
     try testing.expectEqual(@as(u32, 44100), production_config.touch.sample_rate);
     try testing.expectEqual(@as(usize, 128), production_config.touch.poll_frames);
@@ -155,6 +162,38 @@ test "step renders the selected Plant B clip" {
     try testing.expectEqual(@as(usize, core.block_frames), app.plant_b.position());
     try testing.expectEqual(@as(usize, 1), fake_audio.writes);
     try testing.expectEqual(core.block_frames, fake_status.last.?.rendered);
+}
+
+test "step renders only the selected plant voices" {
+    var b_probe = FakeProbe{ .reading = .{ .raw_a = 0, .raw_bc = 0 } };
+    var b_audio = FakeAudio{};
+    var b_status = FakeStatus{};
+    var b_app = engine.Engine.init(
+        .{ false, true },
+        b_probe.source(),
+        b_audio.sink(),
+        b_status.sink(),
+        &.{},
+        random(),
+    );
+
+    try b_app.step();
+    try testing.expect(!hasNonZero(&b_audio.last));
+
+    var a_probe = FakeProbe{ .reading = .{ .raw_a = 0, .raw_bc = 0 } };
+    var a_audio = FakeAudio{};
+    var a_status = FakeStatus{};
+    var a_app = engine.Engine.init(
+        .{ true, false },
+        a_probe.source(),
+        a_audio.sink(),
+        a_status.sink(),
+        &.{},
+        random(),
+    );
+
+    try a_app.step();
+    try testing.expect(hasNonZero(&a_audio.last));
 }
 
 test "step does not start Plant B when only Plant A is selected" {

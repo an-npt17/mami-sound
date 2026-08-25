@@ -61,7 +61,9 @@ pub const Engine = struct {
                 detected == .plant_bc or detected == .both,
             });
             state = detected;
-            self.drone.render(piece, self.machine.a.deviation(), self.selection[0] and touched[0]);
+            if (self.selection[0]) {
+                self.drone.render(piece, self.machine.a.deviation(), touched[0]);
+            }
             self.plant_b.render(piece, self.selection[1] and touched[1]);
         }
 

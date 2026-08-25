@@ -64,16 +64,31 @@ test "a new touch starts one random clip" {
 }
 
 test "a new touch hard-switches the current clip" {
-    const clips = [_][]const f32{ &.{ 1.0, 1.0, 1.0, 1.0 }, &.{ 2.0, 2.0, 2.0, 2.0 } };
+    const clips = [_][]const f32{
+        &.{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 },
+        &.{ 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0 },
+    };
     var prng = std.Random.DefaultPrng.init(3);
     var player = ClipPlayer.init(&clips, prng.random());
     var out: [2]f32 = .{ 0, 0 };
 
     player.render(&out, true);
+    const first_index = player.playingIndex().?;
     try testing.expectEqual(@as(usize, 2), player.position());
+
+    @memset(&out, 0);
     player.render(&out, false);
+    try testing.expect(player.isPlaying());
+    try testing.expectEqual(first_index, player.playingIndex().?);
+    try testing.expectEqual(@as(usize, 4), player.position());
+    const mid_clip_sample = out[0];
+
+    @memset(&out, 0);
     player.render(&out, true);
+    const second_index = player.playingIndex().?;
     try testing.expectEqual(@as(usize, 2), player.position());
+    try testing.expectEqual(clips[second_index][0] * voice_gain, out[0]);
+    try testing.expect(mid_clip_sample != out[0]);
 }
 
 test "a held touch does not retrigger every poll" {

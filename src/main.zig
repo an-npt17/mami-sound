@@ -73,19 +73,30 @@ fn runComposition(
     defer clips.deinit(gpa);
 
     var sink = try sink_opener.open(io, opts.device());
-    defer _ = sink.finish() catch {};
 
     var status = stderr_status.Adapter.init(io);
     var shuffle = std.Random.DefaultPrng.init(shuffleSeed(io));
+    var sink_port = sink.port();
     var app = engine.Engine.init(
         opts.plants,
         probe.source(),
-        sink.port(),
+        sink_port,
         status.port(),
         clips.clips,
         shuffle.random(),
     );
-    try app.run();
+    return finishAfterRun(&sink_port, app.run());
+}
+
+fn finishAfterRun(sink: *ports.AudioSink, run_result: anyerror!void) !void {
+    if (run_result) |_| {
+        return sink.finish();
+    } else |engine_err| {
+        sink.finish() catch |finish_err| {
+            std.debug.print("audio sink shutdown failed: {s}\n", .{@errorName(finish_err)});
+        };
+        return engine_err;
+    }
 }
 
 fn parseArgs(
@@ -149,6 +160,46 @@ const FakeSinkOpener = struct {
         return .{};
     }
 };
+
+const FakeFinishSink = struct {
+    failure: ?anyerror = null,
+    finished: bool = false,
+
+    fn write(_: *anyopaque, _: []const i16) anyerror!void {}
+
+    fn finish(context: *anyopaque) anyerror!void {
+        const self: *FakeFinishSink = @ptrCast(@alignCast(context));
+        self.finished = true;
+        if (self.failure) |err| return err;
+    }
+
+    fn port(self: *FakeFinishSink) ports.AudioSink {
+        return .{
+            .context = self,
+            .write_fn = write,
+            .finish_fn = finish,
+        };
+    }
+};
+
+test "composition propagates a shutdown failure after a clean engine run" {
+    var fake = FakeFinishSink{ .failure = error.ShutdownFailed };
+    var sink = fake.port();
+
+    try testing.expectError(error.ShutdownFailed, finishAfterRun(&sink, {}));
+    try testing.expect(fake.finished);
+}
+
+test "composition preserves the engine failure when shutdown also fails" {
+    var fake = FakeFinishSink{ .failure = error.ShutdownFailed };
+    var sink = fake.port();
+
+    try testing.expectError(
+        error.EngineFailed,
+        finishAfterRun(&sink, error.EngineFailed),
+    );
+    try testing.expect(fake.finished);
+}
 
 test "probe startup failure prevents sink startup" {
     var probe_opener = FailingProbeOpener{};

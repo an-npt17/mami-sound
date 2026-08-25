@@ -118,7 +118,11 @@ pub const Adapter = struct {
             stdin.close(self.io);
             self.child.stdin = null;
         }
-        _ = try self.child.wait(self.io);
+        const term = try self.child.wait(self.io);
+        switch (term) {
+            .exited => |code| if (code != 0) return error.ChildFailed,
+            else => return error.ChildFailed,
+        }
     }
 
     fn writePort(context: *anyopaque, frames: []const i16) anyerror!void {
@@ -172,7 +176,7 @@ test "the adapter port dispatches finish through its function table" {
     defer threaded.deinit();
     const io = threaded.io();
     const child = try std.process.spawn(io, .{
-        .argv = &.{ "/run/current-system/sw/bin/cat", "-" },
+        .argv = &.{"/bin/sh"},
         .stdin = .pipe,
         .stdout = .ignore,
     });
@@ -180,4 +184,32 @@ test "the adapter port dispatches finish through its function table" {
     var sink = adapter.port();
 
     try sink.finish();
+}
+
+test "finish reports a non-zero child exit" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 7" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+
+    try testing.expectError(error.ChildFailed, adapter.finish());
+}
+
+test "finish reports a child that did not exit normally" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "kill -TERM $$" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+
+    try testing.expectError(error.ChildFailed, adapter.finish());
 }
