@@ -8,7 +8,7 @@ const ads1115 = @import("adapters/ads1115.zig");
 const ads1115_probe = @import("adapters/ads1115_probe.zig");
 const aplay_sink = @import("adapters/aplay_sink.zig");
 const clip_loader = @import("adapters/clip_loader.zig");
-const decode = @import("adapters/decode.zig");
+const clip_stream = @import("adapters/clip_stream.zig");
 const random_probe = @import("adapters/random_probe.zig");
 const stderr_status = @import("adapters/stderr_status.zig");
 
@@ -47,9 +47,9 @@ pub fn main(init: std.process.Init) !void {
                 "--device needs a name, at most {d} characters.\n\n",
                 .{cli.device_max},
             ),
-            error.InvalidNoiseFile => std.debug.print(
-                "--noise-file needs a path, at most {d} characters.\n\n",
-                .{cli.noise_file_max},
+            error.InvalidPlantB => std.debug.print(
+                "--plant-b must be `bell` or `piano`.\n\n",
+                .{},
             ),
             error.UnknownFlag => std.debug.print("unknown flag.\n\n", .{}),
             else => std.debug.print("could not read arguments: {s}\n\n", .{@errorName(err)}),
@@ -89,26 +89,35 @@ fn runComposition(
     defer probe.close();
     std.debug.print("loading: probe ready\n", .{});
 
-    const noise_file_samples: ?[]f32 = if (opts.noiseFile()) |path| blk: {
-        std.debug.print("loading: noise file {s}...\n", .{path});
-        const samples = try decode.loadFile(gpa, io, path, core.sample_rate);
-        std.debug.print("loading: noise file ready ({d} samples)\n", .{samples.len});
-        break :blk samples;
-    } else null;
-    defer {
-        if (noise_file_samples) |samples| gpa.free(samples);
-    }
-
     var clips: clip_loader.LoadedPool = if (opts.plants[1]) blk: {
-        std.debug.print("loading: Plant B clips...\n", .{});
-        const loaded = try clip_loader.loadPlantB(gpa, io, core.sample_rate);
-        std.debug.print("loading: Plant B clips ready ({d})\n", .{loaded.clips.len});
+        const directories = clip_loader.directoriesFor(opts.pool);
+        std.debug.print("loading: Plant B clips ({t})...\n", .{opts.pool});
+        const loaded = clip_loader.loadPlantB(gpa, io, opts.pool) catch |err| {
+            // Naming the folders is the whole of the fix: the pool is chosen by
+            // name, so the one thing the message has to say is which folder on
+            // disk was not there.
+            std.debug.print("no Plant B clips: {s}\n", .{@errorName(err)});
+            for (directories) |directory| {
+                std.debug.print("  looked in ./{s}/\n", .{directory});
+            }
+            // Exited rather than returned, so the message above is the last
+            // thing on the terminal. Returning buries it under a stack trace
+            // for a fault that is a missing folder, not a bug.
+            std.process.exit(1);
+        };
+        std.debug.print("loading: Plant B clips ready ({d})\n", .{loaded.paths.len});
         break :blk loaded;
     } else blk: {
         std.debug.print("loading: Plant B clips skipped\n", .{});
         break :blk clip_loader.LoadedPool.empty;
     };
     defer clips.deinit(gpa);
+
+    std.debug.print("loading: preparing Plant B stream...\n", .{});
+    var stream = try clip_stream.Adapter.init(io, gpa, clips.paths);
+    defer stream.deinit();
+    try stream.start();
+    const stream_port = stream.port();
 
     std.debug.print("loading: opening audio sink...\n", .{});
     var sink = try sink_opener.open(io, opts.device());
@@ -123,8 +132,8 @@ fn runComposition(
         probe.source(),
         sink_port,
         status.port(),
-        noise_file_samples,
-        clips.clips,
+        stream_port,
+        clips.paths.len,
         shuffle.random(),
     );
     std.debug.print("loading: complete\n", .{});

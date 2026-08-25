@@ -1,8 +1,8 @@
 //! Listing the recordings that make up Plant B's clip pool.
 //!
 //! Plant B combines every playable file from `interview files/` and `field
-//! records/`. The loader decodes the combined pool at startup so a new touch
-//! can choose a clip immediately.
+//! records/`. The loader retains their paths at startup; a background stream
+//! worker decodes the selected clip when a new touch arrives.
 
 const std = @import("std");
 
@@ -37,10 +37,9 @@ pub fn isAudio(name: []const u8) bool {
 /// Every clip in `dir_path`, in whatever order the directory gives them. Caller
 /// owns the paths and the slice holding them; `freeList` returns both.
 ///
-/// The whole folder is loaded because a touch has to start a clip *now* —
-/// decoding one on demand means shelling out to ffmpeg for seconds while the
-/// sound card starves. Folders are therefore sized by what a machine can hold:
-/// see the total this prints at start up.
+/// The whole folder is listed so a touch can choose a path immediately. Audio
+/// decoding happens later in the bounded background stream worker rather than
+/// in this startup path or the real-time audio thread.
 pub fn list(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -63,7 +62,11 @@ pub fn list(
         }
         if (!isAudio(entry.name)) continue;
         // The entry's name is only valid until the next step, so join now.
-        try paths.append(gpa, try std.fs.path.join(gpa, &.{ dir_path, entry.name }));
+        const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+        paths.append(gpa, path) catch |err| {
+            gpa.free(path);
+            return err;
+        };
     }
 
     if (paths.items.len == 0) return Error.NoAudioFiles;

@@ -11,8 +11,8 @@ pub const Engine = struct {
     status: ports.StatusSink,
     machine: core.touch.Machine,
     drone: core.noise.Noise,
-    loop: ?core.loop.Player,
-    plant_b: core.plant_b.ClipPlayer,
+    plant_b: core.plant_b.ClipSelector,
+    clip_stream: ports.ClipStream,
     block: [core.block_frames]f32,
     pcm: [core.block_frames]i16,
     rendered: usize,
@@ -22,8 +22,8 @@ pub const Engine = struct {
         probe: ports.ProbeSource,
         sink: ports.AudioSink,
         status: ports.StatusSink,
-        loop_samples: ?[]const f32,
-        clip_pool: []const []const f32,
+        clip_stream: ports.ClipStream,
+        clip_count: usize,
         random: std.Random,
     ) Engine {
         return .{
@@ -37,8 +37,8 @@ pub const Engine = struct {
                 production_config.seed,
                 production_config.drone,
             ),
-            .loop = if (loop_samples) |samples| .init(samples) else null,
-            .plant_b = core.plant_b.ClipPlayer.init(clip_pool, random),
+            .plant_b = core.plant_b.ClipSelector.init(clip_count, random),
+            .clip_stream = clip_stream,
             .block = undefined,
             .pcm = undefined,
             .rendered = 0,
@@ -65,13 +65,10 @@ pub const Engine = struct {
             });
             state = detected;
             if (self.selection[0]) {
-                if (self.loop) |*loop| {
-                    loop.render(piece);
-                } else {
-                    self.drone.render(piece, self.machine.a.deviation(), touched[0]);
-                }
+                self.drone.render(piece, self.machine.a.deviation(), touched[0]);
             }
-            self.plant_b.render(piece, self.selection[1] and touched[1]);
+            const request = if (self.selection[1]) self.plant_b.start(touched[1]) else null;
+            self.clip_stream.render(piece, request);
         }
 
         core.pcm.toPcm(&self.block, &self.pcm);

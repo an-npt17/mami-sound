@@ -35,6 +35,14 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const clip_stream_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/clip_stream_integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const clip_stream_tests = b.addTest(.{ .root_module = clip_stream_test_mod });
+    const run_clip_stream_tests = b.addRunArtifact(clip_stream_tests);
+
     const core_mod = b.addModule("mami_sound_core", .{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
@@ -69,6 +77,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_clip_stream_tests.step);
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_application_tests.step);
     test_step.dependOn(&run_adapters_tests.step);

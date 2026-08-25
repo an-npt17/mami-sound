@@ -9,7 +9,6 @@ pub const select = @import("select.zig");
 pub const touch = @import("touch.zig");
 pub const noise = @import("noise.zig");
 pub const pcm = @import("pcm.zig");
-pub const loop = @import("loop.zig");
 
 test {
     _ = plant;
@@ -19,5 +18,4 @@ test {
     _ = touch;
     _ = noise;
     _ = pcm;
-    _ = loop;
 }

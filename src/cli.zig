@@ -1,10 +1,11 @@
 const std = @import("std");
+const plant_b = @import("core/plant_b.zig");
 const select = @import("core/select.zig");
 
 pub const Error = error{
     UnknownFlag,
     InvalidDevice,
-    InvalidNoiseFile,
+    InvalidPlantB,
     TooManyArguments,
 } || select.Error;
 
@@ -15,24 +16,18 @@ pub const default_device = "default";
 /// included.
 pub const device_max = 63;
 
-pub const noise_file_max = 4095;
-
 pub const Options = struct {
     plants: select.Selection = select.all,
     device_buf: [device_max]u8 = undefined,
     device_len: usize = 0,
-    noise_file_buf: [noise_file_max]u8 = undefined,
-    noise_file_len: usize = 0,
+    /// Which recordings a touch on plant B draws from. The interviews and the
+    /// field records unless the room asked for a stem pool instead.
+    pool: plant_b.Pool = .recordings,
     test_random_probe: bool = false,
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
         return self.device_buf[0..self.device_len];
-    }
-
-    pub fn noiseFile(self: *const Options) ?[]const u8 {
-        if (self.noise_file_len == 0) return null;
-        return self.noise_file_buf[0..self.noise_file_len];
     }
 };
 
@@ -46,11 +41,9 @@ pub fn parse(args: []const []const u8) Error!Options {
             if (name.len == 0 or name.len > device_max) return Error.InvalidDevice;
             @memcpy(opts.device_buf[0..name.len], name);
             opts.device_len = name.len;
-        } else if (std.mem.startsWith(u8, arg, "--noise-file=")) {
-            const path = arg["--noise-file=".len..];
-            if (path.len == 0 or path.len > noise_file_max) return Error.InvalidNoiseFile;
-            @memcpy(opts.noise_file_buf[0..path.len], path);
-            opts.noise_file_len = path.len;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b=")) {
+            opts.pool = plant_b.Pool.parse(arg["--plant-b=".len..]) catch
+                return Error.InvalidPlantB;
         } else if (std.mem.eql(u8, arg, "--test-random-probe")) {
             opts.test_random_probe = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -66,29 +59,46 @@ pub fn parse(args: []const []const u8) Error!Options {
 }
 
 pub const usage =
-    \\usage: mami_sound [PLANTS] [--device=NAME] [--noise-file=PATH] [--test-random-probe]
+    \\usage: mami_sound [PLANTS] [--device=NAME] [--plant-b=POOL] [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A, the sensor-driven drone
-    \\  2  plant B, a random interview clip
+    \\  2  plant B, a random clip
     \\  12 both plants
     \\
-    \\Plant B loads clips from ./interview files/ and ./field records/.
-    \\The two folders form one pool, and each new touch chooses a clip.
+    \\Plant B draws clips from ./interview files/ and ./field records/, which
+    \\form one pool. Each new touch chooses a clip from it at random.
     \\
     \\--device selects the ALSA device for aplay. It defaults to `default`.
     \\Use `aplay -l` to list cards; for example, `plughw:0,0`.
     \\
-    \\--noise-file replaces Plant A's generated noise with a continuously looping audio file.
-    \\The file is decoded, downmixed to mono, and resampled by ffmpeg at startup.
+    \\--plant-b swaps that pool for a folder of tuned stems, chosen the same way:
+    \\  bell   ./Bell Stems/
+    \\  piano  ./EPiano Stems/
+    \\Left off, plant B plays the interviews and field records as usual.
+    \\Plant A's drone is generated either way and is not affected.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
     \\
 ;
 
-test "parse accepts a noise file" {
-    const opts = try parse(&.{"--noise-file=/tmp/test.wav"});
-    try std.testing.expectEqualStrings("/tmp/test.wav", opts.noiseFile().?);
+test "parse accepts either stem pool" {
+    try std.testing.expectEqual(plant_b.Pool.bell, (try parse(&.{"--plant-b=bell"})).pool);
+    try std.testing.expectEqual(plant_b.Pool.piano, (try parse(&.{"--plant-b=piano"})).pool);
+}
+
+test "plant B plays the recordings when nothing asked otherwise" {
+    try std.testing.expectEqual(plant_b.Pool.recordings, (try parse(&.{})).pool);
+    try std.testing.expectEqual(plant_b.Pool.recordings, (try parse(&.{"12"})).pool);
+}
+
+test "parse rejects a pool it has no folder for" {
+    try std.testing.expectError(Error.InvalidPlantB, parse(&.{"--plant-b=cello"}));
+    try std.testing.expectError(Error.InvalidPlantB, parse(&.{"--plant-b="}));
+}
+
+test "the flag the pool replaced is gone rather than ignored" {
+    try std.testing.expectError(Error.UnknownFlag, parse(&.{"--noise-file=/tmp/test.wav"}));
 }
 
 test "parse accepts the random probe test flag" {
