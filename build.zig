@@ -29,12 +29,54 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Play 15 seconds of the installation through aplay");
+    const run_step = b.step("run", "Play the installation through aplay");
     run_step.dependOn(&run_cmd.step);
 
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const core_mod = b.addModule("mami_sound_core", .{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    const run_core_tests = b.addRunArtifact(core_tests);
+
+    const application_mod = b.addModule("mami_sound_application", .{
+        .root_source_file = b.path("src/application_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const application_tests = b.addTest(.{ .root_module = application_mod });
+    const run_application_tests = b.addRunArtifact(application_tests);
+
+    const adapters_mod = b.addModule("mami_sound_adapters", .{
+        .root_source_file = b.path("src/adapters_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const adapters_tests = b.addTest(.{ .root_module = adapters_mod });
+    const run_adapters_tests = b.addRunArtifact(adapters_tests);
+
+    const cli_mod = b.addModule("mami_sound_cli", .{
+        .root_source_file = b.path("src/cli_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_application_tests.step);
+    test_step.dependOn(&run_adapters_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
+
+    const adapter_test_step = b.step(
+        "test-adapters",
+        "Run adapter tests from the adapter root",
+    );
+    adapter_test_step.dependOn(&run_adapters_tests.step);
 }

@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const ports = @import("../ports/root.zig");
 
 /// How much audio each queue between the mixer and the speaker may hold.
 ///
@@ -33,18 +34,6 @@ comptime {
     std.debug.assert(builtin.cpu.arch.endian() == .little);
 }
 
-/// Convert a mixed f32 block to signed 16-bit PCM.
-///
-/// Voices add into a shared block, so the sum can exceed full scale when
-/// several sound at once. Clamping here keeps a loud moment loud instead of
-/// letting it wrap around into noise.
-pub fn toPcm(block: []const f32, out: []i16) void {
-    std.debug.assert(block.len == out.len);
-    for (block, out) |sample, *pcm| {
-        pcm.* = @intFromFloat(std.math.clamp(sample, -1.0, 1.0) * 32767.0);
-    }
-}
-
 /// Shrink the pipe to `bytes`, so `aplay` cannot be handed more audio than it
 /// is about to play.
 ///
@@ -60,7 +49,7 @@ fn shrinkPipe(fd: linux.fd_t, bytes: usize) void {
     _ = linux.fcntl(fd, linux.F.SETPIPE_SZ, bytes);
 }
 
-pub const Sink = struct {
+pub const Adapter = struct {
     io: std.Io,
     child: std.process.Child,
 
@@ -79,7 +68,7 @@ pub const Sink = struct {
         device: []const u8,
         comptime sample_rate: u32,
         comptime channels: u32,
-    ) !Sink {
+    ) !Adapter {
         const child = try std.process.spawn(io, .{
             .argv = &.{
                 "aplay",
@@ -110,18 +99,40 @@ pub const Sink = struct {
         return .{ .io = io, .child = child };
     }
 
-    pub fn write(self: *Sink, frames: []const i16) !void {
+    pub fn port(self: *Adapter) ports.AudioSink {
+        return .{
+            .context = self,
+            .write_fn = writePort,
+            .finish_fn = finishPort,
+        };
+    }
+
+    pub fn write(self: *Adapter, frames: []const i16) !void {
         const stdin = self.child.stdin orelse return error.SinkClosed;
         try stdin.writeStreamingAll(self.io, std.mem.sliceAsBytes(frames));
     }
 
     /// Close the pipe so `aplay` drains what it has and exits, then reap it.
-    pub fn finish(self: *Sink) !void {
+    pub fn finish(self: *Adapter) !void {
         if (self.child.stdin) |stdin| {
             stdin.close(self.io);
             self.child.stdin = null;
         }
-        _ = try self.child.wait(self.io);
+        const term = try self.child.wait(self.io);
+        switch (term) {
+            .exited => |code| if (code != 0) return error.ChildFailed,
+            else => return error.ChildFailed,
+        }
+    }
+
+    fn writePort(context: *anyopaque, frames: []const i16) anyerror!void {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        return self.write(frames);
+    }
+
+    fn finishPort(context: *anyopaque) anyerror!void {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        return self.finish();
     }
 };
 
@@ -148,4 +159,57 @@ test "the queues in front of the card stay inside a playable delay" {
     // about to play, and never a fraction of one it has to wait to complete.
     try testing.expectEqual(@as(u32, 512), period_frames);
     try testing.expectEqual(@as(u32, 0), buffer_frames % period_frames);
+}
+
+test "the adapter port dispatches writes through its function table" {
+    var adapter = Adapter{
+        .io = undefined,
+        .child = std.mem.zeroes(std.process.Child),
+    };
+    var sink = adapter.port();
+
+    try testing.expectError(error.SinkClosed, sink.write(&.{}));
+}
+
+test "the adapter port dispatches finish through its function table" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{"/bin/sh"},
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+    var sink = adapter.port();
+
+    try sink.finish();
+}
+
+test "finish reports a non-zero child exit" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 7" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+
+    try testing.expectError(error.ChildFailed, adapter.finish());
+}
+
+test "finish reports a child that did not exit normally" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "kill -TERM $$" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+    });
+    var adapter = Adapter{ .io = io, .child = child };
+
+    try testing.expectError(error.ChildFailed, adapter.finish());
 }

@@ -1,7 +1,7 @@
 //! ADS1115 16-bit ADC over Linux i2c-dev.
 //!
-//! This is the real version of the ECG probe that `sensors.zig` otherwise
-//! simulates. The chip is put in continuous-conversion mode once, at open, and
+//! This is the low-level driver used by the real ECG probe adapter. The chip is
+//! put in continuous-conversion mode once, at open, and
 //! every later read is a two-byte fetch of the conversion register, so a read
 //! costs one I2C transaction and never waits on the chip.
 //!
@@ -88,8 +88,8 @@ pub const Rate = enum(u3) {
 /// input is single-ended, and the range has to cover the whole supply: at the C
 /// driver's +/-2.048 V the ADC saturates at two thirds of the way up and every
 /// healthy plant reads the same. +/-4.096 V is the smallest range that clears
-/// 3.3 V. A differential probe wants `.ain0_ain1` back, and a mapping in
-/// `sensors.zig` that keeps negative counts instead of folding them to zero.
+/// 3.3 V. A differential probe wants `.ain0_ain1` back, and the probe adapter
+/// keeps negative counts instead of folding them to zero.
 /// The rate is the fastest the chip offers, which is the only setting that
 /// keeps up with a poll every 2.9 ms: at 128 SPS a reading can be 7.8 ms stale
 /// and most polls see the same number twice. The cost is noise — the effective
@@ -156,7 +156,7 @@ pub const Ads1115 = struct {
     /// input, and the conversion register holds the *old* input's last result
     /// until that finishes — one sample period, 1.2 ms at 860 SPS. So this
     /// returns immediately and never waits: it is the caller's business to read
-    /// far enough after the switch, which `sensors.zig` does by holding the
+    /// far enough after the switch, which the probe adapter does by holding the
     /// multiplexer still for a whole block, so the sink's blocking write falls
     /// between the switch and the next read.
     pub fn selectInput(self: *Ads1115, mux: Mux) Error!void {
