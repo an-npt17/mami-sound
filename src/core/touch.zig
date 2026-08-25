@@ -424,7 +424,15 @@ pub const Detector = struct {
     pub fn deviation(self: *const Detector) i16 {
         return switch (self.model) {
             .deviation => clampedAbsDiff(self.last_mean, self.base()),
-            .steady => @max(self.last_mean - (self.band_lo orelse 0), 0),
+            // Nobody on it is no pitch at all. The mean only takes still
+            // readings, so without this it would keep reporting the level of
+            // the last touch for as long as the rig ran, and the drone would
+            // never fall home — the release would be a gate closing over a
+            // pitch that never moved.
+            .steady => if (self.on)
+                @max(self.last_mean - (self.band_lo orelse 0), 0)
+            else
+                0,
         };
     }
 
@@ -461,15 +469,20 @@ pub const Detector = struct {
             return;
         }
 
+        // The release leaks rather than counting a run: a flailing probe throws
+        // the odd repeated reading, and a release that demanded consecutive
+        // movement would have those reset it every time — a touch, once
+        // latched, would never end. Leaking also costs a dropout inside a real
+        // touch nothing, because the still readings either side pay it back.
         if (still) {
             self.last_mean = self.mean.push(raw);
-            self.dropped = 0;
+            self.dropped -|= 1;
             self.count = @min(self.count + 1, self.hold);
             if (self.count == self.hold) self.on = true;
         } else {
             self.count = 0;
-            self.dropped += 1;
-            if (self.dropped >= self.drop) self.on = false;
+            self.dropped = @min(self.dropped + 1, self.drop);
+            if (self.dropped == self.drop) self.on = false;
         }
     }
 
@@ -1365,6 +1378,48 @@ test "a probe clamped to zero is a touch, with or without a band to say so" {
     a_band.band_hi = 750;
     var in_a = Detector.init(a_band);
     for (0..344) |_| try testing.expect(!in_a.update(1));
+}
+
+test "the pitch falls home when the hand goes" {
+    // The mean only takes still readings, so on release there is nothing to
+    // pull it back: what says the touch is over is the latch, not the mean.
+    var rows: [128][2]i16 = undefined;
+    const n = floatingSection(1, &rows);
+    var d = Detector.init(steadyConfig());
+    _ = steadyRun(&d, rows[0..n], 0);
+    try testing.expect(d.on);
+    try testing.expect(d.deviation() > 600);
+
+    // The flailing that follows a release. That block is thirteen polls and
+    // the release is thirty, so the opening block's flailing follows it: what
+    // matters is that these are readings of nobody touching anything.
+    const after = floatingSection(2, &rows);
+    for (rows[0..after]) |row| _ = d.update(row[0]);
+    const more = floatingSection(0, &rows);
+    for (rows[0..more]) |row| _ = d.update(row[0]);
+    try testing.expect(!d.on);
+    try testing.expectEqual(@as(i16, 0), d.deviation());
+}
+
+test "a stray repeated reading in the flailing does not hold a touch open" {
+    // A flailing probe lands on the same value twice now and then. Counting a
+    // run of movement instead of leaking would let each of those reset the
+    // release, and the latch would outlive the hand by the length of the run.
+    var d = Detector.init(steadyConfig());
+    for (0..20) |_| _ = d.update(669);
+    try testing.expect(d.on);
+
+    // Movement, with a repeat every third poll.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const raw: i16 = switch (i % 3) {
+            0 => 1,
+            1 => 1,
+            else => -4096,
+        };
+        _ = d.update(raw);
+    }
+    try testing.expect(!d.on);
 }
 
 test "a reading outside the band is never still, however little it moved" {
