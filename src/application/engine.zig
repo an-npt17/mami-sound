@@ -11,6 +11,7 @@ pub const Engine = struct {
     status: ports.StatusSink,
     machine: core.touch.Machine,
     drone: core.noise.Noise,
+    loop: ?core.loop.Player,
     plant_b: core.plant_b.ClipPlayer,
     block: [core.block_frames]f32,
     pcm: [core.block_frames]i16,
@@ -21,6 +22,7 @@ pub const Engine = struct {
         probe: ports.ProbeSource,
         sink: ports.AudioSink,
         status: ports.StatusSink,
+        loop_samples: ?[]const f32,
         clip_pool: []const []const f32,
         random: std.Random,
     ) Engine {
@@ -35,6 +37,7 @@ pub const Engine = struct {
                 production_config.seed,
                 production_config.drone,
             ),
+            .loop = if (loop_samples) |samples| .init(samples) else null,
             .plant_b = core.plant_b.ClipPlayer.init(clip_pool, random),
             .block = undefined,
             .pcm = undefined,
@@ -62,7 +65,11 @@ pub const Engine = struct {
             });
             state = detected;
             if (self.selection[0]) {
-                self.drone.render(piece, self.machine.a.deviation(), touched[0]);
+                if (self.loop) |*loop| {
+                    loop.render(piece);
+                } else {
+                    self.drone.render(piece, self.machine.a.deviation(), touched[0]);
+                }
             }
             self.plant_b.render(piece, self.selection[1] and touched[1]);
         }

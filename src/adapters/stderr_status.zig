@@ -71,7 +71,7 @@ fn formatLine(
         out.* = if (awake) letter else '-';
     }
 
-    return std.fmt.bufPrint(buf, "t={d:.0}s a0={d} a1={d} z0={d:.1} z1={d:.1} {s} touch={s}\n", .{
+    return std.fmt.bufPrint(buf, "t={d:.0}s a0={d} a1={d} z0={d:.1} z1={d:.1} state={s} touch={s}\n", .{
         audio_s,
         snapshot.raw_a,
         snapshot.raw_bc,
@@ -80,4 +80,24 @@ fn formatLine(
         @tagName(snapshot.state),
         &touched,
     });
+}
+
+test "formatLine labels runtime diagnostics" {
+    const snapshot = ports.Snapshot{
+        .raw_a = 12,
+        .raw_bc = -34,
+        .z_a = 1.5,
+        .z_bc = -2.5,
+        .state = .plant_bc,
+        .touched = .{ true, false },
+        .block = &.{},
+        .rendered = 44100,
+    };
+    var buffer: [128]u8 = undefined;
+    const line = try formatLine(&buffer, snapshot, 1.0);
+
+    try std.testing.expectEqualStrings(
+        "t=1s a0=12 a1=-34 z0=1.5 z1=-2.5 state=plant_bc touch=A-\n",
+        line,
+    );
 }

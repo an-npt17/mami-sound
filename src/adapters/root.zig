@@ -4,6 +4,7 @@ pub const aplay_sink = @import("aplay_sink.zig");
 pub const clip_loader = @import("clip_loader.zig");
 pub const decode = @import("decode.zig");
 pub const library = @import("library.zig");
+pub const random_probe = @import("random_probe.zig");
 pub const stderr_status = @import("stderr_status.zig");
 
 test {
@@ -13,5 +14,6 @@ test {
     _ = clip_loader;
     _ = decode;
     _ = library;
+    _ = random_probe;
     _ = stderr_status;
 }
