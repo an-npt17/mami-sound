@@ -4,6 +4,7 @@ const cli = @import("cli.zig");
 const core = @import("core/root.zig");
 const engine = @import("application/engine.zig");
 const ports = @import("ports/root.zig");
+const production_config = @import("application/production_config.zig");
 const ads1115 = @import("adapters/ads1115.zig");
 const ads1115_probe = @import("adapters/ads1115_probe.zig");
 const aplay_sink = @import("adapters/aplay_sink.zig");
@@ -120,6 +121,23 @@ fn runComposition(
     }
     var stream = try clip_stream.Adapter.init(io, gpa, clips.paths, limit);
     defer stream.deinit();
+
+    // Before `start`, and never fatal. The heads are what make a touch audible
+    // straight away instead of one ffmpeg startup later; without them the
+    // streamer still plays every clip, just late.
+    if (clips.paths.len != 0) {
+        std.debug.print("loading: pre-decoding clip heads...\n", .{});
+        if (stream.primeHeads()) |_| {
+            const megabytes: f32 = @as(f32, @floatFromInt(stream.headBytes())) / 1024.0 / 1024.0;
+            std.debug.print("loading: clip heads ready ({d:.1} MB)\n", .{megabytes});
+        } else |err| {
+            std.debug.print(
+                "clip heads unavailable ({s}); clips will start after ffmpeg does\n",
+                .{@errorName(err)},
+            );
+        }
+    }
+
     try stream.start();
     const stream_port = stream.port();
 
@@ -133,6 +151,7 @@ fn runComposition(
     std.debug.print("loading: starting engine...\n", .{});
     var app = engine.Engine.init(
         opts.plants,
+        production_config.touchWith(opts.model, opts.still_range, opts.still_release),
         probe.source(),
         sink_port,
         status.port(),

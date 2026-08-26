@@ -32,6 +32,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Play the installation through aplay");
     run_step.dependOn(&run_cmd.step);
 
+    // Replays a captured probe log through the detector, so thresholds can be
+    // chosen from what the rig did rather than from a trip to the room.
+    const replay_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const replay_exe = b.addExecutable(.{ .name = "replay", .root_module = replay_mod });
+    b.installArtifact(replay_exe);
+    const replay_cmd = b.addRunArtifact(replay_exe);
+    if (b.args) |args| replay_cmd.addArgs(args);
+    const replay_step = b.step("replay", "Replay a probe capture through the detector");
+    replay_step.dependOn(&replay_cmd.step);
+
+    const replay_tests = b.addTest(.{ .root_module = replay_mod });
+    const run_replay_tests = b.addRunArtifact(replay_tests);
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
@@ -82,6 +99,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_application_tests.step);
     test_step.dependOn(&run_adapters_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_replay_tests.step);
 
     const adapter_test_step = b.step(
         "test-adapters",

@@ -1,105 +1,32 @@
 const std = @import("std");
 const linux = std.os.linux;
+const clip_heads = @import("clip_heads.zig");
+const clip_ring = @import("clip_ring.zig");
 const core = @import("../core/root.zig");
 const ports = @import("../ports/root.zig");
 
-const ring_capacity = 44100;
 const none_index = std.math.maxInt(usize);
-const voice_gain: f32 = 0.4;
-
-var test_ring_storage: [8]f32 = undefined;
-var test_ring_tags: [8]u64 = undefined;
-
-const Ring = struct {
-    samples: []f32,
-    tags: []u64,
-    read_index: std.atomic.Value(usize),
-    write_index: std.atomic.Value(usize),
-
-    fn init(gpa: std.mem.Allocator) !Ring {
-        const samples = try gpa.alloc(f32, ring_capacity);
-        errdefer gpa.free(samples);
-        const tags = try gpa.alloc(u64, ring_capacity);
-        return .{
-            .samples = samples,
-            .tags = tags,
-            .read_index = .init(0),
-            .write_index = .init(0),
-        };
-    }
-
-    fn initForTest() Ring {
-        return .{
-            .samples = &test_ring_storage,
-            .tags = &test_ring_tags,
-            .read_index = .init(0),
-            .write_index = .init(0),
-        };
-    }
-
-    fn deinit(self: *Ring, gpa: std.mem.Allocator) void {
-        if (self.samples.len == ring_capacity) {
-            gpa.free(self.samples);
-            gpa.free(self.tags);
-        }
-        self.* = undefined;
-    }
-
-    fn clear(self: *Ring) void {
-        const write = self.write_index.load(.acquire);
-        self.read_index.store(write, .release);
-    }
-
-    fn push(self: *Ring, input: []const f32, generation: u64) usize {
-        const read = self.read_index.load(.acquire);
-        const write = self.write_index.load(.acquire);
-        const used = write - read;
-        const count = @min(input.len, self.samples.len - used);
-        for (input[0..count], 0..) |sample, i| {
-            const index = (write + i) % self.samples.len;
-            self.samples[index] = sample;
-            self.tags[index] = generation;
-        }
-        self.write_index.store(write + count, .release);
-        return count;
-    }
-
-    fn pop(self: *Ring, output: []f32) usize {
-        const read = self.read_index.load(.acquire);
-        const write = self.write_index.load(.acquire);
-        const count = @min(output.len, write - read);
-        for (output[0..count], 0..) |*sample, i| {
-            sample.* = self.samples[(read + i) % self.samples.len];
-        }
-        self.read_index.store(read + count, .release);
-        return count;
-    }
-
-    fn mix(self: *Ring, output: []f32, generation: u64) usize {
-        const read = self.read_index.load(.acquire);
-        const write = self.write_index.load(.acquire);
-        const count = @min(output.len, write - read);
-        for (output[0..count], 0..) |*sample, i| {
-            const index = (read + i) % self.samples.len;
-            if (self.tags[index] == generation) {
-                sample.* += self.samples[index] * voice_gain;
-            }
-        }
-        self.read_index.store(read + count, .release);
-        return count;
-    }
-};
+/// Re-exported so callers keep reading it from the streamer they render through.
+pub const voice_gain = clip_ring.voice_gain;
 
 pub const Adapter = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     paths: []const []const u8,
-    ring: Ring,
+    ring: clip_ring.Ring,
     requested_index: std.atomic.Value(usize),
     request_generation: std.atomic.Value(u64),
     /// How much of a clip one touch plays. Spent per clip: each decode takes a
     /// fresh copy, so this one is only ever the template.
     limit: core.plant_b.Limit,
+    /// The opening of every clip, decoded up front. Written by `primeHeads`
+    /// before the worker exists and read-only from then on, which is what lets
+    /// both the audio thread and the worker hold it without a lock.
+    heads: clip_heads.Heads,
+    /// The head now playing and how far through it the audio thread is. Touched
+    /// only from `render`.
+    head: []const f32,
+    head_cursor: usize,
     shutdown: std.atomic.Value(bool),
     child_pid: std.atomic.Value(i32),
     thread: ?std.Thread,
@@ -115,8 +42,11 @@ pub const Adapter = struct {
             .io = io,
             .gpa = gpa,
             .paths = paths,
-            .ring = try Ring.init(gpa),
+            .ring = try clip_ring.Ring.init(gpa),
             .limit = limit,
+            .heads = .none,
+            .head = &.{},
+            .head_cursor = 0,
             .requested_index = .init(none_index),
             .request_generation = .init(0),
             .shutdown = .init(false),
@@ -126,12 +56,32 @@ pub const Adapter = struct {
         };
     }
 
+    /// Decode every clip's head into RAM. Before `start`, and optional: a
+    /// streamer that skips it behaves exactly as it did before heads existed,
+    /// which is what the tests that do not care about startup latency rely on.
+    pub fn primeHeads(self: *Adapter) !void {
+        if (self.started) return error.AlreadyStarted;
+        self.heads = try clip_heads.decode(
+            self.gpa,
+            self.io,
+            self.paths,
+            self.limit,
+            core.sample_rate,
+        );
+    }
+
     pub fn start(self: *Adapter) !void {
         if (self.started) return error.AlreadyStarted;
         self.started = true;
         errdefer self.started = false;
         if (self.paths.len == 0) return;
         self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
+    }
+
+    /// How much RAM the primed heads hold, for the startup line. Worth saying
+    /// out loud on a board with 512 MB of it.
+    pub fn headBytes(self: *const Adapter) usize {
+        return self.heads.samples.len * @sizeOf(f32);
     }
 
     pub fn port(self: *Adapter) ports.ClipStream {
@@ -146,6 +96,7 @@ pub const Adapter = struct {
         const pid = self.child_pid.load(.acquire);
         if (pid >= 0) _ = linux.kill(pid, linux.SIG.KILL);
         if (self.thread) |thread| thread.join();
+        self.heads.deinit(self.gpa);
         self.ring.deinit(self.gpa);
         self.* = undefined;
     }
@@ -159,13 +110,32 @@ pub const Adapter = struct {
         if (request) |index| {
             if (index >= self.paths.len) return;
             self.ring.clear();
+            // A clip with no head leaves this empty, which is the old
+            // behaviour: nothing sounds until the worker has decoded something.
+            self.head = self.heads.get(index);
+            self.head_cursor = 0;
             self.requested_index.store(index, .release);
             const generation = self.request_generation.load(.acquire);
             self.request_generation.store(generation + 1, .release);
         }
 
         const generation = self.request_generation.load(.acquire);
-        _ = self.ring.mix(out, generation);
+
+        // The head is played straight from memory and the ring picks the clip
+        // up exactly where the head stops -- the worker is told to throw away
+        // the samples the head already holds, so the seam is a sample boundary
+        // and not a seek.
+        var offset: usize = 0;
+        if (self.head_cursor < self.head.len) {
+            const count = @min(out.len, self.head.len - self.head_cursor);
+            for (out[0..count], self.head[self.head_cursor..][0..count]) |*sample, head| {
+                sample.* += head * voice_gain;
+            }
+            self.head_cursor += count;
+            offset = count;
+        }
+
+        _ = self.ring.mix(out[offset..], generation);
     }
 
     fn workerMain(self: *Adapter) void {
@@ -180,11 +150,24 @@ pub const Adapter = struct {
 
             const index = self.requested_index.load(.acquire);
             if (index >= self.paths.len) continue;
-            self.decodePath(self.paths[index], generation);
+            self.decodePath(self.paths[index], generation, self.heads.get(index).len);
         }
     }
 
-    fn decodePath(self: *Adapter, path: []const u8, generation: u64) void {
+    /// `skip` is how many samples of this clip the head already holds. They
+    /// are decoded and thrown away rather than seeked past: `-ss` on an mp3
+    /// lands on a frame boundary, not a sample, and a seam that is a few
+    /// milliseconds out is a click in the middle of every clip. Decoding two
+    /// seconds nobody hears costs the worker a few milliseconds, once.
+    fn decodePath(self: *Adapter, path: []const u8, generation: u64, skip: usize) void {
+        var limit = self.limit;
+        // The allowance counts from the start of the clip, so the head's share
+        // of it is already spent. A stem whose whole cap fits in the head is
+        // finished before ffmpeg is asked for anything.
+        limit.emitted = @min(skip, limit.total);
+        if (limit.finished()) return;
+        var remaining_skip = skip;
+
         var child = std.process.spawn(self.io, .{
             .argv = &.{
                 "ffmpeg",
@@ -236,7 +219,6 @@ pub const Adapter = struct {
         var bytes: [16 * 1024]u8 align(@alignOf(f32)) = undefined;
         var pending: [@sizeOf(f32)]u8 = undefined;
         var pending_len: usize = 0;
-        var limit = self.limit;
 
         while (!self.shouldStop(generation)) {
             if (pending_len != 0) @memcpy(bytes[0..pending_len], pending[0..pending_len]);
@@ -261,7 +243,13 @@ pub const Adapter = struct {
             const total = pending_len + read;
             const complete = total - total % @sizeOf(f32);
             const samples = std.mem.bytesAsSlice(f32, bytes[0..complete]);
-            self.pushSamples(samples, generation, &limit);
+            var run = samples;
+            if (remaining_skip != 0) {
+                const dropped = @min(remaining_skip, run.len);
+                remaining_skip -= dropped;
+                run = run[dropped..];
+            }
+            if (run.len != 0) self.pushSamples(run, generation, &limit);
             pending_len = total - complete;
             if (pending_len != 0) @memcpy(pending[0..pending_len], bytes[complete..total]);
 
@@ -320,35 +308,6 @@ pub const Adapter = struct {
             self.request_generation.load(.acquire) != generation;
     }
 };
-
-test "ring wraps and reports underflow without blocking" {
-    var ring = Ring.initForTest();
-    var first = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
-    var output = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
-    try std.testing.expectEqual(@as(usize, 6), ring.push(&first, 1));
-    try std.testing.expectEqual(@as(usize, 4), ring.pop(&output));
-    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, &output);
-    @memset(&output, 0);
-    try std.testing.expectEqual(@as(usize, 2), ring.pop(&output));
-    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 0.0, 0.0 }, &output);
-
-    var second = [_]f32{ 7.0, 8.0, 9.0, 10.0, 11.0, 12.0 };
-    try std.testing.expectEqual(@as(usize, 6), ring.push(&second, 1));
-    var wrapped = [_]f32{0.0} ** 8;
-    try std.testing.expectEqual(@as(usize, 6), ring.pop(&wrapped));
-    try std.testing.expectEqualSlices(f32, &.{ 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 0.0, 0.0 }, &wrapped);
-}
-
-test "ring mixing preserves audio already in the engine block" {
-    var ring = Ring.initForTest();
-    var input = [_]f32{ 1.0, 2.0 };
-    var output = [_]f32{ 10.0, 20.0, 30.0 };
-    _ = ring.push(&input, 1);
-    try std.testing.expectEqual(@as(usize, 2), ring.mix(&output, 1));
-    try std.testing.expectApproxEqAbs(@as(f32, 10.4), output[0], 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f32, 20.8), output[1], 0.000001);
-    try std.testing.expectEqual(@as(f32, 30.0), output[2]);
-}
 
 test "adapter rejects duplicate starts" {
     var adapter = try Adapter.init(

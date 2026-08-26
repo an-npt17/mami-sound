@@ -1,11 +1,14 @@
 const std = @import("std");
 const plant_b = @import("core/plant_b.zig");
+const touch = @import("core/touch.zig");
 const select = @import("core/select.zig");
 
 pub const Error = error{
     UnknownFlag,
     InvalidDevice,
     InvalidPlantB,
+    InvalidTouchModel,
+    InvalidStillThreshold,
     TooManyArguments,
 } || select.Error;
 
@@ -24,6 +27,16 @@ pub const Options = struct {
     /// field records unless the room asked for a stem pool instead.
     pool: plant_b.Pool = .recordings,
     test_random_probe: bool = false,
+    /// Which question the detector asks each probe, and the two spreads the
+    /// `steady` model answers it with. Unset, the compiled-in preset stands.
+    ///
+    /// On the command line because the thresholds are a property of the rig on
+    /// the day, not of the piece: an electrode moved between one morning and
+    /// the next changes them, and a rebuild to try a number is a rebuild
+    /// nobody does while a room is waiting.
+    model: ?touch.Model = null,
+    still_range: ?i16 = null,
+    still_release: ?i16 = null,
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
@@ -44,6 +57,15 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--plant-b=")) {
             opts.pool = plant_b.Pool.parse(arg["--plant-b=".len..]) catch
                 return Error.InvalidPlantB;
+        } else if (std.mem.startsWith(u8, arg, "--touch-model=")) {
+            const name = arg["--touch-model=".len..];
+            opts.model = parseModel(name) orelse return Error.InvalidTouchModel;
+        } else if (std.mem.startsWith(u8, arg, "--still-range=")) {
+            opts.still_range = parseCounts(arg["--still-range=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
+            opts.still_release = parseCounts(arg["--still-release=".len..]) orelse
+                return Error.InvalidStillThreshold;
         } else if (std.mem.eql(u8, arg, "--test-random-probe")) {
             opts.test_random_probe = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -56,6 +78,19 @@ pub fn parse(args: []const []const u8) Error!Options {
     }
 
     return opts;
+}
+
+fn parseModel(name: []const u8) ?touch.Model {
+    if (std.mem.eql(u8, name, "deviation")) return .deviation;
+    if (std.mem.eql(u8, name, "steady")) return .steady;
+    return null;
+}
+
+/// A threshold in counts. Negative is not a range, and zero would latch on
+/// nothing at all, so both are refused rather than clamped.
+fn parseCounts(text: []const u8) ?i16 {
+    const value = std.fmt.parseInt(i16, text, 10) catch return null;
+    return if (value > 0) value else null;
 }
 
 pub const usage =
@@ -104,4 +139,30 @@ test "the flag the pool replaced is gone rather than ignored" {
 test "parse accepts the random probe test flag" {
     const opts = try parse(&.{"--test-random-probe"});
     try std.testing.expect(opts.test_random_probe);
+}
+
+test "the touch model can be chosen on the command line" {
+    try std.testing.expectEqual(touch.Model.steady, (try parse(&.{"--touch-model=steady"})).model.?);
+    try std.testing.expectEqual(
+        touch.Model.deviation,
+        (try parse(&.{"--touch-model=deviation"})).model.?,
+    );
+    try std.testing.expectError(Error.InvalidTouchModel, parse(&.{"--touch-model=stillness"}));
+}
+
+test "an unset model leaves the compiled-in preset alone" {
+    const opts = try parse(&.{});
+    try std.testing.expect(opts.model == null);
+    try std.testing.expect(opts.still_range == null);
+}
+
+test "the quiet thresholds take counts, and refuse what is not one" {
+    const opts = try parse(&.{ "--still-range=64", "--still-release=900" });
+    try std.testing.expectEqual(@as(i16, 64), opts.still_range.?);
+    try std.testing.expectEqual(@as(i16, 900), opts.still_release.?);
+    // Zero would latch on a probe that never went still, and a range has no
+    // sign; both are a typo rather than a setting.
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-range=0"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-range=-8"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-release=wide"}));
 }

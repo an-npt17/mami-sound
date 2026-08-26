@@ -351,3 +351,26 @@ test "a release part-way through a burst hands the pitch back to the glide" {
     try std.testing.expect(voice.fc < abandoned);
     try std.testing.expect(voice.fc < 1.1 * freq_min);
 }
+
+test "the touch is heard as a burst and not only as a change of pitch" {
+    // The gate and the sweep are what make a touch audible; the pitch alone is
+    // not. Both voices here are handed the same deviation, so the only thing
+    // that can separate them is the touch itself -- which is exactly the wire
+    // an engine could drop without any test noticing.
+    const shape: Shape = .{ .span = 3000 };
+    var touched: Noise = .init(44100, 1, shape);
+    var idle: Noise = .init(44100, 1, shape);
+
+    var touched_out = [_]f32{0.0} ** 44100;
+    var idle_out = [_]f32{0.0} ** 44100;
+    touched.render(&touched_out, 1500, true);
+    idle.render(&idle_out, 1500, false);
+
+    try std.testing.expect(rootMeanSquare(&touched_out) > rootMeanSquare(&idle_out) * 2.0);
+}
+
+fn rootMeanSquare(samples: []const f32) f32 {
+    var sum: f64 = 0.0;
+    for (samples) |sample| sum += @as(f64, sample) * @as(f64, sample);
+    return @floatCast(@sqrt(sum / @as(f64, @floatFromInt(samples.len))));
+}

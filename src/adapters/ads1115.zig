@@ -22,6 +22,43 @@ pub const default_address: u16 = 0x48;
 /// this fd talks to.
 const I2C_SLAVE: u32 = 0x0703;
 
+/// From <linux/i2c-dev.h>. Hands the driver a list of messages to run as one
+/// transaction, which is the only way to get a repeated START out of this
+/// interface.
+const I2C_RDWR: u32 = 0x0707;
+
+/// `I2C_M_RD`: this message is a read.
+pub const flag_read: u16 = 0x0001;
+
+/// `struct i2c_msg`. The layout is the kernel's and is asserted by a test.
+pub const I2cMsg = extern struct {
+    addr: u16,
+    flags: u16,
+    len: u16,
+    buf: [*]u8,
+};
+
+/// `struct i2c_rdwr_ioctl_data`.
+pub const I2cRdwr = extern struct {
+    msgs: [*]I2cMsg,
+    nmsgs: u32,
+};
+
+/// The two messages that read a register in a single transaction: write the
+/// register pointer, then read the value, with a repeated START between them
+/// and no STOP.
+///
+/// The ADS1115 wants exactly this. A separate `write` then `read` puts a STOP
+/// and a fresh START between the pointer and the data, which leaves the chip
+/// and any other master free to get in between -- and on a marginal bus it is
+/// where a conversion read comes back with a corrupt high byte.
+pub fn readMessages(address: u16, pointer: *[1]u8, data: *[2]u8) [2]I2cMsg {
+    return .{
+        .{ .addr = address, .flags = 0, .len = pointer.len, .buf = pointer },
+        .{ .addr = address, .flags = flag_read, .len = data.len, .buf = data },
+    };
+}
+
 /// Register pointers.
 const reg_conversion: u8 = 0x00;
 const reg_config: u8 = 0x01;
@@ -31,6 +68,9 @@ pub const Error = error{
     AddressFailed,
     WriteFailed,
     ReadFailed,
+    /// The driver cannot do combined transfers. Recoverable: the caller falls
+    /// back to a separate write and read.
+    Unsupported,
 };
 
 /// Input multiplexer. The first four are differential pairs, the last four are
@@ -120,6 +160,13 @@ pub fn configWord(cfg: Config) u16 {
 
 pub const Ads1115 = struct {
     fd: linux.fd_t,
+    /// Needed per message once reads go through `I2C_RDWR`, which addresses
+    /// each message itself rather than inheriting the `I2C_SLAVE` setting.
+    address: u16,
+    /// Whether this driver does combined transfers. Cleared the first time the
+    /// kernel says it cannot, and never set again: a bus that has no repeated
+    /// START still works the old way, just less reliably.
+    combined: bool,
     /// What was last written to the config register, so a mux change can rewrite
     /// it without the caller repeating the gain and rate.
     cfg: Config,
@@ -141,7 +188,7 @@ pub const Ads1115 = struct {
 
         try writeConfig(fd, cfg);
 
-        return .{ .fd = fd, .cfg = cfg };
+        return .{ .fd = fd, .address = address, .combined = true, .cfg = cfg };
     }
 
     pub fn close(self: *Ads1115) void {
@@ -174,13 +221,39 @@ pub const Ads1115 = struct {
     ///
     /// Which input this reads is whatever `selectInput` last pointed at.
     pub fn readRaw(self: *Ads1115) Error!i16 {
-        try writeAll(self.fd, &[_]u8{reg_conversion});
-
         var data: [2]u8 = undefined;
+
+        if (self.combined) {
+            if (self.readCombined(&data)) |_| {
+                return std.mem.readInt(i16, &data, .big);
+            } else |err| switch (err) {
+                // The driver has no repeated START to give. Said once, then
+                // never asked again.
+                Error.Unsupported => self.combined = false,
+                else => return err,
+            }
+        }
+
+        try writeAll(self.fd, &[_]u8{reg_conversion});
         const rc = linux.read(self.fd, &data, data.len);
         if (linux.errno(rc) != .SUCCESS or rc != data.len) return Error.ReadFailed;
 
         return std.mem.readInt(i16, &data, .big);
+    }
+
+    /// Pointer write and value read as one transaction.
+    fn readCombined(self: *Ads1115, data: *[2]u8) Error!void {
+        var pointer = [1]u8{reg_conversion};
+        var msgs = readMessages(self.address, &pointer, data);
+        var request: I2cRdwr = .{ .msgs = &msgs, .nmsgs = msgs.len };
+
+        const rc = linux.ioctl(self.fd, I2C_RDWR, @intFromPtr(&request));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            // What a driver without `I2C_FUNC_I2C` answers. Not a bus fault.
+            .NOTTY, .OPNOTSUPP, .NOSYS, .INVAL => return Error.Unsupported,
+            else => return Error.ReadFailed,
+        }
     }
 };
 
@@ -194,4 +267,32 @@ fn writeConfig(fd: linux.fd_t, cfg: Config) Error!void {
 fn writeAll(fd: linux.fd_t, bytes: []const u8) Error!void {
     const rc = linux.write(fd, bytes.ptr, bytes.len);
     if (linux.errno(rc) != .SUCCESS or rc != bytes.len) return Error.WriteFailed;
+}
+
+test "a register read is one transaction: a write of the pointer, then a read" {
+    var pointer = [1]u8{reg_conversion};
+    var data = [2]u8{ 0, 0 };
+    const msgs = readMessages(0x48, &pointer, &data);
+
+    // Both halves are addressed to the same chip, and the pointer write has no
+    // STOP after it -- that is the whole point of the pair.
+    try std.testing.expectEqual(@as(u16, 0x48), msgs[0].addr);
+    try std.testing.expectEqual(@as(u16, 0x48), msgs[1].addr);
+
+    try std.testing.expectEqual(@as(u16, 0), msgs[0].flags);
+    try std.testing.expectEqual(@as(u16, 1), msgs[0].len);
+    try std.testing.expectEqual(@as([*]u8, &pointer), msgs[0].buf);
+
+    try std.testing.expectEqual(flag_read, msgs[1].flags);
+    try std.testing.expectEqual(@as(u16, 2), msgs[1].len);
+    try std.testing.expectEqual(@as([*]u8, &data), msgs[1].buf);
+}
+
+test "the message struct matches the layout the kernel reads" {
+    // Not decoration: a wrong offset here is a kernel reading a pointer out of
+    // the padding, which fails as corrupt data rather than as an error.
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(I2cMsg, "addr"));
+    try std.testing.expectEqual(@as(usize, 2), @offsetOf(I2cMsg, "flags"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(I2cMsg, "len"));
+    try std.testing.expectEqual(@sizeOf(usize), @offsetOf(I2cMsg, "buf"));
 }

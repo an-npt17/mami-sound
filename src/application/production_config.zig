@@ -4,30 +4,31 @@ const core = @import("../core/root.zig");
 ///
 /// `deviation` is right where a probe rests somewhere and a touch moves it.
 /// `steady` is right where the electrode floats: the flailing has no rest to
-/// measure from, so what is asked instead is whether the probe has gone still,
-/// and at what level. On the floating rig `deviation` reads a MAD of about 260
-/// counts on probe A, which is a threshold no touch can clear.
+/// measure from, so what is asked instead is whether the probe has gone still.
+/// On the floating rig `deviation` reads a MAD of about 260 counts on probe A,
+/// which is a threshold no touch can clear.
 ///
-/// The floating rig's preset, kept here because the numbers are measured
-/// rather than guessable — plant A's probe clamps to 650-750 and plant B's to
-/// about 1:
+/// The floating rig's preset. `steady` has to be told nothing about where a
+/// held probe sits, which is the point: plant A's probe clamps somewhere near
+/// 660 and plant B's near 1, neither is predictable from one day to the next,
+/// and the model asks how tightly the readings cluster rather than where:
 ///
 ///     pub const touch: core.touch.Config = .{
 ///         .sample_rate = core.sample_rate,
 ///         .poll_frames = core.sensor_frames,
 ///         .model = .steady,
-///         .band_lo = 600,
-///         .band_hi = 800,
-///         .band_lo_bc = -8,
-///         .band_hi_bc = 8,
 ///     };
 ///
-/// `drone.touch_floor` has to move with it. In `steady` the pitch is a level
-/// measured from the bottom of a band a hundred counts wide, so `span` wants
-/// to be that band and the floor is what makes a touch audible at all:
+/// The two thresholds have defaults measured off `touch.csv`; `zig build
+/// replay -- touch.csv --sweep` is how to check them against a fresh capture,
+/// and `--still-range` is how to try a number without a rebuild.
+///
+/// `drone.span` has to move with it. In `steady` the pitch is the level the
+/// probe went still at, so the span wants to be about the range those levels
+/// fall in, and the floor is what makes a touch audible at all:
 ///
 ///     pub const drone: core.noise.Shape = .{
-///         .span = 200,
+///         .span = 1000,
 ///         .touch_floor = 0.6,
 ///         .burst_s = 0.4,
 ///         .glide_s = 4.0,
@@ -42,6 +43,20 @@ pub const touch: core.touch.Config = .{
     .window_bc_ms = 1000.0,
 };
 
+/// The preset with the room's overrides applied. Anything left unset on the
+/// command line keeps the number above, which is the one that was measured.
+pub fn touchWith(
+    model: ?core.touch.Model,
+    still_range: ?i16,
+    still_release: ?i16,
+) core.touch.Config {
+    var cfg = touch;
+    if (model) |chosen| cfg.model = chosen;
+    if (still_range) |counts| cfg.still_range = counts;
+    if (still_release) |counts| cfg.still_release = counts;
+    return cfg;
+}
+
 pub const seed: u64 = 0xC0FFEE;
 
 pub const drone: core.noise.Shape = .{
@@ -50,3 +65,18 @@ pub const drone: core.noise.Shape = .{
     .glide_s = 4.0,
     .release_s = 0.5,
 };
+
+const std = @import("std");
+
+test "an override reaches the config and the rest of the preset stands" {
+    const cfg = touchWith(.steady, 64, null);
+    try std.testing.expectEqual(core.touch.Model.steady, cfg.model);
+    try std.testing.expectEqual(@as(i16, 64), cfg.still_range);
+    // Untouched by the override, so still the measured number.
+    try std.testing.expectEqual(touch.still_release, cfg.still_release);
+    try std.testing.expectEqual(touch.level_bc, cfg.level_bc);
+}
+
+test "no overrides is the preset exactly" {
+    try std.testing.expectEqual(touch, touchWith(null, null, null));
+}

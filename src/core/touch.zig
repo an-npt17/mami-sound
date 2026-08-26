@@ -15,6 +15,7 @@
 //! worked on this rig.
 
 const std = @import("std");
+const spread_mod = @import("spread.zig");
 
 /// The distance between two readings, clamped to what an `i16` can carry.
 ///
@@ -211,39 +212,33 @@ const mad_floor: f32 = 25.0;
 /// quiet, and a rolling median of the flailing is a number about nothing.
 pub const Model = enum { deviation, steady };
 
-/// Where a clamped probe sits, in counts, when a level is worth insisting on.
-/// Unset by default: a probe that has gone still has been taken hold of
-/// whatever level it went still at, and the two probes on the floating rig
-/// clamp to quite different ones — plant A's to 650-750, plant B's to about 1.
+/// How wide the window the `steady` model measures a probe's spread over.
 ///
-/// A band is worth setting when the margin needs widening. Untouched readings
-/// are then thrown out on level before stillness is asked about at all, which
-/// leaves only the stillness of a probe parked inside the band to argue with.
-pub const default_band_lo: ?i16 = null;
-pub const default_band_hi: ?i16 = null;
+/// A second. Long enough that a probe left alone always shows its flailing
+/// inside it, short enough that a hand is heard about a second after it lands
+/// -- and the hold that follows is counted on top.
+pub const default_still_window_ms: f32 = 1000.0;
 
-/// How far a clamped probe may move between readings and still count as still.
-/// In the capture it moves by one count, occasionally seven.
-pub const default_jitter: i16 = 8;
-
-/// The longest stillness prefilter worth running. Odd, because it is a median.
-pub const max_still_median = 9;
-
-/// How many raw readings the stillness test looks at before it decides.
+/// The spread, in counts, at or below which a probe counts as held, and the one
+/// at or above which the touch is over.
 ///
-/// A held probe does not merely wander, it drops out. In the capture, plant A
-/// held at 662 reads 662 for six polls and then throws one or two readings of
-/// 640, 618, 1, or the rail, and comes straight back. Judged on consecutive
-/// raw readings every one of those is a move, and since losing stillness
-/// restarts the run, the longest still run in fifteen minutes of holding was
-/// 24 polls against a hold of 34 — plant A could never latch at all. Probe BC
-/// drops out less and did latch, which is what made the model look
-/// half-working rather than broken.
+/// Two numbers rather than one because a single line chatters: a probe sitting
+/// on it latches and releases on alternate windows, which on plant B is clip
+/// after clip. Between the two the state is whatever it already was.
 ///
-/// A median of five covers the pair of bad readings this rig actually throws,
-/// and it is the trick the baseline already uses: an outlier occupying less
-/// than half the window cannot move the answer. One disables the prefilter.
-pub const default_still_median: u32 = 5;
+/// The gap between them is where the margin lives, and on the capture in
+/// `touch.csv` it is enormous: over a one-second window probe BC spends 19% of
+/// its time under a spread of 8 and 50% of it over a spread of 2048, with only
+/// 3% anywhere between 32 and 512. Anything inside that gap works.
+///
+/// 64 rather than the 128 the gap would also allow, because `zig build replay
+/// -- touch.csv --sweep` shows where the cliff is: every threshold from 4 to
+/// 128 reports the same thing on that capture, 12 to 20 touches on A and 26 to
+/// 37 on BC, and then 1024 reports A latched for 82% of the run, which is a
+/// detector stuck on. Sitting in the middle of the plateau rather than at its
+/// edge costs one episode in nine hundred seconds.
+pub const default_still_range: i16 = 64;
+pub const default_still_release: i16 = 512;
 
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
@@ -255,24 +250,20 @@ pub const Config = struct {
     sample_rate: u32,
     poll_frames: usize,
     model: Model = .deviation,
-    /// The band a clamped probe reads in, and how far it may move between
-    /// readings and still count as clamped. `steady` only.
-    band_lo: ?i16 = default_band_lo,
-    band_hi: ?i16 = default_band_hi,
-    jitter: i16 = default_jitter,
-    /// How many raw readings the stillness test medians over before judging.
-    /// `steady` only.
-    still_median: u32 = default_still_median,
-    /// Probe BC's own band. `null` puts it in A's.
-    ///
-    /// The two probes clamp to different levels on the floating rig: a hand on
-    /// plant A holds its probe at 650-750, a hand on plant B holds BC at about
-    /// 1. Same question, different answer, which is what a band per probe is
-    /// for — and why one band for both cannot work here.
-    band_lo_bc: ?i16 = null,
-    band_hi_bc: ?i16 = null,
     /// How long the stillness must be gone before the touch is. `steady` only.
     drop_ms: f32 = default_drop_ms,
+    /// The window and the two thresholds the `steady` model judges by.
+    /// `steady` only.
+    still_window_ms: f32 = default_still_window_ms,
+    still_range: i16 = default_still_range,
+    still_release: i16 = default_still_release,
+    /// Probe BC's own thresholds. `null` puts it on A's.
+    ///
+    /// The two probes are not equally clean and do not have to be judged
+    /// equally hard: a wrong latch on A moves a drone that was already
+    /// sounding, where a wrong latch on BC starts a recording.
+    still_range_bc: ?i16 = null,
+    still_release_bc: ?i16 = null,
     level: f32 = default_level,
     hold_ms: f32 = default_hold_ms,
     average_ms: f32 = default_average_ms,
@@ -316,10 +307,10 @@ pub const Config = struct {
         var bc = self;
         bc.level = self.level_bc orelse self.level;
         bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
-        if (self.band_lo_bc) |lo| bc.band_lo = lo;
-        if (self.band_hi_bc) |hi| bc.band_hi = hi;
-        bc.band_lo_bc = null;
-        bc.band_hi_bc = null;
+        bc.still_range = self.still_range_bc orelse self.still_range;
+        bc.still_release = self.still_release_bc orelse self.still_release;
+        bc.still_range_bc = null;
+        bc.still_release_bc = null;
         bc.counts = self.counts_bc orelse self.counts;
         bc.window_ms = self.window_bc_ms orelse self.window_ms;
         bc.level_bc = null;
@@ -345,7 +336,8 @@ pub const Detector = struct {
     /// The last score, kept for the log and the status line.
     z: f32,
     /// The last mean, which is what the score and the pitch are both taken
-    /// from.
+    /// from. `deviation` only: the steady model reads neither off an average,
+    /// and the crosstalk floor it feeds is a deviation-model idea too.
     last_mean: i16,
     /// Set while the other probe has this one pulled off its rest. The score is
     /// then measured from where the pull left it, so only a further move counts.
@@ -367,28 +359,18 @@ pub const Detector = struct {
     pulse: bool,
     /// Which question this probe is asked.
     model: Model,
-    /// The band and the jitter allowance, in counts. `steady` only, and the
-    /// band is optional: unset, any level will do so long as it holds still.
-    band_lo: ?i16,
-    band_hi: ?i16,
-    jitter: i16,
     /// Polls of lost stillness that call a touch off, and how many have come
     /// in a row. `steady` only.
     drop: u32,
     dropped: u32,
-    /// The last few raw readings, and how many of them have arrived. The
-    /// median of these is what the stillness test is actually shown, so a
-    /// dropout shorter than half the window never reaches it. `steady` only.
-    still_window: [max_still_median]i16,
-    still_len: u32,
-    still_count: u32,
-    still_head: u32,
-    /// The previous filtered reading, which is what the jitter is measured
-    /// against. `null` before the first. `steady` only.
-    prev_raw: ?i16,
     /// Whether the probe is at rest as this model sees it: back inside the
     /// deviation model's release band, or no longer still in the steady one.
     at_rest: bool,
+    /// How tightly the recent readings cluster, and the two spreads that decide
+    /// what that means. `steady` only.
+    spread: spread_mod.Spread,
+    still_range: i16,
+    still_release: i16,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -411,17 +393,12 @@ pub const Detector = struct {
             .blocked = false,
             .pulse = false,
             .model = cfg.model,
-            .band_lo = cfg.band_lo,
-            .band_hi = cfg.band_hi,
-            .jitter = cfg.jitter,
-            .still_window = undefined,
-            .still_len = std.math.clamp(cfg.still_median, 1, max_still_median),
-            .still_count = 0,
-            .still_head = 0,
             .drop = @max(holdPolls(cfg.drop_ms, cfg.sample_rate, cfg.poll_frames), 1),
             .dropped = 0,
-            .prev_raw = null,
             .at_rest = true,
+            .spread = .init(cfg.still_window_ms, cfg.sample_rate, cfg.poll_frames),
+            .still_range = cfg.still_range,
+            .still_release = cfg.still_release,
         };
     }
 
@@ -447,11 +424,11 @@ pub const Detector = struct {
     /// drone's pitch is mapped from and a pitch has no sign.
     ///
     /// In the steady model there is no rest to be far from, so what the pitch
-    /// gets instead is the level the probe went still at, measured from the
-    /// bottom of the band where there is one and from zero where there is not.
-    /// A held probe moves by five to nine counts against a jitter allowance of
-    /// eight, so `--pitch-span` wants to be about that much travel and the
-    /// pitch will wander inside it on its own.
+    /// gets instead is the level the probe went still at, whatever that turned
+    /// out to be. The model is deliberately told nothing about where a held
+    /// probe sits, so the pitch is read off the probe rather than off a band --
+    /// and a probe clamping at 1 one day and 660 the next is two different
+    /// pitches, which is the rig being honest rather than a fault.
     pub fn deviation(self: *const Detector) i16 {
         return switch (self.model) {
             .deviation => clampedAbsDiff(self.last_mean, self.base()),
@@ -460,85 +437,63 @@ pub const Detector = struct {
             // the last touch for as long as the rig ran, and the drone would
             // never fall home — the release would be a gate closing over a
             // pitch that never moved.
-            .steady => if (self.on)
-                @max(self.last_mean - (self.band_lo orelse 0), 0)
-            else
-                0,
+            // Nobody on it is no pitch at all. Without this the drone would
+            // keep reporting the level of the last touch for as long as the rig
+            // ran and never fall home -- the release would be a gate closing
+            // over a pitch that never moved.
+            .steady => if (self.on) @max(self.spread.level, 0) else 0,
         };
-    }
-
-    /// This poll's reading with the rig's dropouts taken out of it: the median
-    /// of the last few raw readings.
-    ///
-    /// Only the stillness test and the pitch see this. Nothing is averaged —
-    /// an average of a clamped level and a rail is a number that was never
-    /// read, where the median is always one of the readings that arrived.
-    fn stillValue(self: *Detector, raw: i16) i16 {
-        if (self.still_len <= 1) return raw;
-
-        self.still_window[self.still_head] = raw;
-        self.still_head = (self.still_head + 1) % self.still_len;
-        if (self.still_count < self.still_len) self.still_count += 1;
-
-        var scratch: [max_still_median]i16 = undefined;
-        const n = self.still_count;
-        @memcpy(scratch[0..n], self.still_window[0..n]);
-        std.mem.sort(i16, scratch[0..n], {}, std.sort.asc(i16));
-        return scratch[n / 2];
-    }
-
-    /// Whether this reading is a clamped probe: inside the band and no further
-    /// than the jitter allowance from the one before it.
-    fn isStill(self: *const Detector, raw: i16) bool {
-        if (self.band_lo) |lo| if (raw < lo) return false;
-        if (self.band_hi) |hi| if (raw > hi) return false;
-        const prev = self.prev_raw orelse return true;
-        return clampedAbsDiff(raw, prev) <= self.jitter;
     }
 
     /// One poll of the steady model, which sets `on` and `at_rest`.
     ///
-    /// Judged on the raw reading passed through a median, never on the mean.
-    /// The mean is an average of the flailing, which is a plausible-looking
-    /// number about nothing, and averaging is exactly what destroys the
-    /// stillness that is the signal here. A median is not an average: it only
-    /// ever returns a reading that arrived, so it drops the rig's dropouts
-    /// without inventing a level between them. The mean is still kept, from
-    /// the still readings only, because the pitch wants something that does
-    /// not step and holds through a dropout.
-    fn stepSteady(self: *Detector, raw: i16) void {
-        const value = self.stillValue(raw);
-        const still = self.isStill(value);
-        self.prev_raw = value;
-        self.at_rest = !still;
-
-        // The score has no meaning here; what the log and the status line get
-        // instead is the move that was judged, in jitter allowances.
-        self.z = @as(f32, @floatFromInt(self.deviation())) /
-            @as(f32, @floatFromInt(@max(self.jitter, 1)));
-
-        if (self.blocked) {
-            if (self.at_rest) self.blocked = false;
-            self.count = 0;
-            self.on = false;
-            return;
+    /// Judged on how tightly the last second of readings cluster, never on the
+    /// mean and never on consecutive readings. The mean is an average of the
+    /// flailing, a plausible-looking number about nothing, and averaging is
+    /// what destroys the stillness that is the signal here. Consecutive
+    /// readings are worse: a held probe on this rig drops out every few polls,
+    /// and a test that restarts its run on every dropout never accumulates
+    /// enough of one -- which is why plant A could not latch at all.
+    ///
+    /// Returns false while the window has less than its full length behind it,
+    /// which is the one case this model cannot answer.
+    fn stepSteady(self: *Detector, raw: i16) bool {
+        self.spread.push(raw);
+        if (!self.spread.ready()) {
+            self.reset();
+            return false;
         }
 
-        // The release leaks rather than counting a run: a flailing probe throws
-        // the odd repeated reading, and a release that demanded consecutive
-        // movement would have those reset it every time — a touch, once
-        // latched, would never end. Leaking also costs a dropout inside a real
-        // touch nothing, because the still readings either side pay it back.
-        if (still) {
-            self.last_mean = self.mean.push(value);
-            self.dropped -|= 1;
+        const range = self.spread.range;
+
+        // No score to report in this model; what the log gets instead is the
+        // spread in latch-widths, so a number under one is a probe being held.
+        self.z = @as(f32, @floatFromInt(range)) /
+            @as(f32, @floatFromInt(@max(self.still_range, 1)));
+
+        const held = range <= self.still_range;
+        const loose = range >= self.still_release;
+        self.at_rest = loose;
+
+        if (self.blocked) {
+            if (loose) self.blocked = false;
+            self.count = 0;
+            self.on = false;
+            return false;
+        }
+
+        // Between the two thresholds nothing moves. That gap is the whole
+        // reason there are two of them.
+        if (held) {
             self.count = @min(self.count + 1, self.hold);
+            self.dropped -|= 1;
             if (self.count == self.hold) self.on = true;
-        } else {
+        } else if (loose) {
             self.count = 0;
             self.dropped = @min(self.dropped + 1, self.drop);
             if (self.dropped == self.drop) self.on = false;
         }
+        return true;
     }
 
     /// One poll of the deviation model, which sets `on` and `at_rest`.
@@ -610,7 +565,7 @@ pub const Detector = struct {
 
         switch (self.model) {
             .deviation => if (!self.stepDeviation(raw)) return false,
-            .steady => self.stepSteady(raw),
+            .steady => if (!self.stepSteady(raw)) return false,
         }
 
         // The tap layer is the same question of either model: did the state go
@@ -747,77 +702,71 @@ fn steadyConfig() Config {
         .sample_rate = 44100,
         .poll_frames = sensor_poll_frames,
         .model = .steady,
-        .band_lo = 600,
-        .band_hi = 800,
     };
 }
+
+/// A probe left alone on the floating rig: flipping between a rail and a zero,
+/// which is what the Pi's journal shows probe A doing for minutes at a time.
+fn flailing(poll: usize) i16 {
+    return switch (poll % 4) {
+        0, 2 => -4096,
+        1 => 1,
+        else => 2,
+    };
+}
+
+/// Polls enough to fill the one-second window and satisfy the hold on top.
+const steady_warmup: usize = 800;
 
 /// The poll size the engine runs the detector at, which is what makes the hold
 /// in these tests the same number of polls as it is in the room.
 const sensor_poll_frames: usize = 128;
 
-test "the steady model latches through the dropouts a held probe throws" {
-    var detector: Detector = .init(steadyConfig());
-
-    var latched = false;
-    for (0..400) |poll| {
-        _ = detector.update(heldPlantA(poll));
-        if (detector.on) latched = true;
+test "the steady model latches a probe held at any level at all" {
+    // Two levels a band would have to be told about in advance, one of which
+    // is also the commonest corrupt reading this rig throws. Neither is
+    // configured anywhere, and both must latch.
+    for ([_]i16{ 663, 1 }) |level| {
+        var detector: Detector = .init(steadyConfig());
+        for (0..steady_warmup) |_| _ = detector.update(level);
+        try std.testing.expect(detector.on);
     }
+}
 
-    try std.testing.expect(latched);
+test "the steady model never latches a flailing probe" {
+    var detector: Detector = .init(steadyConfig());
+    for (0..steady_warmup) |poll| {
+        _ = detector.update(flailing(poll));
+        try std.testing.expect(!detector.on);
+    }
+}
+
+test "the steady model latches through the dropouts a held probe throws" {
+    // The case the consecutive-jitter test could never pass: six polls clamped,
+    // then one or two readings from nowhere, over and over. Judged poll against
+    // poll, every dropout restarted the run and the longest run the rig offered
+    // was shorter than the hold.
+    var detector: Detector = .init(steadyConfig());
+    for (0..steady_warmup) |poll| _ = detector.update(heldPlantA(poll));
     try std.testing.expect(detector.on);
 }
 
-test "without the median one dropout every few polls stops the latch outright" {
-    // What this model did before the prefilter, and why plant A never sounded
-    // while plant BC — which drops out less — did. The hold is 34 polls and
-    // the longest run the rig ever offers is 24.
-    var cfg = steadyConfig();
-    cfg.still_median = 1;
-    var detector: Detector = .init(cfg);
-
-    for (0..400) |poll| _ = detector.update(heldPlantA(poll));
-
-    try std.testing.expect(!detector.on);
-}
-
-test "the steady model still ignores a probe held still outside its band" {
+test "the steady model lets go once the probe is left alone again" {
     var detector: Detector = .init(steadyConfig());
-
-    // Probe BC's clamped level, fed to a detector banded for probe A. The
-    // median makes a flailing probe look still, so the band is what is left
-    // holding this apart from a touch.
-    for (0..400) |_| _ = detector.update(1);
-
-    try std.testing.expect(!detector.on);
-}
-
-test "the steady model lets go once the probe leaves the band" {
-    var detector: Detector = .init(steadyConfig());
-    for (0..400) |poll| _ = detector.update(heldPlantA(poll));
+    for (0..steady_warmup) |_| _ = detector.update(663);
     try std.testing.expect(detector.on);
 
-    // The hand comes off and the electrode floats again.
-    for (0..200) |poll| _ = detector.update(if (poll % 2 == 0) @as(i16, 2047) else -4095);
-
+    for (0..steady_warmup) |poll| _ = detector.update(flailing(poll));
     try std.testing.expect(!detector.on);
 }
 
-test "the held level reaches the pitch, measured from the bottom of the band" {
+test "the pitch follows the level the probe went still at, not a band" {
     var detector: Detector = .init(steadyConfig());
-    for (0..400) |poll| _ = detector.update(heldPlantA(poll));
+    for (0..steady_warmup) |_| _ = detector.update(663);
+    try std.testing.expectEqual(@as(i16, 663), detector.deviation());
 
-    // 662 inside a band starting at 600. The dropouts must not drag it down:
-    // the mean only ever sees readings the median called still.
-    try std.testing.expect(detector.on);
-    try std.testing.expectEqual(@as(i16, 62), detector.deviation());
-}
-
-test "a probe with no pitch reports none once the touch is over" {
-    var detector: Detector = .init(steadyConfig());
-    for (0..400) |poll| _ = detector.update(heldPlantA(poll));
-    for (0..200) |poll| _ = detector.update(if (poll % 2 == 0) @as(i16, 2047) else -4095);
-
+    // A hand off the plant is no pitch at all, however the probe was reading
+    // when it left.
+    for (0..steady_warmup) |poll| _ = detector.update(flailing(poll));
     try std.testing.expectEqual(@as(i16, 0), detector.deviation());
 }
