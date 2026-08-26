@@ -73,6 +73,26 @@ pub fn list(
     return paths.toOwnedSlice(gpa);
 }
 
+/// Every clip in `dir_path`, sorted by name.
+///
+/// Directory order is whatever the filesystem hands back, so a caller that
+/// wants "the first clip" would otherwise be depending on the disk. Sorting
+/// makes it depend on the folder's contents instead -- which is still the
+/// room's to change, but at least it is the same answer twice running.
+///
+/// This is what the tests use rather than naming a file: the stems have been
+/// renamed once already, and a test that breaks when somebody tidies a folder
+/// is a test that will be deleted rather than fixed.
+pub fn listSorted(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![][]u8 {
+    const paths = try list(gpa, io, dir_path);
+    std.mem.sort([]u8, paths, {}, lessByName);
+    return paths;
+}
+
+fn lessByName(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 pub fn freeList(gpa: std.mem.Allocator, paths: [][]u8) void {
     for (paths) |path| gpa.free(path);
     gpa.free(paths);

@@ -27,6 +27,12 @@ pub const Adapter = struct {
     /// only from `render`.
     head: []const f32,
     head_cursor: usize,
+    /// The generation the worker has finished decoding. While this trails
+    /// `request_generation` a clip is still being fetched, which is what makes
+    /// `sounding` exact rather than a guess from an empty ring: a worker that
+    /// has fallen behind mid-clip leaves the ring empty for a moment, and a
+    /// touch landing in that moment must not read as the clip having ended.
+    completed_generation: std.atomic.Value(u64),
     shutdown: std.atomic.Value(bool),
     child_pid: std.atomic.Value(i32),
     thread: ?std.Thread,
@@ -49,6 +55,7 @@ pub const Adapter = struct {
             .head_cursor = 0,
             .requested_index = .init(none_index),
             .request_generation = .init(0),
+            .completed_generation = .init(0),
             .shutdown = .init(false),
             .child_pid = .init(-1),
             .thread = null,
@@ -88,6 +95,7 @@ pub const Adapter = struct {
         return .{
             .context = self,
             .render_fn = renderPort,
+            .sounding_fn = soundingPort,
         };
     }
 
@@ -99,6 +107,20 @@ pub const Adapter = struct {
         self.heads.deinit(self.gpa);
         self.ring.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Whether a clip is still playing: its head not yet spent, or audio still
+    /// queued, or the worker still fetching more of it.
+    pub fn sounding(self: *Adapter) bool {
+        if (self.head_cursor < self.head.len) return true;
+        if (self.ring.pending() != 0) return true;
+        return self.completed_generation.load(.acquire) !=
+            self.request_generation.load(.acquire);
+    }
+
+    fn soundingPort(context: *anyopaque) bool {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        return self.sounding();
     }
 
     fn renderPort(context: *anyopaque, out: []f32, request: ?usize) void {
@@ -149,8 +171,13 @@ pub const Adapter = struct {
             handled_generation = generation;
 
             const index = self.requested_index.load(.acquire);
-            if (index >= self.paths.len) continue;
-            self.decodePath(self.paths[index], generation, self.heads.get(index).len);
+            if (index < self.paths.len) {
+                self.decodePath(self.paths[index], generation, self.heads.get(index).len);
+            }
+            // Marked whatever happened, including a clip that failed to decode:
+            // a generation nobody will ever finish would leave plant B reading
+            // as sounding for the rest of the run and deaf to every touch.
+            self.completed_generation.store(generation, .release);
         }
     }
 

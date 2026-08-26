@@ -209,7 +209,7 @@ const mad_floor: f32 = 25.0;
 /// moved from its own recent past. On the second the electrode floats: nobody
 /// on it and it flails over the whole range and slams the rails, and a hand
 /// clamps it to about 660 counts and holds it there. There the touch is the
-/// quiet, and a rolling median of the flailing is a number about nothing.
+/// stillness, and a rolling median of the flailing is a number about nothing.
 pub const Model = enum { deviation, steady };
 
 /// How wide the window the `steady` model measures a probe's spread over.

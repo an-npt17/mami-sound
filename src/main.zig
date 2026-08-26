@@ -156,7 +156,7 @@ fn runComposition(
         sink_port,
         status.port(),
         stream_port,
-        clips.paths.len,
+        clips.folders,
         shuffle.random(),
     );
     std.debug.print("loading: complete\n", .{});

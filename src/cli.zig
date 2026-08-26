@@ -94,7 +94,9 @@ fn parseCounts(text: []const u8) ?i16 {
 }
 
 pub const usage =
-    \\usage: mami_sound [PLANTS] [--device=NAME] [--plant-b=POOL] [--test-random-probe]
+    \\usage: mami_sound [PLANTS] [--device=NAME] [--plant-b=POOL]
+    \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
+    \\                  [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A, the sensor-driven drone
@@ -112,6 +114,18 @@ pub const usage =
     \\  piano  ./EPiano Stems/
     \\Left off, plant B plays the interviews and field records as usual.
     \\Plant A's drone is generated either way and is not affected.
+    \\
+    \\--touch-model picks what the detector asks each probe:
+    \\  deviation  how far the probe has moved from its own recent past
+    \\  steady     how tightly the last second of readings clusters, at any level
+    \\Use `steady` on a rig whose probes clamp to a level you cannot predict.
+    \\
+    \\--still-range and --still-release are that model's two thresholds, in
+    \\counts: at or below the range the probe is being held, at or above the
+    \\release the touch is over, and between them nothing changes. Defaults are
+    \\64 and 512. Raise the range if touches are missed, lower it if the rig
+    \\latches on its own. `zig build replay -- CAPTURE --sweep` picks them from
+    \\a recording rather than from the room.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
     \\
@@ -156,7 +170,7 @@ test "an unset model leaves the compiled-in preset alone" {
     try std.testing.expect(opts.still_range == null);
 }
 
-test "the quiet thresholds take counts, and refuse what is not one" {
+test "the still thresholds take counts, and refuse what is not one" {
     const opts = try parse(&.{ "--still-range=64", "--still-release=900" });
     try std.testing.expectEqual(@as(i16, 64), opts.still_range.?);
     try std.testing.expectEqual(@as(i16, 900), opts.still_release.?);

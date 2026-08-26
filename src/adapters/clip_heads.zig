@@ -20,6 +20,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const core = @import("../core/root.zig");
+const library = @import("library.zig");
 
 /// How much of each clip is kept.
 ///
@@ -242,10 +243,11 @@ test "heads are handed out by index" {
 
 test "every clip in a pool gets its own head" {
     const gpa = std.testing.allocator;
-    var heads = try decode(gpa, std.testing.io, &.{
-        "Bell Stems/Bell_01.wav",
-        "Bell Stems/Bell_02.wav",
-    }, .unlimited, 44100);
+    const stems = try library.listSorted(gpa, std.testing.io, "Bell Stems");
+    defer library.freeList(gpa, stems);
+    try std.testing.expect(stems.len >= 2);
+
+    var heads = try decode(gpa, std.testing.io, &.{ stems[0], stems[1] }, .unlimited, 44100);
     defer heads.deinit(gpa);
 
     const want: usize = @intFromFloat(head_s * 44100.0);
@@ -258,8 +260,11 @@ test "every clip in a pool gets its own head" {
 
 test "a capped pool is pre-decoded whole, not just to the head length" {
     const gpa = std.testing.allocator;
+    const stems = try library.listSorted(gpa, std.testing.io, "Bell Stems");
+    defer library.freeList(gpa, stems);
+
     const limit: core.plant_b.Limit = .forPool(.bell, 44100);
-    var heads = try decode(gpa, std.testing.io, &.{"Bell Stems/Bell_01.wav"}, limit, 44100);
+    var heads = try decode(gpa, std.testing.io, &.{stems[0]}, limit, 44100);
     defer heads.deinit(gpa);
 
     // The whole allowance, so the streamer has nothing left to fetch and the

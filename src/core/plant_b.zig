@@ -107,36 +107,98 @@ pub const Limit = struct {
     }
 };
 
+/// How long a clip is protected from the next touch.
+///
+/// A hand on plant B while a clip is running is somebody enjoying it or
+/// somebody brushing past, and neither is a request to hear the first four
+/// seconds of something else. Ten seconds is long enough that the clip has
+/// established itself and short enough that a room which has heard enough can
+/// move it on.
+///
+/// Counted from the clip starting, and only while it is still sounding: a stem
+/// that has already finished its four seconds answers the next touch at once
+/// rather than sulking for another six.
+pub const open_after_s: f32 = 10.0;
+
+/// Which clip a touch on plant B starts, and whether a touch starts one at all.
 pub const ClipSelector = struct {
-    path_count: usize,
+    /// Which folder each clip came from, by index into the pool. The pool is
+    /// flat -- one list of paths -- so this is what is left of the fact that it
+    /// was built from two directories.
+    folders: []const u8,
     random: std.Random,
     previous_touch: bool,
+    /// The folder the clip now playing was drawn from, so the next one can be
+    /// drawn from the other. `null` before anything has played.
+    last_folder: ?u8,
+    /// Frames since the last clip was started, and how many make ten seconds.
+    frames_since_start: u64,
+    open_frames: u64,
 
-    pub fn init(path_count: usize, random: std.Random) ClipSelector {
+    pub fn init(folders: []const u8, sample_rate: u32, random: std.Random) ClipSelector {
         return .{
-            .path_count = path_count,
+            .folders = folders,
             .random = random,
             .previous_touch = false,
+            .last_folder = null,
+            .frames_since_start = 0,
+            .open_frames = @intFromFloat(open_after_s * @as(f32, @floatFromInt(sample_rate))),
         };
     }
 
-    pub fn start(self: *ClipSelector, touched: bool) ?usize {
+    /// One poll's answer: the clip to start, or nothing.
+    ///
+    /// `sounding` is whether plant B is still playing; `frames` is how much
+    /// audio this poll covers.
+    pub fn start(
+        self: *ClipSelector,
+        touched: bool,
+        sounding: bool,
+        frames: usize,
+    ) ?usize {
+        self.frames_since_start +|= frames;
+
         const rising = touched and !self.previous_touch;
         self.previous_touch = touched;
-        if (!rising or self.path_count == 0) return null;
-        return self.random.uintLessThan(usize, self.path_count);
+        if (!rising or self.folders.len == 0) return null;
+
+        // A clip still inside its ten seconds is left alone. This is the whole
+        // of the fix for a plant that answered every stray edge with the first
+        // second of a new recording.
+        if (sounding and self.frames_since_start < self.open_frames) return null;
+
+        const index = self.pick();
+        self.last_folder = self.folders[index];
+        self.frames_since_start = 0;
+        return index;
+    }
+
+    /// A clip from whichever folder the last one did not come from.
+    ///
+    /// A pool built from one folder -- either stem pool -- has no other folder
+    /// to go to, so it draws from the whole pool as it always did.
+    fn pick(self: *ClipSelector) usize {
+        const wanted = self.countOther();
+        if (wanted == 0) return self.random.uintLessThan(usize, self.folders.len);
+
+        var remaining = self.random.uintLessThan(usize, wanted);
+        for (self.folders, 0..) |folder, index| {
+            if (self.last_folder) |last| if (folder == last) continue;
+            if (remaining == 0) return index;
+            remaining -= 1;
+        }
+        unreachable;
+    }
+
+    fn countOther(self: *const ClipSelector) usize {
+        const last = self.last_folder orelse return self.folders.len;
+        var count: usize = 0;
+        for (self.folders) |folder| {
+            if (folder != last) count += 1;
+        }
+        return count;
     }
 };
-
-test "selector emits one path request per touch edge" {
-    var prng = std.Random.DefaultPrng.init(1);
-    var selector = ClipSelector.init(2, prng.random());
-    try std.testing.expect(selector.start(false) == null);
-    try std.testing.expect(selector.start(true) != null);
-    try std.testing.expect(selector.start(true) == null);
-    try std.testing.expect(selector.start(false) == null);
-    try std.testing.expect(selector.start(true) != null);
-}
 
 test "the named pools are the two the command line offers" {
     try std.testing.expectEqual(Pool.bell, try Pool.parse("bell"));
@@ -215,4 +277,79 @@ test "the fade survives being split across reads" {
     _ = split.take(runs[5..8]);
 
     try std.testing.expectEqualSlices(f32, &one_run, &runs);
+}
+
+/// A pool shaped like the recordings: two folders read as one flat list.
+const two_folders = [_]u8{ 0, 0, 0, 1, 1, 1 };
+
+/// The poll the engine runs the selector at, and how many of them a second is.
+const poll_frames: usize = 128;
+const polls_per_s: usize = 44100 / poll_frames;
+
+fn testSelector(folders: []const u8, seed: u64) ClipSelector {
+    const State = struct {
+        var prng: std.Random.DefaultPrng = undefined;
+    };
+    State.prng = .init(seed);
+    return ClipSelector.init(folders, 44100, State.prng.random());
+}
+
+test "a touch starts a clip when plant B is silent" {
+    var selector = testSelector(&two_folders, 1);
+    try std.testing.expect(selector.start(false, false, poll_frames) == null);
+    try std.testing.expect(selector.start(true, false, poll_frames) != null);
+}
+
+test "a touch inside the clip's ten seconds is ignored" {
+    var selector = testSelector(&two_folders, 1);
+    try std.testing.expect(selector.start(true, false, poll_frames) != null);
+
+    // Nine seconds of somebody leaning on the plant, touching it over and over.
+    // The clip must survive every one of those edges.
+    for (0..9 * polls_per_s) |poll| {
+        const touched = poll % 2 == 0;
+        try std.testing.expect(selector.start(touched, true, poll_frames) == null);
+    }
+}
+
+test "a touch past the ten seconds cuts in" {
+    var selector = testSelector(&two_folders, 1);
+    _ = selector.start(true, false, poll_frames);
+
+    for (0..11 * polls_per_s) |_| {
+        try std.testing.expect(selector.start(false, true, poll_frames) == null);
+    }
+    try std.testing.expect(selector.start(true, true, poll_frames) != null);
+}
+
+test "a clip that has already finished answers the next touch at once" {
+    // What keeps a four-second stem responsive: the ten seconds only protect a
+    // clip that is still sounding.
+    var selector = testSelector(&two_folders, 1);
+    _ = selector.start(true, false, poll_frames);
+    _ = selector.start(false, false, poll_frames);
+    try std.testing.expect(selector.start(true, false, poll_frames) != null);
+}
+
+test "consecutive clips come from alternating folders" {
+    var selector = testSelector(&two_folders, 7);
+    var previous: ?u8 = null;
+    for (0..8) |_| {
+        const index = selector.start(true, false, poll_frames).?;
+        const folder = two_folders[index];
+        if (previous) |last| try std.testing.expect(folder != last);
+        previous = folder;
+        _ = selector.start(false, false, poll_frames);
+    }
+}
+
+test "a pool built from one folder still draws from all of it" {
+    // Either stem pool. There is no other folder to alternate with, and the
+    // plant must not fall silent for want of one.
+    const one_folder = [_]u8{ 0, 0, 0, 0 };
+    var selector = testSelector(&one_folder, 3);
+    for (0..8) |_| {
+        try std.testing.expect(selector.start(true, false, poll_frames) != null);
+        _ = selector.start(false, false, poll_frames);
+    }
 }

@@ -5,6 +5,13 @@ const library = @import("library.zig");
 
 pub const LoadedPool = struct {
     paths: []const []const u8,
+    /// Which directory each path came from, by index into `directoriesFor`.
+    ///
+    /// The pool is flat so a clip can be drawn from both folders without either
+    /// getting its own turn, and this is what is left of the fact that there
+    /// were two. Plant B alternates on it: the next clip comes from whichever
+    /// folder the last one did not.
+    folders: []const u8 = &.{},
     path_capacity: usize = 0,
 
     pub const empty: LoadedPool = .{ .paths = &.{} };
@@ -14,9 +21,14 @@ pub const LoadedPool = struct {
         if (self.path_capacity != 0) {
             gpa.free(@constCast(self.paths.ptr[0..self.path_capacity]));
         }
+        if (self.folders.len != 0) gpa.free(@constCast(self.folders));
         self.* = .empty;
     }
 };
+
+/// The most folders a pool is made of. Two, and the array below is sized for
+/// twice that so adding a third is a change to `directoriesFor` alone.
+const max_directories = 4;
 
 fn nextCapacity(current: usize, needed: usize) usize {
     if (current >= needed) return current;
@@ -86,15 +98,30 @@ pub fn loadPlantB(
     which: core.plant_b.Pool,
 ) !LoadedPool {
     const directories = directoriesFor(which);
+    std.debug.assert(directories.len <= max_directories);
+
     var pool: LoadedPool = .empty;
     errdefer pool.deinit(gpa);
 
-    for (directories) |directory| {
+    // Where each directory's clips stop, so the folder each path came from can
+    // be written down once the pool has stopped moving under `appendPath`.
+    var ends: [max_directories]usize = undefined;
+
+    for (directories, 0..) |directory, folder| {
         const paths = try library.list(gpa, io, directory);
         defer library.freeList(gpa, paths);
 
         for (paths) |path| try appendPath(gpa, &pool, path);
+        ends[folder] = pool.paths.len;
     }
+
+    const folders = try gpa.alloc(u8, pool.paths.len);
+    var start: usize = 0;
+    for (ends[0..directories.len], 0..) |end, folder| {
+        for (folders[start..end]) |*of| of.* = @intCast(folder);
+        start = end;
+    }
+    pool.folders = folders;
 
     return pool;
 }
@@ -109,4 +136,38 @@ test "each pool names the folders it is made of" {
 
     try std.testing.expectEqual(@as(usize, 1), directoriesFor(.piano).len);
     try std.testing.expectEqualStrings("EPiano Stems", directoriesFor(.piano)[0]);
+}
+
+test "the pool remembers which folder each clip came from" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var pool = try loadPlantB(gpa, io, .recordings);
+    defer pool.deinit(gpa);
+
+    try std.testing.expectEqual(pool.paths.len, pool.folders.len);
+
+    const directories = directoriesFor(.recordings);
+    for (directories, 0..) |directory, folder| {
+        const listed = try library.list(gpa, io, directory);
+        defer library.freeList(gpa, listed);
+
+        var counted: usize = 0;
+        for (pool.folders) |of| {
+            if (of == folder) counted += 1;
+        }
+        try std.testing.expectEqual(listed.len, counted);
+    }
+
+    // Both folders present, or there is nothing for plant B to alternate with.
+    try std.testing.expect(pool.folders[0] != pool.folders[pool.folders.len - 1]);
+}
+
+test "a one-folder pool marks every clip as the same folder" {
+    const gpa = std.testing.allocator;
+    var pool = try loadPlantB(gpa, std.testing.io, .bell);
+    defer pool.deinit(gpa);
+
+    try std.testing.expect(pool.folders.len > 0);
+    for (pool.folders) |folder| try std.testing.expectEqual(@as(u8, 0), folder);
 }

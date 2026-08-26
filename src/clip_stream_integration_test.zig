@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core/root.zig");
 const clip_heads = @import("adapters/clip_heads.zig");
+const library = @import("adapters/library.zig");
 const clip_stream = @import("adapters/clip_stream.zig");
 
 test "worker streams a checked-in clip without blocking the consumer" {
@@ -82,10 +83,13 @@ test "a capped touch plays its allowance and then stops on its own" {
     const sample_rate = 44100;
     const limit: core.plant_b.Limit = .forPool(.bell, sample_rate);
 
+    const stems = try library.listSorted(std.testing.allocator, std.testing.io, "Bell Stems");
+    defer library.freeList(std.testing.allocator, stems);
+
     var adapter = try clip_stream.Adapter.init(
         std.testing.io,
         std.testing.allocator,
-        &.{"Bell Stems/Bell_01.wav"},
+        &.{stems[0]},
         limit,
     );
     defer adapter.deinit();
@@ -124,10 +128,13 @@ test "a capped touch plays its allowance and then stops on its own" {
     try std.testing.expect(heard > limit.total * 9 / 10);
 }
 test "a primed head sounds on the very first render after a touch" {
+    const stems = try library.listSorted(std.testing.allocator, std.testing.io, "Bell Stems");
+    defer library.freeList(std.testing.allocator, stems);
+
     var adapter = try clip_stream.Adapter.init(
         std.testing.io,
         std.testing.allocator,
-        &.{"Bell Stems/Bell_01.wav"},
+        &.{stems[0]},
         .unlimited,
     );
     defer adapter.deinit();
@@ -148,7 +155,9 @@ test "a primed head sounds on the very first render after a touch" {
 test "the stream picks the clip up exactly where the head stops" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const path = "Bell Stems/Bell_01.wav";
+    const stems = try library.listSorted(gpa, io, "Bell Stems");
+    defer library.freeList(gpa, stems);
+    const path = stems[0];
 
     // A hundred milliseconds past the head, which is where a seek-based seam
     // would show up as a repeat or a gap.
@@ -196,5 +205,110 @@ test "the stream picks the clip up exactly where the head stops" {
             });
             return err;
         };
+    }
+}
+
+test "a clip reads as sounding until it has actually run out" {
+    // What the ten-second guard is asked. A ring that has momentarily run dry
+    // mid-clip must still read as sounding, or a touch landing in that gap
+    // restarts the recording -- which is the fault the room hears as plant B
+    // playing one second of something and stopping.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const limit: core.plant_b.Limit = .forPool(.bell, 44100);
+
+    const stems = try library.listSorted(gpa, io, "Bell Stems");
+    defer library.freeList(gpa, stems);
+
+    var adapter = try clip_stream.Adapter.init(io, gpa, &.{stems[0]}, limit);
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    try std.testing.expect(!port.sounding());
+
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+    try std.testing.expect(port.sounding());
+
+    // Drain past the four seconds the stem is allowed. It must go quiet on its
+    // own and say so.
+    var drained: usize = 0;
+    while (drained < 44100 * 6) : (drained += block.len) {
+        @memset(&block, 0);
+        port.render(&block, null);
+    }
+    try std.testing.expect(!port.sounding());
+}
+
+test "a stem plays between three and five seconds and then stops" {
+    // The room's requirement for --plant-b=bell and --plant-b=piano: a touch is
+    // answered by a note, not by a recording that outstays it.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    for ([_]core.plant_b.Pool{ .bell, .piano }) |pool| {
+        const directory = if (pool == .bell) "Bell Stems" else "EPiano Stems";
+        const stems = try library.listSorted(gpa, io, directory);
+        defer library.freeList(gpa, stems);
+
+        const limit: core.plant_b.Limit = .forPool(pool, 44100);
+        var adapter = try clip_stream.Adapter.init(io, gpa, &.{stems[0]}, limit);
+        defer adapter.deinit();
+        try adapter.primeHeads();
+        try adapter.start();
+
+        var port = adapter.port();
+        var block = [_]f32{0.0} ** 512;
+        port.render(&block, 0);
+
+        // Count what actually arrives rather than trusting the allowance: the
+        // fade is applied to real samples and the cut has to land on one.
+        var sounded: usize = 0;
+        var drained: usize = 0;
+        while (drained < 44100 * 8) : (drained += block.len) {
+            @memset(&block, 0);
+            port.render(&block, null);
+            for (block) |sample| {
+                if (sample != 0.0) sounded += 1;
+            }
+        }
+
+        const seconds = @as(f32, @floatFromInt(sounded)) / 44100.0;
+        try std.testing.expect(seconds >= 3.0);
+        try std.testing.expect(seconds <= 5.0);
+        try std.testing.expect(!port.sounding());
+    }
+}
+
+test "an uncapped clip keeps sounding once the head has handed over" {
+    // The head is two seconds; a recording runs for minutes. Past the seam the
+    // ring is what is playing, and the guard has to keep reading it as a clip
+    // in progress rather than as one that ended at the head.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var adapter = try clip_stream.Adapter.init(
+        io,
+        gpa,
+        &.{"field records/chum giuoc.mp3"},
+        .unlimited,
+    );
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+
+    // Four seconds, which is twice the head. Sounding must not drop once.
+    var drained: usize = 0;
+    while (drained < 44100 * 4) : (drained += block.len) {
+        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+        @memset(&block, 0);
+        port.render(&block, null);
+        try std.testing.expect(port.sounding());
     }
 }

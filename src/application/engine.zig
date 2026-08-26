@@ -24,7 +24,9 @@ pub const Engine = struct {
         sink: ports.AudioSink,
         status: ports.StatusSink,
         clip_stream: ports.ClipStream,
-        clip_count: usize,
+        /// Which folder each clip in the pool came from, so a touch can move to
+        /// the other one.
+        clip_folders: []const u8,
         random: std.Random,
     ) Engine {
         return .{
@@ -38,7 +40,7 @@ pub const Engine = struct {
                 production_config.seed,
                 production_config.drone,
             ),
-            .plant_b = core.plant_b.ClipSelector.init(clip_count, random),
+            .plant_b = core.plant_b.ClipSelector.init(clip_folders, core.sample_rate, random),
             .clip_stream = clip_stream,
             .block = undefined,
             .pcm = undefined,
@@ -68,7 +70,13 @@ pub const Engine = struct {
             if (self.selection[0]) {
                 self.drone.render(piece, self.machine.a.deviation(), touched[0]);
             }
-            const request = if (self.selection[1]) self.plant_b.start(touched[1]) else null;
+            // Asked before rendering, so the answer is about the clip already
+            // running rather than about the one this poll might start.
+            const sounding = self.clip_stream.sounding();
+            const request = if (self.selection[1])
+                self.plant_b.start(touched[1], sounding, core.sensor_frames)
+            else
+                null;
             self.clip_stream.render(piece, request);
         }
 
@@ -147,6 +155,9 @@ const FakeSink = struct {
 
 fn ignoreStatus(_: *anyopaque, _: ports.Snapshot) void {}
 fn ignoreClips(_: *anyopaque, _: []f32, _: ?usize) void {}
+fn neverSounding(_: *anyopaque) bool {
+    return false;
+}
 
 /// A probe A held at a level, with the dropouts this rig throws through it.
 /// Probe BC is left flailing, so nothing here depends on plant B.
@@ -168,7 +179,7 @@ fn untouched(poll: usize) ports.Reading {
     return .{ .raw_a = value, .raw_bc = value };
 }
 
-/// Blocks enough to fill the quiet model's window and satisfy its hold. Four
+/// Blocks enough to fill the steady model's window and satisfy its hold. Four
 /// polls a block, a window of a second, and a hold on top of that.
 const warmup_blocks: usize = 400;
 
@@ -176,7 +187,11 @@ fn runPlantA(pattern: *const fn (usize) ports.Reading, blocks: usize) !FakeSink 
     var probe: FakeProbe = .{ .pattern = pattern };
     var sink: FakeSink = .{};
     const status: ports.StatusSink = .{ .context = &sink, .observe_fn = ignoreStatus };
-    const clips: ports.ClipStream = .{ .context = &sink, .render_fn = ignoreClips };
+    const clips: ports.ClipStream = .{
+        .context = &sink,
+        .render_fn = ignoreClips,
+        .sounding_fn = neverSounding,
+    };
     var prng = std.Random.DefaultPrng.init(1);
 
     var app = Engine.init(
@@ -191,7 +206,7 @@ fn runPlantA(pattern: *const fn (usize) ports.Reading, blocks: usize) !FakeSink 
         sink.port(),
         status,
         clips,
-        0,
+        &.{},
         prng.random(),
     );
 

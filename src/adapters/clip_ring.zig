@@ -55,6 +55,11 @@ pub const Ring = struct {
         self.* = undefined;
     }
 
+    /// How many samples are waiting to be played.
+    pub fn pending(self: *const Ring) usize {
+        return self.write_index.load(.acquire) - self.read_index.load(.acquire);
+    }
+
     pub fn clear(self: *Ring) void {
         const write = self.write_index.load(.acquire);
         self.read_index.store(write, .release);
@@ -127,4 +132,25 @@ test "ring mixing preserves audio already in the engine block" {
     try std.testing.expectApproxEqAbs(@as(f32, 10.4), output[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f32, 20.8), output[1], 0.000001);
     try std.testing.expectEqual(@as(f32, 30.0), output[2]);
+}
+
+test "pending counts what is waiting to be played" {
+    var ring = Ring.initForTest();
+    try std.testing.expectEqual(@as(usize, 0), ring.pending());
+
+    var input = [_]f32{ 1.0, 2.0, 3.0 };
+    _ = ring.push(&input, 1);
+    try std.testing.expectEqual(@as(usize, 3), ring.pending());
+
+    var output = [_]f32{ 0.0, 0.0 };
+    _ = ring.pop(&output);
+    try std.testing.expectEqual(@as(usize, 1), ring.pending());
+}
+
+test "a cleared ring has nothing pending" {
+    var ring = Ring.initForTest();
+    var input = [_]f32{ 1.0, 2.0, 3.0 };
+    _ = ring.push(&input, 1);
+    ring.clear();
+    try std.testing.expectEqual(@as(usize, 0), ring.pending());
 }

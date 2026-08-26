@@ -16,7 +16,7 @@
 //! repository root is one of these.
 //!
 //!     zig build replay -- touch.csv
-//!     zig build replay -- touch.csv --model=quiet --still-range=64
+//!     zig build replay -- touch.csv --model=steady --still-range=64
 //!     zig build replay -- touch.csv --sweep
 
 const std = @import("std");
