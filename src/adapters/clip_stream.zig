@@ -97,6 +97,9 @@ pub const Adapter = struct {
     ring: Ring,
     requested_index: std.atomic.Value(usize),
     request_generation: std.atomic.Value(u64),
+    /// How much of a clip one touch plays. Spent per clip: each decode takes a
+    /// fresh copy, so this one is only ever the template.
+    limit: core.plant_b.Limit,
     shutdown: std.atomic.Value(bool),
     child_pid: std.atomic.Value(i32),
     thread: ?std.Thread,
@@ -106,12 +109,14 @@ pub const Adapter = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         paths: []const []const u8,
+        limit: core.plant_b.Limit,
     ) !Adapter {
         return .{
             .io = io,
             .gpa = gpa,
             .paths = paths,
             .ring = try Ring.init(gpa),
+            .limit = limit,
             .requested_index = .init(none_index),
             .request_generation = .init(0),
             .shutdown = .init(false),
@@ -231,6 +236,7 @@ pub const Adapter = struct {
         var bytes: [16 * 1024]u8 align(@alignOf(f32)) = undefined;
         var pending: [@sizeOf(f32)]u8 = undefined;
         var pending_len: usize = 0;
+        var limit = self.limit;
 
         while (!self.shouldStop(generation)) {
             if (pending_len != 0) @memcpy(bytes[0..pending_len], pending[0..pending_len]);
@@ -255,9 +261,16 @@ pub const Adapter = struct {
             const total = pending_len + read;
             const complete = total - total % @sizeOf(f32);
             const samples = std.mem.bytesAsSlice(f32, bytes[0..complete]);
-            self.pushSamples(samples, generation);
+            self.pushSamples(samples, generation, &limit);
             pending_len = total - complete;
             if (pending_len != 0) @memcpy(pending[0..pending_len], bytes[complete..total]);
+
+            // The clip has had its four seconds. Returning here rather than
+            // breaking is deliberate: the loop's exit path reaps ffmpeg, and
+            // ffmpeg is still mid-file with a pipe nobody is draining, so
+            // waiting on it would hang the worker forever. The deferred kill
+            // is the only correct way out.
+            if (limit.finished()) return;
         }
 
         if (self.shouldStop(generation)) return;
@@ -280,10 +293,19 @@ pub const Adapter = struct {
         }
     }
 
-    fn pushSamples(self: *Adapter, samples: []const f32, generation: u64) void {
+    /// Push one run of decoded samples into the ring, shaped by what is left of
+    /// the clip's allowance. Uncapped pools spend an allowance that never runs
+    /// out, so there is no branch here for them.
+    fn pushSamples(
+        self: *Adapter,
+        samples: []f32,
+        generation: u64,
+        limit: *core.plant_b.Limit,
+    ) void {
+        const kept = limit.take(samples);
         var offset: usize = 0;
-        while (offset < samples.len and !self.shouldStop(generation)) {
-            const pushed = self.ring.push(samples[offset..], generation);
+        while (offset < kept and !self.shouldStop(generation)) {
+            const pushed = self.ring.push(samples[offset..kept], generation);
             offset += pushed;
             if (pushed == 0) self.pause();
         }
@@ -329,7 +351,12 @@ test "ring mixing preserves audio already in the engine block" {
 }
 
 test "adapter rejects duplicate starts" {
-    var adapter = try Adapter.init(std.testing.io, std.testing.allocator, &.{});
+    var adapter = try Adapter.init(
+        std.testing.io,
+        std.testing.allocator,
+        &.{},
+        .unlimited,
+    );
     defer adapter.deinit();
     try adapter.start();
     try std.testing.expectError(error.AlreadyStarted, adapter.start());

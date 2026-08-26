@@ -114,7 +114,11 @@ fn runComposition(
     defer clips.deinit(gpa);
 
     std.debug.print("loading: preparing Plant B stream...\n", .{});
-    var stream = try clip_stream.Adapter.init(io, gpa, clips.paths);
+    const limit: core.plant_b.Limit = .forPool(opts.pool, core.sample_rate);
+    if (opts.pool.playSeconds()) |seconds| {
+        std.debug.print("loading: each touch plays {d:.1}s of a clip\n", .{seconds});
+    }
+    var stream = try clip_stream.Adapter.init(io, gpa, clips.paths, limit);
     defer stream.deinit();
     try stream.start();
     const stream_port = stream.port();

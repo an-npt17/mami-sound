@@ -1,13 +1,3 @@
-//! Plant A's voice: white noise pushed through a resonant bandpass filter.
-//!
-//! The filter's centre frequency is what the ear hears as pitch. A touch fires
-//! a burst — the pitch drops to the bottom of the range and sweeps up to what
-//! the probe is reading — and from then on it follows how far the probe has
-//! moved from its own rest through a slow one-pole smoother, so the drone
-//! tracks the plant's overall state rather than individual spikes: a firmer
-//! touch reads further out and sounds higher. The pitch sweeps or glides and
-//! never steps.
-
 const std = @import("std");
 
 /// Pitch range. `freq_max` is the first number to retune for a different room
@@ -110,15 +100,6 @@ const idle_gain: f32 = 0.35;
 
 /// Map a deviation from rest to centre frequency on a log scale, so equal steps
 /// in the deviation sound like equal pitch steps.
-///
-/// Deviation rather than level, because level is meaningless here: probe A
-/// rests at -2049 and reads +660 when touched, so the reading's magnitude
-/// *falls* on a touch. Distance from rest rises on a touch whichever way the
-/// probe happens to move, and it is zero when nobody is there.
-///
-/// `floor` is where the deviation starts counting from: at zero the deviation
-/// has the whole range, and at 0.6 it has the top 40% of it and everything
-/// below that belongs to the fact of being touched at all.
 pub fn freqFromDeviation(dev: i16, span: i16, floor: f32) f32 {
     const reach = std.math.clamp(floor, 0.0, 1.0);
     const t = std.math.clamp(
@@ -129,7 +110,6 @@ pub fn freqFromDeviation(dev: i16, span: i16, floor: f32) f32 {
     return freq_min * std.math.pow(f32, freq_max / freq_min, reach + (1.0 - reach) * t);
 }
 
-/// One-pole coefficient reaching ~63% of a step in `tau` seconds.
 fn smoothingAlpha(tau_s: f32, sample_rate: u32) f32 {
     const sr = @as(f32, @floatFromInt(sample_rate));
     return 1.0 - @exp(-1.0 / (tau_s * sr));
