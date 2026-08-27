@@ -123,6 +123,7 @@ fn runComposition(
     };
 
     var voices: [2]voice_mod.Voice = .{ droneVoice(), droneVoice() };
+    var held: [2]bool = .{ false, false };
 
     for (opts.plant_sources, 0..) |chosen, plant| {
         const name: []const u8 = if (plant == 0) "A" else "B";
@@ -192,7 +193,20 @@ fn runComposition(
         const retrigger = opts.plant_retrigger[plant] orelse chosen.defaultRetriggerSeconds();
         const mode = opts.plant_mode[plant] orelse .trigger;
         if (mode == .hold) {
+            held[plant] = true;
             std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
+            // Said out loud because it is a limit of the model rather than a
+            // setting: the deviation model measures how far a probe has moved
+            // from its own recent past, so a hand left in place becomes that
+            // past within about three seconds and the plant falls quiet under
+            // a hand that never left.
+            if ((opts.model orelse touch_preset_model) == .deviation) {
+                std.debug.print(
+                    "warning: plant {s} holds for about three seconds on the deviation model;" ++
+                        " --touch-model=steady holds for as long as the hand is there\n",
+                    .{name},
+                );
+            }
         }
         voices[plant] = .{
             .clips = .{
@@ -219,7 +233,7 @@ fn runComposition(
     std.debug.print("loading: starting engine...\n", .{});
     var app = engine.Engine.init(
         opts.plants,
-        production_config.touchWith(opts.model, opts.still_range, opts.still_release),
+        production_config.touchWith(opts.model, opts.still_range, opts.still_release, held),
         probe.source(),
         sink_port,
         status.port(),
@@ -265,6 +279,9 @@ fn parseArgs(
 }
 
 /// The generated voice, with the room's preset shape.
+/// The model the compiled preset asks for, for the warning above.
+const touch_preset_model = production_config.touch.model;
+
 fn droneVoice() voice_mod.Voice {
     return .{ .drone = .init(
         core.sample_rate,

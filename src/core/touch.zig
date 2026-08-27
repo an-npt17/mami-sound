@@ -290,6 +290,17 @@ pub const Config = struct {
     /// in the units the probe actually reads.
     counts: ?i16 = null,
     counts_bc: ?i16 = null,
+    /// Whether this probe drives a voice that sounds while it is held.
+    ///
+    /// A tap window asks whether a hand left again in time; a held voice needs
+    /// to know whether the hand is still there. Both cannot be answered at
+    /// once, and it is the hold the room asked for -- so a held probe drops its
+    /// window rather than reporting a three-millisecond blip and blocking.
+    ///
+    /// Per probe, because the two plants are told separately: a held plant A
+    /// must not quietly retire the window plant B was given.
+    hold: bool = false,
+    hold_bc: bool = false,
     /// How long a touch may last and still count. `null` latches instead: the
     /// state stays on for as long as the probe reads touched.
     ///
@@ -313,6 +324,8 @@ pub const Config = struct {
         bc.still_release_bc = null;
         bc.counts = self.counts_bc orelse self.counts;
         bc.window_ms = self.window_bc_ms orelse self.window_ms;
+        bc.hold = self.hold_bc;
+        bc.hold_bc = false;
         bc.level_bc = null;
         bc.hold_bc_ms = null;
         bc.counts_bc = null;
@@ -393,7 +406,7 @@ pub const Detector = struct {
             // until it was let go. The preset still carries `window_bc_ms` for
             // the rig it was measured on, so this cannot be left to the caller
             // remembering to clear it.
-            .window = if (cfg.model == .deviation) blk: {
+            .window = if (cfg.model == .deviation and !cfg.hold) blk: {
                 const ms = cfg.window_ms orelse break :blk null;
                 break :blk @max(holdPolls(ms, cfg.sample_rate, cfg.poll_frames), 1);
             } else null,
@@ -706,6 +719,14 @@ fn heldPlantA(poll: usize) i16 {
     };
 }
 
+fn deviationConfig() Config {
+    return .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .deviation,
+    };
+}
+
 fn steadyConfig() Config {
     return .{
         .sample_rate = 44100,
@@ -810,4 +831,79 @@ test "the preset's plant B window does not silence a steady rig" {
     }
     try std.testing.expect(latched);
     try std.testing.expect(machine.bc.on);
+}
+
+test "a windowed probe reports a tap, not a hand that stays" {
+    // What `hold` needs from a detector is a level: is there a hand on it now.
+    // A windowed probe answers a different question -- did a hand arrive and
+    // leave again soon enough to have been a gesture -- and answers it on one
+    // poll only. The live preset gives plant B a window, so this is what a held
+    // plant B would hand a gate.
+    var cfg = deviationConfig();
+    cfg.window_ms = 1000.0;
+    var detector: Detector = .init(cfg);
+
+    var polls_reported: usize = 0;
+    var polls_on: usize = 0;
+    for (0..4000) |poll| {
+        // Rest for a second, then a hand that arrives and stays.
+        const raw: i16 = if (poll < 1000) 0 else 3000;
+        if (detector.update(raw)) polls_reported += 1;
+        if (detector.on) polls_on += 1;
+    }
+
+    // Three thousand polls of hand, and the probe says so on almost none.
+    try std.testing.expect(polls_reported < 10);
+    try std.testing.expect(polls_on < 500);
+}
+
+test "dropping the window lets a deviation probe report a hand for seconds" {
+    // The fix for the above, and the limit of it. Without the window a held
+    // probe reports the hand for about 950 polls -- near three seconds -- where
+    // a windowed one managed fewer than ten. It does not last, and cannot: the
+    // deviation model measures how far a probe has moved from its own recent
+    // past, and a hand left in place becomes that past within a few seconds.
+    var cfg = deviationConfig();
+    cfg.window_ms = 1000.0;
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    var polls_reported: usize = 0;
+    for (0..4000) |poll| {
+        const raw: i16 = if (poll < 1000) 0 else 3000;
+        if (detector.update(raw)) polls_reported += 1;
+    }
+
+    try std.testing.expect(polls_reported > 500);
+    // Never blocked, which is what the window used to do to it.
+    try std.testing.expect(!detector.blocked);
+}
+
+test "the steady model reports a hand for as long as it is there" {
+    // Why `hold` wants `--touch-model=steady`. This asks how tightly the
+    // readings cluster, which stays true under a hand however long it stays.
+    var detector: Detector = .init(steadyConfig());
+
+    var polls_reported: usize = 0;
+    for (0..4000) |poll| {
+        const raw: i16 = if (poll < 1000) flailing(poll) else 663;
+        if (detector.update(raw)) polls_reported += 1;
+    }
+
+    // Nearly every poll the hand was there for, less the window it takes to
+    // notice and the hold it takes to be sure.
+    try std.testing.expect(polls_reported > 2500);
+    try std.testing.expect(detector.on);
+}
+
+test "plant B's window survives when only plant A is held" {
+    // The two probes are told separately. A held plant A must not quietly
+    // retire the tap window plant B was given.
+    var cfg = deviationConfig();
+    cfg.window_bc_ms = 1000.0;
+    cfg.hold = true;
+    const machine: Machine = .init(cfg);
+
+    try std.testing.expect(machine.a.window == null);
+    try std.testing.expect(machine.bc.window != null);
 }
