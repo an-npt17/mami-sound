@@ -124,6 +124,10 @@ const FakeStream = struct {
     requests: usize = 0,
     /// Samples handed over, so a test can tell a paused clip from a silent one.
     rendered: usize = 0,
+    /// Samples this clip is allowed, as a capped source's limit would give it.
+    /// Zero is no cap.
+    allowance: usize = 0,
+    spent: usize = 0,
 
     fn render(context: *anyopaque, out: []f32, request: ?usize) void {
         const self: *FakeStream = @ptrCast(@alignCast(context));
@@ -131,8 +135,16 @@ const FakeStream = struct {
             self.requests += 1;
             self.playing = true;
         }
+        if (request != null) self.spent = 0;
+        if (self.allowance != 0 and self.spent >= self.allowance) {
+            // Out of allowance is out of clip: the real streamer's worker stops
+            // pushing and the ring drains to nothing.
+            self.playing = false;
+            return;
+        }
         if (!self.playing) return;
         self.rendered += out.len;
+        self.spent += out.len;
         for (out) |*sample| sample.* += 0.5;
     }
 
@@ -367,4 +379,29 @@ test "a hand back inside the release keeps the clip it had" {
 
     try std.testing.expectEqual(@as(usize, 1), stream.requests);
     try std.testing.expect(piece[piece.len - 1] > 0.4);
+}
+
+test "a clip that reaches its own end under a hold waits for a new touch" {
+    // Under `hold` there is no cap -- `Limit.forSource` refuses to give one --
+    // so the only way a clip ends mid-hold is running out of file. When that
+    // happens the plant goes quiet and waits, which is the same rule as
+    // everywhere else: a finished clip needs a new touch, not a longer hold.
+    var stream: FakeStream = .{ .allowance = 5 * 44100 };
+    var voice = holdVoice(&stream);
+    const probe = testDetector();
+    var piece = [_]f32{0.0} ** 128;
+
+    const polls = 8 * 44100 / piece.len;
+    for (0..polls) |_| {
+        @memset(&piece, 0);
+        voice.render(&piece, &probe, true);
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), piece[piece.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), stream.requests);
+
+    // Let go past the release, take hold again: a new clip.
+    const release_polls = @as(usize, @intFromFloat(1.5 * 44100.0)) / piece.len;
+    for (0..release_polls) |_| voice.render(&piece, &probe, false);
+    voice.render(&piece, &probe, true);
+    try std.testing.expectEqual(@as(usize, 2), stream.requests);
 }

@@ -33,8 +33,15 @@ pub const Limit = struct {
     pub fn forSource(
         source: source_mod.Source,
         seconds: ?f32,
+        mode: Mode,
         sample_rate: u32,
     ) Limit {
+        // Under a hold the hand is the length, and a second answer to the same
+        // question can only contradict it: a cap running out mid-hold leaves
+        // the plant silent with somebody still holding it and no rising edge
+        // left to ask with.
+        if (mode == .hold) return .unlimited;
+
         const chosen = seconds orelse source.defaultSeconds() orelse return .unlimited;
         if (chosen <= 0.0) return .unlimited;
 
@@ -215,7 +222,7 @@ pub const ClipSelector = struct {
 };
 
 test "the recordings spend an allowance that never runs out" {
-    var limit: Limit = .forSource(.recordings, null, 44100);
+    var limit: Limit = .forSource(.recordings, null, .trigger, 44100);
     var samples = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
 
     try std.testing.expectEqual(@as(usize, 4), limit.take(&samples));
@@ -226,7 +233,7 @@ test "the recordings spend an allowance that never runs out" {
 }
 
 test "a stem pool's allowance is four seconds of samples" {
-    const limit: Limit = .forSource(.bell, null, 44100);
+    const limit: Limit = .forSource(.bell, null, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 4 * 44100), limit.total);
     try std.testing.expectEqual(@as(usize, 6615), limit.fade); // 150 ms
 }
@@ -354,30 +361,30 @@ test "a pool built from one folder still draws from all of it" {
 }
 
 test "a bird call is capped at five seconds with a fade" {
-    const limit: Limit = .forSource(.daybird, null, 44100);
+    const limit: Limit = .forSource(.daybird, null, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 5 * 44100), limit.total);
     try std.testing.expect(limit.fade > 0);
 }
 
 test "a source's own length becomes its limit" {
-    const capped: Limit = .forSource(.bell, null, 44100);
+    const capped: Limit = .forSource(.bell, null, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 4 * 44100), capped.total);
     try std.testing.expect(capped.fade > 0);
 
-    const uncapped: Limit = .forSource(.tradvn, null, 44100);
+    const uncapped: Limit = .forSource(.tradvn, null, .trigger, 44100);
     try std.testing.expectEqual(Limit.unlimited.total, uncapped.total);
 }
 
 test "an override replaces the source's length" {
-    const longer: Limit = .forSource(.bell, 12.0, 44100);
+    const longer: Limit = .forSource(.bell, 12.0, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 12 * 44100), longer.total);
 
     // Zero is how a capped source is uncapped from the command line.
-    const uncapped: Limit = .forSource(.bell, 0.0, 44100);
+    const uncapped: Limit = .forSource(.bell, 0.0, .trigger, 44100);
     try std.testing.expectEqual(Limit.unlimited.total, uncapped.total);
 
     // And how a source that runs to its end is capped.
-    const capped: Limit = .forSource(.recordings, 30.0, 44100);
+    const capped: Limit = .forSource(.recordings, 30.0, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 30 * 44100), capped.total);
 }
 
@@ -443,3 +450,24 @@ test "a pool of one clip has nothing else to offer and says so" {
 /// is the same visit and carries on; past it the clip is finished, and the next
 /// hand gets a different recording rather than the one it just heard.
 pub const hold_release_s: f32 = 1.0;
+
+test "a held plant is given no allowance to run out of" {
+    // The fix for a plant going quiet in somebody's hand. Under `hold` the hand
+    // is the length, and a cap is a second answer to that question which can
+    // only contradict it -- there is no rising edge left to ask for the next
+    // clip with while the hand is still there.
+    for ([_]source_mod.Source{ .insect, .daybird, .bell, .piano }) |capped| {
+        const triggered: Limit = .forSource(capped, null, .trigger, 44100);
+        try std.testing.expect(triggered.total != Limit.unlimited.total);
+
+        const held: Limit = .forSource(capped, null, .hold, 44100);
+        try std.testing.expectEqual(Limit.unlimited.total, held.total);
+    }
+}
+
+test "a length asked for on the command line is refused a held plant too" {
+    // `--plant-a-seconds=3 --plant-a-mode=hold` is two answers to one question.
+    // The hold is the one the room gave last and the one it can see.
+    const held: Limit = .forSource(.insect, 3.0, .hold, 44100);
+    try std.testing.expectEqual(Limit.unlimited.total, held.total);
+}

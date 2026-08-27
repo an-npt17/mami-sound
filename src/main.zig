@@ -152,9 +152,11 @@ fn runComposition(
             .{ name, pools[plant].paths.len },
         );
 
+        const mode = opts.plant_mode[plant] orelse .trigger;
         const limit: core.clips.Limit = .forSource(
             chosen,
             opts.plant_seconds[plant],
+            mode,
             core.sample_rate,
         );
         if (limit.total == core.clips.Limit.unlimited.total) {
@@ -191,7 +193,6 @@ fn runComposition(
         try streams[plant].start();
 
         const retrigger = opts.plant_retrigger[plant] orelse chosen.defaultRetriggerSeconds();
-        const mode = opts.plant_mode[plant] orelse .trigger;
         if (mode == .hold) {
             held[plant] = true;
             std.debug.print("loading: plant {s} sounds while it is held\n", .{name});

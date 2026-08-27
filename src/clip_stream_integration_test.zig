@@ -81,7 +81,7 @@ test "a capped touch plays its allowance and then stops on its own" {
     // than the file. Nothing here asks the stream to stop: the point is that it
     // runs out by itself and waits for the next touch.
     const sample_rate = 44100;
-    const limit: core.clips.Limit = .forSource(.bell, null, sample_rate);
+    const limit: core.clips.Limit = .forSource(.bell, null, .trigger, sample_rate);
 
     const stems = try library.listSorted(std.testing.allocator, std.testing.io, "Bell Stems");
     defer library.freeList(std.testing.allocator, stems);
@@ -218,7 +218,7 @@ test "a clip reads as sounding until it has actually run out" {
     // playing one second of something and stopping.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const limit: core.clips.Limit = .forSource(.bell, null, 44100);
+    const limit: core.clips.Limit = .forSource(.bell, null, .trigger, 44100);
 
     const stems = try library.listSorted(gpa, io, "Bell Stems");
     defer library.freeList(gpa, stems);
@@ -256,7 +256,7 @@ test "a stem plays between three and five seconds and then stops" {
         const stems = try library.listSorted(gpa, io, directory);
         defer library.freeList(gpa, stems);
 
-        const limit: core.clips.Limit = .forSource(pool, null, 44100);
+        const limit: core.clips.Limit = .forSource(pool, null, .trigger, 44100);
         var adapter = try clip_stream.Adapter.init(io, gpa, &.{stems[0]}, limit);
         defer adapter.deinit();
         try adapter.primeHeads();
@@ -327,7 +327,7 @@ test "a bird call plays five seconds and then stops" {
     defer library.freeList(gpa, calls);
     try std.testing.expect(calls.len > 0);
 
-    const limit: core.clips.Limit = .forSource(.daybird, null, 44100);
+    const limit: core.clips.Limit = .forSource(.daybird, null, .trigger, 44100);
     var adapter = try clip_stream.Adapter.init(io, gpa, &.{calls[0]}, limit);
     defer adapter.deinit();
     try adapter.primeHeads();
@@ -364,7 +364,7 @@ test "a capped source sounds for the length it was given" {
     defer library.freeList(gpa, paths);
     try std.testing.expect(paths.len > 0);
 
-    const limit: core.clips.Limit = .forSource(.insect, null, 44100);
+    const limit: core.clips.Limit = .forSource(.insect, null, .trigger, 44100);
     var adapter = try clip_stream.Adapter.init(io, gpa, &.{paths[0]}, limit);
     defer adapter.deinit();
     try adapter.primeHeads();
@@ -401,7 +401,7 @@ test "a source that runs to its end is still sounding past five seconds" {
     defer library.freeList(gpa, paths);
     try std.testing.expect(paths.len > 0);
 
-    const limit: core.clips.Limit = .forSource(.tradvn, null, 44100);
+    const limit: core.clips.Limit = .forSource(.tradvn, null, .trigger, 44100);
     try std.testing.expectEqual(core.clips.Limit.unlimited.total, limit.total);
 
     var adapter = try clip_stream.Adapter.init(io, gpa, &.{paths[0]}, limit);
@@ -437,7 +437,7 @@ test "seconds=0 plays to the end, and a later touch replaces it mid-clip" {
     try std.testing.expect(paths.len >= 2);
 
     // insect is normally cut at five seconds; zero is how the room uncaps it.
-    const limit: core.clips.Limit = .forSource(.insect, 0.0, 44100);
+    const limit: core.clips.Limit = .forSource(.insect, 0.0, .trigger, 44100);
     try std.testing.expectEqual(core.clips.Limit.unlimited.total, limit.total);
 
     var adapter = try clip_stream.Adapter.init(io, gpa, paths, limit);

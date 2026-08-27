@@ -272,7 +272,7 @@ test "a capped pool is pre-decoded whole, not just to the head length" {
     const stems = try library.listSorted(gpa, std.testing.io, "Bell Stems");
     defer library.freeList(gpa, stems);
 
-    const limit: core.clips.Limit = .forSource(.bell, null, 44100);
+    const limit: core.clips.Limit = .forSource(.bell, null, .trigger, 44100);
     var heads = try decode(gpa, std.testing.io, &.{stems[0]}, limit, 44100);
     defer heads.deinit(gpa);
 
@@ -292,7 +292,7 @@ test "a long allowance keeps a head rather than the whole clip" {
     const paths = try library.listSorted(gpa, io, "Insect");
     defer library.freeList(gpa, paths);
 
-    const long: core.clips.Limit = .forSource(.insect, 60.0, 44100);
+    const long: core.clips.Limit = .forSource(.insect, 60.0, .trigger, 44100);
     var heads = try decode(gpa, io, &.{paths[0]}, long, 44100);
     defer heads.deinit(gpa);
 
@@ -309,7 +309,7 @@ test "a short allowance is still taken whole" {
     const paths = try library.listSorted(gpa, io, "Insect");
     defer library.freeList(gpa, paths);
 
-    const short: core.clips.Limit = .forSource(.insect, null, 44100);
+    const short: core.clips.Limit = .forSource(.insect, null, .trigger, 44100);
     var heads = try decode(gpa, io, &.{paths[0]}, short, 44100);
     defer heads.deinit(gpa);
 
