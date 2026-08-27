@@ -352,3 +352,63 @@ test "an untouched plant A stays at its idle" {
     try testing.expect(idle.rms() < 0.015);
     try testing.expect(idle.peak < 2000);
 }
+
+/// Plant A held while plant BC is left flailing, and the other way round, so a
+/// test can touch one plant without touching the other.
+fn heldAOnly(poll: usize) ports.Reading {
+    return .{ .raw_a = heldA(poll).raw_a, .raw_bc = flailingA(poll) };
+}
+
+fn heldBOnly(poll: usize) ports.Reading {
+    return .{ .raw_a = flailingA(poll), .raw_bc = heldA(poll).raw_a };
+}
+
+/// Two clip voices at levels that add up to something only reachable by both.
+fn twoClipVoices(a: *FakeClips, b: *FakeClips) [2]voice_mod.Voice {
+    a.level = 0.25;
+    b.level = 0.5;
+    return .{ clipVoice(a, 0), clipVoice(b, 1) };
+}
+
+test "the plants sound independently, and together when both are touched" {
+    // The room's question: does a hand on one plant have anything to do with
+    // the other. It must not. The two voices are mixed into the same block, so
+    // levels that add up are what tells one plant sounding from both.
+    var a: FakeClips = .{};
+    var b: FakeClips = .{};
+
+    const only_a = try runVoices(heldAOnly, warmup_blocks, .{ true, true }, twoClipVoices(&a, &b));
+    try testing.expect(a.requests > 0);
+    try testing.expectEqual(@as(usize, 0), b.requests);
+
+    var a2: FakeClips = .{};
+    var b2: FakeClips = .{};
+    const only_b = try runVoices(heldBOnly, warmup_blocks, .{ true, true }, twoClipVoices(&a2, &b2));
+    try testing.expectEqual(@as(usize, 0), a2.requests);
+    try testing.expect(b2.requests > 0);
+
+    var a3: FakeClips = .{};
+    var b3: FakeClips = .{};
+    const both = try runVoices(heldBoth, warmup_blocks, .{ true, true }, twoClipVoices(&a3, &b3));
+    try testing.expect(a3.requests > 0);
+    try testing.expect(b3.requests > 0);
+
+    // Plant B is the louder of the two, and both together is louder than either
+    // alone by the other's share -- which is only true if neither is waiting on
+    // the other or replacing it.
+    try testing.expect(only_b.peak > only_a.peak);
+    try testing.expect(both.peak > only_b.peak);
+    try testing.expect(both.peak > only_a.peak + only_b.peak - 1000);
+}
+
+test "one plant left out does not stop the other" {
+    // `12` versus `1`: a plant that was never selected must cost the other
+    // nothing at all.
+    var a: FakeClips = .{};
+    var b: FakeClips = .{};
+    const alone = try runVoices(heldAOnly, warmup_blocks, .{ true, false }, twoClipVoices(&a, &b));
+
+    try testing.expect(a.requests > 0);
+    try testing.expectEqual(@as(usize, 0), b.requests);
+    try testing.expect(alone.peak > 0);
+}
