@@ -86,6 +86,9 @@ pub const ClipSelector = struct {
     /// The folder the clip now playing was drawn from, so the next one can be
     /// drawn from the other. `null` before anything has played.
     last_folder: ?u8,
+    /// And which clip it was, so a pool with only one folder still answers a
+    /// touch with something new. `null` before anything has played.
+    last_index: ?usize,
     /// Frames since the last clip was started, and how many make ten seconds.
     frames_since_start: u64,
     open_frames: u64,
@@ -101,6 +104,7 @@ pub const ClipSelector = struct {
             .random = random,
             .previous_touch = false,
             .last_folder = null,
+            .last_index = null,
             .frames_since_start = 0,
             .open_frames = @intFromFloat(retrigger_s * @as(f32, @floatFromInt(sample_rate))),
         };
@@ -129,6 +133,7 @@ pub const ClipSelector = struct {
 
         const index = self.pick();
         self.last_folder = self.folders[index];
+        self.last_index = index;
         self.frames_since_start = 0;
         return index;
     }
@@ -137,17 +142,55 @@ pub const ClipSelector = struct {
     ///
     /// A pool built from one folder -- either stem pool -- has no other folder
     /// to go to, so it draws from the whole pool as it always did.
+    /// A clip that is not the one just playing.
+    ///
+    /// The recordings are two folders read as one, so the rule there is the
+    /// folder: the next clip comes from whichever the last one did not, and a
+    /// different folder is necessarily a different clip. Every other source is
+    /// one folder and has no other to go to, so the rule falls back to the clip
+    /// itself -- without which a touch would restart the same bell about one
+    /// time in four, which is a room hearing the plant fail to answer.
     fn pick(self: *ClipSelector) usize {
-        const wanted = self.countOther();
-        if (wanted == 0) return self.random.uintLessThan(usize, self.folders.len);
+        const other_folder = self.countOther();
+        if (other_folder > 0) return self.nth(other_folder, .folder);
 
-        var remaining = self.random.uintLessThan(usize, wanted);
-        for (self.folders, 0..) |folder, index| {
-            if (self.last_folder) |last| if (folder == last) continue;
+        const choices = self.countUnplayed();
+        return self.nth(choices, .clip);
+    }
+
+    /// Which of the two rules is deciding what counts as a candidate.
+    const Rule = enum { folder, clip };
+
+    fn eligible(self: *const ClipSelector, index: usize, rule: Rule) bool {
+        return switch (rule) {
+            .folder => if (self.last_folder) |last| self.folders[index] != last else true,
+            // A pool of one has to answer a touch with the clip it has, however
+            // lately it played. Said here rather than at the counting, because a
+            // count and a predicate that disagree walk off the end of the pool.
+            .clip => if (self.folders.len <= 1)
+                true
+            else if (self.last_index) |last| index != last else true,
+        };
+    }
+
+    /// The `wanted`-th eligible clip, counting from a fresh draw.
+    fn nth(self: *ClipSelector, choices: usize, rule: Rule) usize {
+        var remaining = self.random.uintLessThan(usize, choices);
+        for (0..self.folders.len) |index| {
+            if (!self.eligible(index, rule)) continue;
             if (remaining == 0) return index;
             remaining -= 1;
         }
         unreachable;
+    }
+
+    /// How many clips are not the one just playing.
+    fn countUnplayed(self: *const ClipSelector) usize {
+        var count: usize = 0;
+        for (0..self.folders.len) |index| {
+            if (self.eligible(index, .clip)) count += 1;
+        }
+        return count;
     }
 
     fn countOther(self: *const ClipSelector) usize {
@@ -349,3 +392,31 @@ pub const Mode = enum { trigger, hold };
 /// number both ways: a fade-in that outran its fade-out would click on a quick
 /// re-grip, which is the gesture a room does most.
 pub const hold_fade_s: f32 = 0.04;
+
+test "a touch never restarts the clip that was just playing" {
+    // Alternating folders guarantees a different clip for the recordings, which
+    // are two folders read as one. Every other source is one folder, so there
+    // is no other folder to go to and the only thing standing between a touch
+    // and hearing the same bell again is this.
+    const one_folder = [_]u8{ 0, 0, 0, 0 };
+    var selector = testSelector(&one_folder, 11);
+
+    var previous: ?usize = null;
+    for (0..60) |_| {
+        const index = selector.start(true, false, poll_frames).?;
+        if (previous) |last| try std.testing.expect(index != last);
+        previous = index;
+        _ = selector.start(false, false, poll_frames);
+    }
+}
+
+test "a pool of one clip has nothing else to offer and says so" {
+    // The edge the rule above must not turn into a hang or an unreachable: one
+    // clip, and a touch has to be answered with it.
+    const single = [_]u8{0};
+    var selector = testSelector(&single, 3);
+    for (0..4) |_| {
+        try std.testing.expectEqual(@as(usize, 0), selector.start(true, false, poll_frames).?);
+        _ = selector.start(false, false, poll_frames);
+    }
+}

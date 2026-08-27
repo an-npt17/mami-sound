@@ -423,3 +423,47 @@ test "a source that runs to its end is still sounding past five seconds" {
     }
     try std.testing.expect(port.sounding());
 }
+
+test "seconds=0 plays to the end, and a later touch replaces it mid-clip" {
+    // What `--plant-b-seconds=0` is for: the clip runs its own length, and the
+    // only thing that ends it early is somebody asking for another one. The
+    // replacement has to be audible immediately and the clip it interrupted has
+    // to be gone rather than mixed underneath.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const paths = try library.listSorted(gpa, io, "Insect");
+    defer library.freeList(gpa, paths);
+    try std.testing.expect(paths.len >= 2);
+
+    // insect is normally cut at five seconds; zero is how the room uncaps it.
+    const limit: core.clips.Limit = .forSource(.insect, 0.0, 44100);
+    try std.testing.expectEqual(core.clips.Limit.unlimited.total, limit.total);
+
+    var adapter = try clip_stream.Adapter.init(io, gpa, paths, limit);
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+
+    // Well past the five seconds it would have been cut at.
+    var drained: usize = 0;
+    while (drained < 44100 * 7) : (drained += block.len) {
+        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+        @memset(&block, 0);
+        port.render(&block, null);
+    }
+    try std.testing.expect(port.sounding());
+
+    // Another touch, another clip. It must be audible on the render that asks
+    // for it, which is the head cache doing its job.
+    @memset(&block, 0);
+    port.render(&block, 1);
+    var peak: f32 = 0.0;
+    for (block) |sample| peak = @max(peak, @abs(sample));
+    try std.testing.expect(peak > 0.0);
+    try std.testing.expect(port.sounding());
+}
