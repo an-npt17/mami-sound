@@ -14,6 +14,7 @@ pub const Error = error{
     SecondsOnDrone,
     InvalidTouchModel,
     InvalidStillThreshold,
+    InvalidCapture,
     TooManyArguments,
 } || select.Error;
 
@@ -23,6 +24,9 @@ pub const default_device = "default";
 /// Long enough for the names ALSA actually prints, `plughw:CARD=Headphones`
 /// included.
 pub const device_max = 63;
+
+/// Long enough for a path somebody types at a Pi.
+pub const path_max = 127;
 
 pub const Options = struct {
     plants: select.Selection = select.all,
@@ -53,6 +57,17 @@ pub const Options = struct {
     /// Where a held probe sits, when the room can say. Both ends together or
     /// neither: half a band is a typo, not a setting.
     still_band: ?[2]i16 = null,
+    /// Where to write down what the probes read, and for how long. Unset, the
+    /// run measures nothing and writes nothing.
+    capture_buf: [path_max]u8 = undefined,
+    capture_len: usize = 0,
+    capture_s: f32 = default_capture_s,
+
+    /// The capture path, or null in a run that is not measuring the rig.
+    pub fn capture(self: *const Options) ?[]const u8 {
+        if (self.capture_len == 0) return null;
+        return self.capture_buf[0..self.capture_len];
+    }
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
@@ -88,6 +103,16 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--plant-b-retrigger=")) {
             opts.plant_retrigger[1] = parseSeconds(arg["--plant-b-retrigger=".len..]) orelse
                 return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--capture=")) {
+            const path = arg["--capture=".len..];
+            if (path.len == 0 or path.len > path_max) return Error.InvalidCapture;
+            @memcpy(opts.capture_buf[0..path.len], path);
+            opts.capture_len = path.len;
+        } else if (std.mem.startsWith(u8, arg, "--capture-seconds=")) {
+            const secs = parseSeconds(arg["--capture-seconds=".len..]) orelse
+                return Error.InvalidCapture;
+            if (secs <= 0.0) return Error.InvalidCapture;
+            opts.capture_s = secs;
         } else if (std.mem.startsWith(u8, arg, "--still-band=")) {
             opts.still_band = parseBand(arg["--still-band=".len..]) orelse
                 return Error.InvalidStillThreshold;
@@ -142,6 +167,11 @@ pub fn parse(args: []const []const u8) Error!Options {
     return opts;
 }
 
+/// Five minutes of probes, which is 1.2 MB and long enough to hold a few dozen
+/// touches. Long enough to be worth sweeping, short enough that nobody has to
+/// wait about for it.
+pub const default_capture_s: f32 = 300.0;
+
 /// A length in seconds. Negative is not a length; zero is "to the clip's end"
 /// and is deliberately allowed.
 fn parseSeconds(text: []const u8) ?f32 {
@@ -183,6 +213,7 @@ pub const usage =
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--still-window=SECONDS] [--still-band=LO:HI]
+    \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
@@ -249,6 +280,14 @@ pub const usage =
     \\shortening it to a quarter of a second finds one hand fifteen times over
     \\rather than finding more hands. Default 1. `zig build replay -- CAPTURE
     \\--sweep` picks all three from a recording rather than from the room.
+    \\
+    \\--capture writes down what the probes actually read, every poll of both,
+    \\to a file `zig build replay` can sweep. --capture-seconds is how long it
+    \\records for, five minutes by default; it holds the whole thing in memory
+    \\and reaches the disk once, when it is full, so the room gets one click at
+    \\the end and none during. Run it, touch each plant a few dozen times, then
+    \\  zig build replay -- PATH --model=steady --sweep
+    \\and read the thresholds off this rig instead of guessing them.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
     \\
@@ -440,4 +479,21 @@ test "half a band, or one the wrong way round, is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=660:650"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=650:"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=a:b"}));
+}
+
+test "a run can be told to write down what the probes read" {
+    const opts = try parse(&.{ "--capture=probes.csv", "--capture-seconds=900" });
+    try std.testing.expectEqualStrings("probes.csv", opts.capture().?);
+    try std.testing.expectEqual(@as(f32, 900.0), opts.capture_s);
+
+    // And measures nothing unless asked.
+    const quiet = try parse(&.{});
+    try std.testing.expect(quiet.capture() == null);
+    try std.testing.expectEqual(default_capture_s, quiet.capture_s);
+}
+
+test "a capture with no path or no time is refused" {
+    try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture="}));
+    try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=0"}));
+    try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=-5"}));
 }

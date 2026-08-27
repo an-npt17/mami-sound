@@ -12,6 +12,7 @@ const clip_loader = @import("adapters/clip_loader.zig");
 const clip_stream = @import("adapters/clip_stream.zig");
 const voice_mod = @import("application/voice.zig");
 const random_probe = @import("adapters/random_probe.zig");
+const probe_capture = @import("adapters/probe_capture.zig");
 const stderr_status = @import("adapters/stderr_status.zig");
 
 const ProductionProbeOpener = struct {
@@ -59,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
             ),
             error.SecondsOnDrone => std.debug.print(
                 "the drone has no clip, so it takes no length.\n\n",
+                .{},
+            ),
+            error.InvalidCapture => std.debug.print(
+                "--capture takes a path and --capture-seconds a number above zero.\n\n",
                 .{},
             ),
             error.InvalidStillThreshold => std.debug.print(
@@ -222,6 +227,18 @@ fn runComposition(
     var sink = try sink_opener.open(io, opts.device());
     std.debug.print("loading: audio sink ready\n", .{});
 
+    // Only when the room asked. A capture holds every poll of both probes in
+    // memory for its whole length, and reaches the disk once, when it is full.
+    var capture: ?probe_capture.Adapter = if (opts.capture()) |path| blk: {
+        const writer = try probe_capture.Adapter.init(io, gpa, path, opts.capture_s);
+        std.debug.print(
+            "loading: writing {d:.0}s of probe readings to {s}\n",
+            .{ opts.capture_s, path },
+        );
+        break :blk writer;
+    } else null;
+    defer if (capture) |*writer| writer.deinit();
+
     var status = stderr_status.Adapter.init(io);
     var sink_port = sink.port();
     std.debug.print("loading: starting engine...\n", .{});
@@ -239,6 +256,7 @@ fn runComposition(
         sink_port,
         status.port(),
         voices,
+        if (capture) |*writer| writer.port() else null,
     );
     std.debug.print("loading: complete\n", .{});
     return finishAfterRun(&sink_port, app.run());
