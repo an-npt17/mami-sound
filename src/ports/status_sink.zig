@@ -12,6 +12,10 @@ pub const Snapshot = struct {
     /// that looks like nothing at all.
     rest_a: i16,
     rest_bc: i16,
+    /// What each model is comparing against rest. The steady model's window
+    /// median, the deviation model's running mean.
+    level_a: i16,
+    level_bc: i16,
     state: touch.State,
     touched: plant.Selection,
     block: []const f32,

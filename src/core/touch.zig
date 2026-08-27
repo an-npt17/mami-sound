@@ -505,6 +505,20 @@ pub const Detector = struct {
         return self.base_override orelse self.baseline.base;
     }
 
+    /// What the model is actually looking at, as opposed to the raw reading.
+    ///
+    /// The steady model compares the middle of its window against rest, and a
+    /// single reading is neither of those -- so a status line showing only the
+    /// raw value cannot answer the one question a room asks, which is why
+    /// nothing happened when somebody touched the plant. With this and `rest`
+    /// side by side the answer is a subtraction.
+    pub fn compared(self: *const Detector) i16 {
+        return switch (self.model) {
+            .deviation => self.last_mean,
+            .steady => self.spread.level,
+        };
+    }
+
     /// How far the probe sits from rest. Unsigned, because this is what the
     /// drone's pitch is mapped from and a pitch has no sign.
     ///
