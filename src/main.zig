@@ -9,6 +9,7 @@ const ads1115 = @import("adapters/ads1115.zig");
 const ads1115_probe = @import("adapters/ads1115_probe.zig");
 const aplay_sink = @import("adapters/aplay_sink.zig");
 const clip_loader = @import("adapters/clip_loader.zig");
+const interrupt = @import("adapters/interrupt.zig");
 const clip_stream = @import("adapters/clip_stream.zig");
 const voice_mod = @import("application/voice.zig");
 const random_probe = @import("adapters/random_probe.zig");
@@ -258,8 +259,19 @@ fn runComposition(
         voices,
         if (capture) |*writer| writer.port() else null,
     );
+    // From here a Ctrl-C, or a systemd stop, comes out through the shutdown
+    // below rather than killing the process where it stands.
+    interrupt.listen();
+
     std.debug.print("loading: complete\n", .{});
-    return finishAfterRun(&sink_port, app.run());
+    const outcome = app.run(interrupt.requested);
+
+    // Whatever the run did, what it measured is worth keeping. Written here
+    // rather than on the way out of a signal handler, where writing a file is
+    // one of several things that are not allowed.
+    if (capture) |*writer| writer.flush();
+
+    return finishAfterRun(&sink_port, outcome);
 }
 
 fn finishAfterRun(sink: *ports.AudioSink, run_result: anyerror!void) !void {

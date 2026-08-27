@@ -282,12 +282,16 @@ pub const usage =
     \\--sweep` picks all three from a recording rather than from the room.
     \\
     \\--capture writes down what the probes actually read, every poll of both,
-    \\to a file `zig build replay` can sweep. --capture-seconds is how long it
-    \\records for, five minutes by default; it holds the whole thing in memory
-    \\and reaches the disk once, when it is full, so the room gets one click at
-    \\the end and none during. Run it, touch each plant a few dozen times, then
+    \\to a file `zig build replay` can sweep. Start it, touch each plant a few
+    \\times, then Ctrl-C: the run comes out through its ordinary shutdown and
+    \\the capture is written on the way. Then
     \\  zig build replay -- PATH --model=steady --sweep
-    \\and read the thresholds off this rig instead of guessing them.
+    \\reads the thresholds off this rig instead of guessing them.
+    \\
+    \\--capture-seconds is how much room the capture has, not how long you wait
+    \\-- five minutes by default, which is 1.2 MB held in memory. It reaches the
+    \\disk once, at the end, so the room gets one click then and none during.
+    \\Recording stops if the room runs out; the piece carries on either way.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
     \\

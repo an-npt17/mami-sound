@@ -96,8 +96,13 @@ pub const Engine = struct {
         });
     }
 
-    pub fn run(self: *Engine) !void {
-        while (true) try self.step();
+    /// Render until somebody asks to stop.
+    ///
+    /// The check is per block rather than per poll: a block is under twelve
+    /// milliseconds, which is faster than anybody notices, and asking four
+    /// times as often would buy nothing.
+    pub fn run(self: *Engine, stopping: *const fn () bool) !void {
+        while (!stopping()) try self.step();
     }
 };
 
@@ -514,4 +519,42 @@ test "one plant holding and the other triggering do not borrow each other's rule
 
 fn restingBoth(poll: usize) ports.Reading {
     return .{ .raw_a = flailingA(poll), .raw_bc = flailingA(poll) };
+}
+
+test "the run loop comes out when it is asked to" {
+    // What Ctrl-C reaches: the handler sets a flag and the loop notices it
+    // between blocks, so shutdown happens with the whole program standing still
+    // rather than inside a signal handler.
+    const Stopper = struct {
+        var blocks: usize = 0;
+        fn after(limit: usize) bool {
+            blocks += 1;
+            return blocks > limit;
+        }
+        fn afterThree() bool {
+            return after(3);
+        }
+    };
+    Stopper.blocks = 0;
+
+    var probe: FakeProbe = .{ .pattern = resting };
+    var sink: FakeSink = .{};
+    const status: ports.StatusSink = .{ .context = &sink, .observe_fn = ignoreStatus };
+
+    var app = Engine.init(
+        .{ true, false },
+        .{
+            .sample_rate = core.sample_rate,
+            .poll_frames = core.sensor_frames,
+            .model = .steady,
+        },
+        probe.source(),
+        sink.port(),
+        status,
+        .{ droneVoice(), droneVoice() },
+        null,
+    );
+
+    try app.run(Stopper.afterThree);
+    try testing.expectEqual(@as(usize, 3), sink.blocks);
 }
