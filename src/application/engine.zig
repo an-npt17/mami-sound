@@ -215,10 +215,18 @@ const FakeClips = struct {
     /// Samples asked for, so a test can tell a stream still being drained from
     /// one a held voice has stopped consuming.
     drained: usize = 0,
+    /// Which clips were asked for, where a test cares that they differ.
+    track_indices: bool = false,
+    first_index: usize = 0,
+    last_index: usize = 0,
 
     fn render(context: *anyopaque, out: []f32, request: ?usize) void {
         const self: *FakeClips = @ptrCast(@alignCast(context));
-        if (request != null) {
+        if (request) |index| {
+            if (self.track_indices) {
+                if (self.requests == 0) self.first_index = index;
+                self.last_index = index;
+            }
             self.requests += 1;
             self.playing = true;
         }
@@ -281,11 +289,29 @@ fn droneVoice() voice_mod.Voice {
     return .{ .drone = .init(core.sample_rate, 1, .{ .span = 3000 }) };
 }
 
+fn steadyTouchConfig() core.touch.Config {
+    return .{
+        .sample_rate = core.sample_rate,
+        .poll_frames = core.sensor_frames,
+        .model = .steady,
+    };
+}
+
 fn runVoices(
     pattern: *const fn (usize) ports.Reading,
     blocks: usize,
     selection: core.plant.Selection,
     voices: [2]voice_mod.Voice,
+) !FakeSink {
+    return runVoicesWith(pattern, blocks, selection, voices, steadyTouchConfig());
+}
+
+fn runVoicesWith(
+    pattern: *const fn (usize) ports.Reading,
+    blocks: usize,
+    selection: core.plant.Selection,
+    voices: [2]voice_mod.Voice,
+    touch_config: core.touch.Config,
 ) !FakeSink {
     var probe: FakeProbe = .{ .pattern = resting };
     var sink: FakeSink = .{};
@@ -293,11 +319,7 @@ fn runVoices(
 
     var app = Engine.init(
         selection,
-        .{
-            .sample_rate = core.sample_rate,
-            .poll_frames = core.sensor_frames,
-            .model = .steady,
-        },
+        touch_config,
         probe.source(),
         sink.port(),
         status,
@@ -557,4 +579,80 @@ test "the run loop comes out when it is asked to" {
 
     try app.run(Stopper.afterThree);
     try testing.expectEqual(@as(usize, 3), sink.blocks);
+}
+
+/// A hand on for seven seconds, off for two, on again -- two touches far
+/// enough apart that the guard between them has opened.
+fn twoVisits(poll: usize) ports.Reading {
+    const polls_per_s = core.sample_rate / core.sensor_frames;
+    const held = poll < 7 * polls_per_s or poll >= 9 * polls_per_s;
+    return .{
+        .raw_a = if (held) heldA(poll).raw_a else flailingA(poll),
+        .raw_bc = 0,
+    };
+}
+
+/// Sixteen seconds: both visits and the gap between them.
+const two_visit_blocks: usize = 16 * core.sample_rate / core.block_frames;
+
+test "under steady, a touch past the guard swaps the clip" {
+    // What the room does: hears something, waits, touches again to move it on.
+    // The detector model decides only when a touch is reported; the guard and
+    // the swap are a layer above it and do not know which model is running.
+    var clips: FakeClips = .{};
+    _ = try runClipPlantA(twoVisits, two_visit_blocks, &clips);
+
+    // Two visits, two clips.
+    try testing.expectEqual(@as(usize, 2), clips.requests);
+}
+
+test "under steady, the second visit is a different clip" {
+    // And the folder is dealt rather than drawn from, so the second visit
+    // cannot land on what the first one played.
+    var clips: FakeClips = .{ .track_indices = true };
+    _ = try runClipPlantA(twoVisits, two_visit_blocks, &clips);
+
+    try testing.expectEqual(@as(usize, 2), clips.requests);
+    try testing.expect(clips.first_index != clips.last_index);
+}
+
+/// A hand that puts the probe somewhere the band does not cover: still, and a
+/// long way from rest, and not a touch.
+fn heldOutsideBand(poll: usize) ports.Reading {
+    _ = poll;
+    return .{ .raw_a = 2400, .raw_bc = 0 };
+}
+
+test "a band decides whether a touch happened at all, whatever the mode" {
+    // The band is the detector's, and the mode is the voice's. So a band keeps
+    // a plant in `trigger` from firing on a level a hand does not put it at,
+    // exactly as it keeps a held one from sounding -- there is no mode in the
+    // question.
+    var banded = steadyTouchConfig();
+    banded.touch_band_lo = 630;
+    banded.touch_band_hi = 690;
+
+    var inside: FakeClips = .{};
+    _ = try runVoicesWith(heldA, warmup_blocks, .{ true, false }, .{
+        clipVoice(&inside, 0),
+        droneVoice(),
+    }, banded);
+    try testing.expect(inside.requests > 0);
+
+    var outside: FakeClips = .{};
+    _ = try runVoicesWith(heldOutsideBand, warmup_blocks, .{ true, false }, .{
+        clipVoice(&outside, 1),
+        droneVoice(),
+    }, banded);
+    try testing.expectEqual(@as(usize, 0), outside.requests);
+}
+
+test "without a band that same level is a touch" {
+    // So the test above is about the band and not about the level.
+    var outside: FakeClips = .{};
+    _ = try runVoices(heldOutsideBand, warmup_blocks, .{ true, false }, .{
+        clipVoice(&outside, 0),
+        droneVoice(),
+    });
+    try testing.expect(outside.requests > 0);
 }
