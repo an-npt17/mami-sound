@@ -617,11 +617,18 @@ pub const Detector = struct {
         // its own says nothing: a probe with nothing connected to it is stiller
         // than any hand could hold one.
         const held = range <= self.still_range and away;
-        // And let go once it is wandering again. The spread alone is enough
-        // here: a hand coming off takes the probe from where it was held back
-        // to where it rests, and the window spends a second holding both --
-        // which is a spread of hundreds however still either end of it is.
-        const loose = range >= self.still_release;
+        // And let go once it is wandering again, or once it is no longer where
+        // a held probe sits.
+        //
+        // The spread alone is not enough, though it looks it: a hand coming off
+        // usually drags the window through both levels and that is a spread of
+        // hundreds. But a rig whose untouched reading is a flat nought has no
+        // spread to speak of at either end, and a release set wide enough not
+        // to trip on ordinary noise then never trips at all -- the probe leaves
+        // the band, stops being held, and stays latched because nothing tells
+        // it not to. The drop counter is the hysteresis here; a reading sitting
+        // on the edge of the band has ninety milliseconds to make its mind up.
+        const loose = range >= self.still_release or !away;
         self.at_rest = loose;
 
         if (self.blocked) {
@@ -1290,4 +1297,27 @@ test "without a band the learned rest still decides" {
     settle(&detector);
     for (0..steady_warmup) |_| _ = detector.update(655);
     try std.testing.expect(detector.on);
+}
+
+test "a banded probe lets go even when rest is as still as the touch" {
+    // The configuration a room actually types: a band around where a hand puts
+    // the probe, a release wide enough not to trip on ordinary noise, and a rig
+    // whose untouched reading is a flat nought.
+    //
+    // Release watched only the spread, and a flat rest has no spread. So the
+    // probe left the band, stopped being held, and never came off -- because
+    // nothing ever told it to.
+    var cfg = steadyConfig();
+    cfg.still_band_lo = 630;
+    cfg.still_band_hi = 690;
+    cfg.still_range = 400;
+    cfg.still_release = 4000;
+    var detector: Detector = .init(cfg);
+
+    for (0..steady_warmup) |_| _ = detector.update(660);
+    try std.testing.expect(detector.on);
+
+    // The hand comes off and the probe goes flat at nought, as this rig does.
+    for (0..steady_warmup) |poll| _ = detector.update(flatlined(poll));
+    try std.testing.expect(!detector.on);
 }

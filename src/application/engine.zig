@@ -18,6 +18,9 @@ pub const Engine = struct {
     /// them: it hands each its own probe and its own share of the block, and
     /// which of them is a drone and which a folder of clips is not its business.
     voices: [2]voice_mod.Voice,
+    /// Where the raw readings go while a rig is being measured. `null` in a
+    /// run that is not measuring one, which is every run but a diagnostic.
+    capture: ?ports.ProbeCapture,
     block: [core.block_frames]f32,
     pcm: [core.block_frames]i16,
     rendered: usize,
@@ -31,6 +34,7 @@ pub const Engine = struct {
         /// Already built, because what a plant plays is a composition decision
         /// and this is not where compositions are made.
         voices: [2]voice_mod.Voice,
+        capture: ?ports.ProbeCapture,
     ) Engine {
         return .{
             .selection = selection,
@@ -39,6 +43,7 @@ pub const Engine = struct {
             .status = status,
             .machine = core.touch.Machine.init(touch_config),
             .voices = voices,
+            .capture = capture,
             .block = undefined,
             .pcm = undefined,
             .rendered = 0,
@@ -58,6 +63,7 @@ pub const Engine = struct {
             const reading = self.probe.read(core.sensor_frames);
             raw_a = reading.raw_a;
             raw_bc = reading.raw_bc;
+            if (self.capture) |*writer| writer.record(raw_a, raw_bc);
             const detected = self.machine.update(raw_a, raw_bc);
             touched = core.select.apply(self.selection, .{
                 detected == .plant_a or detected == .both,
@@ -291,6 +297,7 @@ fn runVoices(
         sink.port(),
         status,
         voices,
+        null,
     );
 
     // Nobody there, so the detectors learn where the probes rest.
@@ -478,6 +485,7 @@ test "one plant holding and the other triggering do not borrow each other's rule
         sink.port(),
         status,
         .{ heldClipVoice(&a, 0), clipVoice(&b, 1) },
+        null,
     );
 
     for (0..settle_blocks) |_| try app.step();
