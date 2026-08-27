@@ -274,6 +274,22 @@ pub const default_still_release: i16 = 512;
 /// six hundred and fifty a hand moves it, which is the gap this has to fall in.
 pub const default_still_move: i16 = 100;
 
+/// How long the steady model watches an untouched probe before it will judge
+/// one, in seconds.
+///
+/// Rest is learned once and then kept, rather than tracked. A rolling median is
+/// touch-proof only while touches take up less than half its window, and on the
+/// capture in `touch.csv` they do not: for the first four hundred and fifty
+/// seconds somebody is holding plant B most of the time, the median follows
+/// them, and the probe ends up measured against the hand instead of against
+/// rest. An installation powers on before the room opens, so the few seconds
+/// after boot are the one stretch nobody is touching anything.
+///
+/// The cost is that a hand on a plant at power-on teaches the wrong rest, and
+/// the plant stays quiet until it is restarted. The startup line prints what
+/// each probe settled on so that is visible rather than mysterious.
+pub const default_still_rest_s: f32 = 5.0;
+
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
 /// few polls in the middle of a real touch, and releasing on that would end a
@@ -292,6 +308,7 @@ pub const Config = struct {
     still_range: i16 = default_still_range,
     still_release: i16 = default_still_release,
     still_move: i16 = default_still_move,
+    still_rest_s: f32 = default_still_rest_s,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -423,6 +440,8 @@ pub const Detector = struct {
     still_range: i16,
     still_release: i16,
     still_move: i16,
+    /// How many baseline samples the calibration wants before rest is settled.
+    rest_samples: u32,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -461,6 +480,10 @@ pub const Detector = struct {
             .still_range = cfg.still_range,
             .still_release = cfg.still_release,
             .still_move = cfg.still_move,
+            .rest_samples = @max(
+                @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
+                1,
+            ),
         };
     }
 
@@ -533,17 +556,12 @@ pub const Detector = struct {
         // -- which is what lets rest be learned while the piece is running
         // rather than measured once and typed in.
         //
-        // And not learned at all while a hand is believed to be there. The
-        // median is touch-proof only up to half its window: a hand held longer
-        // than that becomes the rest it is being measured against, and the
-        // plant lets go with somebody still holding it. That is a fair trade
-        // for a model watching a probe move and no trade at all for one
-        // watching it hold still, where a hand may stay for the length of an
-        // interview. Freezing costs nothing: rest is what the probe reads when
-        // nobody is on it, and this is exactly when somebody is.
-        self.baseline.frozen = self.on;
+        // Learned once and then kept. Tracking it does not work: a median is
+        // touch-proof only while touches take up less than half its window, and
+        // a plant somebody keeps hold of ends up measured against the hand.
+        self.baseline.frozen = self.baseline.count >= self.rest_samples;
         self.baseline.push(self.spread.level);
-        if (!self.baseline.ready()) {
+        if (self.baseline.count < self.rest_samples) {
             self.reset();
             return false;
         }
@@ -1116,4 +1134,61 @@ test "a hand held for a minute is still a hand" {
     for (0..90 * polls_per_s) |_| _ = detector.update(657);
 
     try std.testing.expect(detector.on);
+}
+
+test "rest is learned once and not moved by a plant nobody leaves alone" {
+    // What a rolling median could not do. On the capture in `touch.csv` plant B
+    // is held for most of the first four hundred and fifty seconds, the median
+    // follows the hand, and the probe ends up measured against the hand instead
+    // of against rest. Learned once at power-on, it cannot.
+    var detector: Detector = .init(steadyConfig());
+    settle(&detector);
+
+    // Then somebody who barely lets go: forty seconds on, five off, over and
+    // over, which is more than half of every window a median could look back
+    // over.
+    const polls_per_s = 44100 / sensor_poll_frames;
+    var latched: usize = 0;
+    for (0..6) |_| {
+        for (0..5 * polls_per_s) |poll| _ = detector.update(flailing(poll));
+        for (0..40 * polls_per_s) |_| {
+            _ = detector.update(657);
+            if (detector.on) latched += 1;
+        }
+    }
+
+    // Still finding the hand at the end of it, which needs rest to have stayed
+    // where the empty room put it.
+    try std.testing.expect(detector.on);
+    try std.testing.expect(latched > 200 * polls_per_s);
+}
+
+test "a probe held at power-on teaches the wrong rest, and says so" {
+    // The cost of learning once. Nothing can be done about it in software --
+    // the probe has never been seen untouched -- so the thing that matters is
+    // that it fails quietly silent rather than quietly wrong, and that the
+    // level it settled on is available to be printed.
+    var detector: Detector = .init(steadyConfig());
+    for (0..rest_warmup) |_| _ = detector.update(657);
+    for (0..steady_warmup) |_| _ = detector.update(657);
+
+    try std.testing.expect(!detector.on);
+    try std.testing.expectEqual(@as(i16, 657), detector.baseline.base);
+}
+
+test "nothing is judged until rest has been learned" {
+    // The guard on a half-formed median. Whatever the probe does in the seconds
+    // after power-on, the model has not yet seen enough of it to say where rest
+    // is, and a plant that latched on the way to finding out would answer the
+    // first person through the door for no reason.
+    var cfg = steadyConfig();
+    cfg.still_rest_s = 5.0;
+    var detector: Detector = .init(cfg);
+
+    const polls_per_s = 44100 / sensor_poll_frames;
+    for (0..5 * polls_per_s) |poll| {
+        // Perfectly still, a long way from anywhere, from the first poll.
+        _ = detector.update(if (poll < polls_per_s) flailing(poll) else 9000);
+        try std.testing.expect(!detector.on);
+    }
 }

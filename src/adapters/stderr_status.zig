@@ -71,15 +71,21 @@ fn formatLine(
         out.* = if (awake) letter else '-';
     }
 
-    return std.fmt.bufPrint(buf, "t={d:.0}s a0={d} a1={d} z0={d:.1} z1={d:.1} state={s} touch={s}\n", .{
-        audio_s,
-        snapshot.raw_a,
-        snapshot.raw_bc,
-        snapshot.z_a,
-        snapshot.z_bc,
-        @tagName(snapshot.state),
-        &touched,
-    });
+    return std.fmt.bufPrint(
+        buf,
+        "t={d:.0}s a0={d} a1={d} r0={d} r1={d} z0={d:.1} z1={d:.1} state={s} touch={s}\n",
+        .{
+            audio_s,
+            snapshot.raw_a,
+            snapshot.raw_bc,
+            snapshot.rest_a,
+            snapshot.rest_bc,
+            snapshot.z_a,
+            snapshot.z_bc,
+            @tagName(snapshot.state),
+            &touched,
+        },
+    );
 }
 
 test "formatLine labels runtime diagnostics" {
@@ -88,6 +94,8 @@ test "formatLine labels runtime diagnostics" {
         .raw_bc = -34,
         .z_a = 1.5,
         .z_bc = -2.5,
+        .rest_a = 660,
+        .rest_bc = 1,
         .state = .plant_bc,
         .touched = .{ true, false },
         .block = &.{},
@@ -97,7 +105,7 @@ test "formatLine labels runtime diagnostics" {
     const line = try formatLine(&buffer, snapshot, 1.0);
 
     try std.testing.expectEqualStrings(
-        "t=1s a0=12 a1=-34 z0=1.5 z1=-2.5 state=plant_bc touch=A-\n",
+        "t=1s a0=12 a1=-34 r0=660 r1=1 z0=1.5 z1=-2.5 state=plant_bc touch=A-\n",
         line,
     );
 }
