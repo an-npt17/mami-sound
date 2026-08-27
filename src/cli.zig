@@ -162,10 +162,12 @@ fn parseCounts(text: []const u8) ?i16 {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--device=NAME]
-    \\                  [--plant-a=SOURCE] [--plant-a-seconds=N] [--plant-a-retrigger=N]
-    \\                  [--plant-b=SOURCE] [--plant-b-seconds=N] [--plant-b-retrigger=N]
+    \\                  [--plant-a=SOURCE] [--plant-a-mode=MODE]
+    \\                  [--plant-a-seconds=N] [--plant-a-retrigger=N]
+    \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE]
+    \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--test-random-probe]
+    \\                  [--still-window=SECONDS] [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A only
@@ -363,4 +365,38 @@ test "the stillness window can be shortened from the command line" {
 test "a window of no time at all is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=0"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
+}
+
+test "the usage banner names every flag the parser takes" {
+    // The banner has gone stale twice: --plant-a-mode and --still-window both
+    // worked, were documented in the body, and were missing from the summary
+    // at the top. A flag nobody can find is a flag nobody uses.
+    const flags = [_][]const u8{
+        "--device=",
+        "--plant-a=",
+        "--plant-a-mode=",
+        "--plant-a-seconds=",
+        "--plant-a-retrigger=",
+        "--plant-b=",
+        "--plant-b-mode=",
+        "--plant-b-seconds=",
+        "--plant-b-retrigger=",
+        "--touch-model=",
+        "--still-range=",
+        "--still-release=",
+        "--still-window=",
+        "--test-random-probe",
+    };
+    const banner_end = std.mem.indexOf(u8, usage, "\nPLANTS").?;
+    const banner = usage[0..banner_end];
+
+    for (flags) |flag| {
+        // The name without its `=`, so the banner may write it as `=N` or
+        // `=SOURCE` however it likes.
+        const name = flag[0 .. flag.len - @as(usize, if (flag[flag.len - 1] == '=') 1 else 0)];
+        if (std.mem.indexOf(u8, banner, name) == null) {
+            std.debug.print("usage banner does not name {s}\n", .{name});
+            return error.FlagMissingFromBanner;
+        }
+    }
 }
