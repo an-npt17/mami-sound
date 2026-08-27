@@ -221,7 +221,13 @@ fn runComposition(
     std.debug.print("loading: starting engine...\n", .{});
     var app = engine.Engine.init(
         opts.plants,
-        production_config.touchWith(opts.model, opts.still_range, opts.still_release, held),
+        production_config.touchWith(
+            opts.model,
+            opts.still_range,
+            opts.still_release,
+            opts.still_window_ms,
+            held,
+        ),
         probe.source(),
         sink_port,
         status.port(),

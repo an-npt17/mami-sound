@@ -49,6 +49,7 @@ pub fn touchWith(
     model: ?core.touch.Model,
     still_range: ?i16,
     still_release: ?i16,
+    still_window_ms: ?f32,
     /// Which plants sound while they are held. A held probe drops its tap
     /// window: the window asks whether a hand left in time, a hold asks whether
     /// it is still there, and both cannot be answered at once.
@@ -60,6 +61,7 @@ pub fn touchWith(
     cfg.hold_bc = held[1];
     if (still_range) |counts| cfg.still_range = counts;
     if (still_release) |counts| cfg.still_release = counts;
+    if (still_window_ms) |ms| cfg.still_window_ms = ms;
     return cfg;
 }
 
@@ -75,7 +77,7 @@ pub const drone: core.noise.Shape = .{
 const std = @import("std");
 
 test "an override reaches the config and the rest of the preset stands" {
-    const cfg = touchWith(.steady, 64, null, .{ false, false });
+    const cfg = touchWith(.steady, 64, null, null, .{ false, false });
     try std.testing.expectEqual(core.touch.Model.steady, cfg.model);
     try std.testing.expectEqual(@as(i16, 64), cfg.still_range);
     // Untouched by the override, so still the measured number.
@@ -84,14 +86,14 @@ test "an override reaches the config and the rest of the preset stands" {
 }
 
 test "no overrides is the preset exactly" {
-    try std.testing.expectEqual(touch, touchWith(null, null, null, .{ false, false }));
+    try std.testing.expectEqual(touch, touchWith(null, null, null, null, .{ false, false }));
 }
 
 test "a held plant drops its tap window, and only that plant's" {
     // The preset gives plant B a tap window for the rig it was measured on. A
     // plant told to sound while it is held cannot also be asked whether the
     // hand left in time, and the other plant keeps whatever it was given.
-    const b_held = touchWith(null, null, null, .{ false, true });
+    const b_held = touchWith(null, null, null, null, .{ false, true });
     try std.testing.expect(!b_held.hold);
     try std.testing.expect(b_held.hold_bc);
 

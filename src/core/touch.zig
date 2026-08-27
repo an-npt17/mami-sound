@@ -214,9 +214,18 @@ pub const Model = enum { deviation, steady };
 
 /// How wide the window the `steady` model measures a probe's spread over.
 ///
-/// A second. Long enough that a probe left alone always shows its flailing
-/// inside it, short enough that a hand is heard about a second after it lands
-/// -- and the hold that follows is counted on top.
+/// A second, and the number that matters most in this model.
+///
+/// It buys the answer's stability, not its speed. Swept against the capture in
+/// `touch.csv`, probe BC gives 39 touches averaging 5.5 seconds over a
+/// one-second window, 157 averaging 1.5 over half a second, and 582 averaging
+/// 0.46 over a quarter. Nobody touched that plant 582 times in fifteen minutes:
+/// a short window does not find more hands, it breaks one hand into many.
+///
+/// Shorter is still worth having on the command line. A held voice absorbs the
+/// fragments -- it waits a second of no hand before letting a clip go -- so a
+/// rig that wants to hear a hand sooner can trade the stability it no longer
+/// needs.
 pub const default_still_window_ms: f32 = 1000.0;
 
 /// The spread, in counts, at or below which a probe counts as held, and the one
@@ -231,13 +240,24 @@ pub const default_still_window_ms: f32 = 1000.0;
 /// its time under a spread of 8 and 50% of it over a spread of 2048, with only
 /// 3% anywhere between 32 and 512. Anything inside that gap works.
 ///
-/// 64 rather than the 128 the gap would also allow, because `zig build replay
-/// -- touch.csv --sweep` shows where the cliff is: every threshold from 4 to
-/// 128 reports the same thing on that capture, 12 to 20 touches on A and 26 to
-/// 37 on BC, and then 1024 reports A latched for 82% of the run, which is a
-/// detector stuck on. Sitting in the middle of the plateau rather than at its
-/// edge costs one episode in nine hundred seconds.
-pub const default_still_range: i16 = 64;
+/// A hand holds a probe far tighter than this. In the capture in `touch.csv`
+/// the middle window of a held probe spreads three counts, and nine in ten
+/// spread under fourteen -- so ten would be the number, and is the number this
+/// wants to become.
+///
+/// Thirty-two is what the rig's dropouts force meanwhile. The fixture
+/// `heldPlantA`, taken from fifteen minutes of the floating rig, spreads
+/// twenty-two: not because the hand moves, but because the rails it throws at
+/// one poll in eight push the twentieth percentile off the clamped level and
+/// onto a dropout. At ten that probe never latches at all. At thirty-two it
+/// latches with margin, and still rejects the thousands a probe left alone
+/// spreads.
+///
+/// The cost of the difference is small and measured: against the same capture,
+/// ten rejects about a tenth of genuinely held windows and thirty-two rejects
+/// about a twentieth. Once the conversion reads come back clean, drop this to
+/// ten with `--still-range=10`.
+pub const default_still_range: i16 = 32;
 pub const default_still_release: i16 = 512;
 
 /// How long the readings must stop being still before a touch is called off,
@@ -929,4 +949,41 @@ test "a warm baseline does not absorb a hand the way a cold one does" {
     }
 
     try std.testing.expect(polls_reported > held_polls / 2);
+}
+
+test "the steady model judges the range and not the value" {
+    // The whole of what this model is: a probe held anywhere at all reads as
+    // held, and two probes clamped a thousand counts apart with the same wobble
+    // must give the same answer on the same poll. Nothing here consults where a
+    // drone would map that level to, or anything else about the voice.
+    const levels = [_]i16{ 663, 1, -2000, 12000 };
+    var detectors: [levels.len]Detector = undefined;
+    for (&detectors) |*detector| detector.* = .init(steadyConfig());
+
+    for (0..steady_warmup) |poll| {
+        // The same shape of wobble around each of them, well inside the range.
+        const wobble: i16 = @intCast(@as(i32, @intCast(poll % 5)) - 2);
+        var first: ?bool = null;
+        for (&detectors, levels) |*detector, level| {
+            const on = detector.update(level +| wobble);
+            if (first) |expected| {
+                try std.testing.expectEqual(expected, on);
+            } else {
+                first = on;
+            }
+        }
+    }
+
+    for (&detectors) |*detector| try std.testing.expect(detector.on);
+}
+
+test "a probe wandering further than the range is not held, wherever it sits" {
+    // The other half. A slow drift is not a hand, and neither is a probe
+    // parked at a plausible-looking level while still moving about.
+    var detector: Detector = .init(steadyConfig());
+    for (0..steady_warmup) |poll| {
+        const drift: i16 = @intCast(@as(i32, @intCast(poll % 400)) - 200);
+        _ = detector.update(663 +| drift);
+    }
+    try std.testing.expect(!detector.on);
 }

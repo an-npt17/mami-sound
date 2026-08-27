@@ -49,6 +49,7 @@ pub const Options = struct {
     model: ?touch.Model = null,
     still_range: ?i16 = null,
     still_release: ?i16 = null,
+    still_window_ms: ?f32 = null,
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
@@ -99,6 +100,11 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
             opts.still_release = parseCounts(arg["--still-release=".len..]) orelse
                 return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--still-window=")) {
+            const ms = parseSeconds(arg["--still-window=".len..]) orelse
+                return Error.InvalidStillThreshold;
+            if (ms <= 0.0) return Error.InvalidStillThreshold;
+            opts.still_window_ms = ms * 1000.0;
         } else if (std.mem.eql(u8, arg, "--plant-a")) {
             // The shorthand the flag had when it was a switch, kept so a unit
             // file already passing it keeps starting.
@@ -207,9 +213,15 @@ pub const usage =
     \\--still-range and --still-release are that model's two thresholds, in
     \\counts: at or below the range the probe is being held, at or above the
     \\release the touch is over, and between them nothing changes. Defaults are
-    \\64 and 512. Raise the range if touches are missed, lower it if the rig
-    \\latches on its own. `zig build replay -- CAPTURE --sweep` picks them from
-    \\a recording rather than from the room.
+    \\32 and 512. A hand actually holds a probe to about three counts; 32 is
+    \\room for the dropouts this rig throws, and --still-range=10 is the number
+    \\to use once the conversion reads come back clean.
+    \\
+    \\--still-window is how long a stretch of readings that range is measured
+    \\over, in seconds. It buys the answer's stability rather than its speed:
+    \\shortening it to a quarter of a second finds one hand fifteen times over
+    \\rather than finding more hands. Default 1. `zig build replay -- CAPTURE
+    \\--sweep` picks all three from a recording rather than from the room.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
     \\
@@ -340,4 +352,15 @@ test "a mode given to the drone is refused" {
     // The drone already holds: its gate opens under a hand and falls to an idle
     // floor when the hand goes. A flag that changed nothing would only mislead.
     try std.testing.expectError(Error.ModeOnDrone, parse(&.{"--plant-a-mode=hold"}));
+}
+
+test "the stillness window can be shortened from the command line" {
+    const opts = try parse(&.{"--still-window=0.25"});
+    try std.testing.expectEqual(@as(f32, 250.0), opts.still_window_ms.?);
+    try std.testing.expect((try parse(&.{})).still_window_ms == null);
+}
+
+test "a window of no time at all is refused" {
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=0"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
 }
