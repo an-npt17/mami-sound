@@ -290,6 +290,19 @@ pub const default_still_move: i16 = 100;
 /// each probe settled on so that is visible rather than mysterious.
 pub const default_still_rest_s: f32 = 5.0;
 
+/// Where a held probe sits, when the room knows and can say so.
+///
+/// Unset, the model works rest out for itself and calls a hand stillness a
+/// hundred counts away from it -- which needs a stretch after power-on with
+/// nobody touching anything, and teaches the wrong answer if it does not get
+/// one. A band needs neither: it states outright what a touch looks like, so
+/// there is nothing to learn and nothing to learn wrongly.
+///
+/// Worth setting once a rig has been watched. On this one a hand puts a probe
+/// at 650 to 660 and nothing else does.
+pub const default_still_band_lo: ?i16 = null;
+pub const default_still_band_hi: ?i16 = null;
+
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
 /// few polls in the middle of a real touch, and releasing on that would end a
@@ -309,6 +322,8 @@ pub const Config = struct {
     still_release: i16 = default_still_release,
     still_move: i16 = default_still_move,
     still_rest_s: f32 = default_still_rest_s,
+    still_band_lo: ?i16 = default_still_band_lo,
+    still_band_hi: ?i16 = default_still_band_hi,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -442,6 +457,10 @@ pub const Detector = struct {
     still_move: i16,
     /// How many baseline samples the calibration wants before rest is settled.
     rest_samples: u32,
+    /// Where a held probe sits, when the room said so. Unset, rest is learned
+    /// and a hand is stillness away from it.
+    band_lo: ?i16,
+    band_hi: ?i16,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -480,6 +499,8 @@ pub const Detector = struct {
             .still_range = cfg.still_range,
             .still_release = cfg.still_release,
             .still_move = cfg.still_move,
+            .band_lo = cfg.still_band_lo,
+            .band_hi = cfg.still_band_hi,
             .rest_samples = @max(
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
@@ -570,21 +591,32 @@ pub const Detector = struct {
         // -- which is what lets rest be learned while the piece is running
         // rather than measured once and typed in.
         //
-        // Learned once and then kept. Tracking it does not work: a median is
+        // A band is the room telling the model what a touch looks like, which
+        // leaves it nothing to learn. Without one, rest is learned once and
+        // then kept -- tracking it does not work, because a median is
         // touch-proof only while touches take up less than half its window, and
         // a plant somebody keeps hold of ends up measured against the hand.
-        self.baseline.frozen = self.baseline.count >= self.rest_samples;
-        self.baseline.push(self.spread.level);
-        if (self.baseline.count < self.rest_samples) {
-            self.reset();
-            return false;
+        const banded = self.band_lo != null or self.band_hi != null;
+        if (!banded) {
+            self.baseline.frozen = self.baseline.count >= self.rest_samples;
+            self.baseline.push(self.spread.level);
+            if (self.baseline.count < self.rest_samples) {
+                self.reset();
+                return false;
+            }
         }
-        const moved = clampedAbsDiff(self.spread.level, self.baseline.base);
+
+        const level = self.spread.level;
+        const away = if (banded)
+            (self.band_lo == null or level >= self.band_lo.?) and
+                (self.band_hi == null or level <= self.band_hi.?)
+        else
+            clampedAbsDiff(level, self.baseline.base) >= self.still_move;
 
         // Still, and somewhere the probe does not normally sit. Stillness on
         // its own says nothing: a probe with nothing connected to it is stiller
         // than any hand could hold one.
-        const held = range <= self.still_range and moved >= self.still_move;
+        const held = range <= self.still_range and away;
         // And let go once it is wandering again. The spread alone is enough
         // here: a hand coming off takes the probe from where it was held back
         // to where it rests, and the window spends a second holding both --
@@ -1205,4 +1237,57 @@ test "nothing is judged until rest has been learned" {
         _ = detector.update(if (poll < polls_per_s) flailing(poll) else 9000);
         try std.testing.expect(!detector.on);
     }
+}
+
+test "a band says what a touch looks like, so no rest need be learned" {
+    // What the room can see and the calibration cannot always get: on this rig
+    // a hand puts the probe at 650 to 660 and nothing else does. Told that, the
+    // model needs no untouched stretch at power-on to compare against, which is
+    // the one failure it could not detect or recover from.
+    var cfg = steadyConfig();
+    cfg.still_band_lo = 650;
+    cfg.still_band_hi = 660;
+    var detector: Detector = .init(cfg);
+
+    // Held from the very first poll, with no rest ever observed.
+    for (0..steady_warmup) |_| _ = detector.update(655);
+    try std.testing.expect(detector.on);
+}
+
+test "stillness outside the band is not a touch, however still" {
+    var cfg = steadyConfig();
+    cfg.still_band_lo = 650;
+    cfg.still_band_hi = 660;
+    var detector: Detector = .init(cfg);
+
+    // The dead probe from the journal: nought and one, for as long as you like.
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flatlined(poll));
+    try std.testing.expect(!detector.on);
+
+    // And a probe parked still at a level that is simply not a hand.
+    var other: Detector = .init(cfg);
+    for (0..steady_warmup * 2) |_| _ = other.update(2400);
+    try std.testing.expect(!other.on);
+}
+
+test "a banded probe lets go when the hand does" {
+    var cfg = steadyConfig();
+    cfg.still_band_lo = 650;
+    cfg.still_band_hi = 660;
+    var detector: Detector = .init(cfg);
+
+    for (0..steady_warmup) |_| _ = detector.update(655);
+    try std.testing.expect(detector.on);
+
+    for (0..steady_warmup) |poll| _ = detector.update(flailing(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "without a band the learned rest still decides" {
+    // The band is an option, not a replacement: a rig whose touched level moves
+    // about keeps the model that works that out for itself.
+    var detector: Detector = .init(steadyConfig());
+    settle(&detector);
+    for (0..steady_warmup) |_| _ = detector.update(655);
+    try std.testing.expect(detector.on);
 }

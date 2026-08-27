@@ -227,6 +227,7 @@ fn runComposition(
             opts.still_range,
             opts.still_release,
             opts.still_window_ms,
+            opts.still_band,
             held,
         ),
         probe.source(),

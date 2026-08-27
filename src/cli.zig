@@ -50,6 +50,9 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// Where a held probe sits, when the room can say. Both ends together or
+    /// neither: half a band is a typo, not a setting.
+    still_band: ?[2]i16 = null,
 
     pub fn device(self: *const Options) []const u8 {
         if (self.device_len == 0) return default_device;
@@ -85,6 +88,9 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--plant-b-retrigger=")) {
             opts.plant_retrigger[1] = parseSeconds(arg["--plant-b-retrigger=".len..]) orelse
                 return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--still-band=")) {
+            opts.still_band = parseBand(arg["--still-band=".len..]) orelse
+                return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
             opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
                 return Error.InvalidMode;
@@ -143,6 +149,15 @@ fn parseSeconds(text: []const u8) ?f32 {
     return if (value >= 0.0) value else null;
 }
 
+/// `LO:HI`, both ends, low end first. A band with one end open would be a
+/// threshold wearing a band's name.
+fn parseBand(text: []const u8) ?[2]i16 {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
+    const lo = std.fmt.parseInt(i16, text[0..colon], 10) catch return null;
+    const hi = std.fmt.parseInt(i16, text[colon + 1 ..], 10) catch return null;
+    return if (lo < hi) .{ lo, hi } else null;
+}
+
 fn parseMode(name: []const u8) ?clips.Mode {
     return std.meta.stringToEnum(clips.Mode, name);
 }
@@ -167,7 +182,8 @@ pub const usage =
     \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE]
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS] [--test-random-probe]
+    \\                  [--still-window=SECONDS] [--still-band=LO:HI]
+    \\                  [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A only
@@ -218,6 +234,13 @@ pub const usage =
     \\32 and 512. A hand actually holds a probe to about three counts; 32 is
     \\room for the dropouts this rig throws, and --still-range=10 is the number
     \\to use once the conversion reads come back clean.
+    \\
+    \\--still-band says where a held probe sits, as LO:HI in counts. Given one,
+    \\the model needs no untouched stretch after power-on to work rest out from,
+    \\and cannot learn the wrong rest because somebody had hold of a plant while
+    \\it was starting. Left off, rest is learned and a touch is stillness a
+    \\hundred counts away from it. Set it once you have watched the rig: the
+    \\status line's l0 and l1 are the levels to read it off.
     \\
     \\--still-window is how long a stretch of readings that range is measured
     \\over, in seconds. It buys the answer's stability rather than its speed:
@@ -399,4 +422,20 @@ test "the usage banner names every flag the parser takes" {
             return error.FlagMissingFromBanner;
         }
     }
+}
+
+test "a band takes both ends, low first" {
+    const opts = try parse(&.{"--still-band=650:660"});
+    try std.testing.expectEqual(@as(i16, 650), opts.still_band.?[0]);
+    try std.testing.expectEqual(@as(i16, 660), opts.still_band.?[1]);
+    try std.testing.expect((try parse(&.{})).still_band == null);
+}
+
+test "half a band, or one the wrong way round, is refused" {
+    // A band with one end open is a threshold wearing a band's name, and one
+    // that runs backwards can never contain anything.
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=660:650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=650:"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=a:b"}));
 }
