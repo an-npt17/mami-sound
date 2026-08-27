@@ -195,6 +195,9 @@ const FakeClips = struct {
     playing: bool = false,
     requests: usize = 0,
     level: f32 = 0.5,
+    /// Samples asked for, so a test can tell a stream still being drained from
+    /// one a held voice has stopped consuming.
+    drained: usize = 0,
 
     fn render(context: *anyopaque, out: []f32, request: ?usize) void {
         const self: *FakeClips = @ptrCast(@alignCast(context));
@@ -203,6 +206,7 @@ const FakeClips = struct {
             self.playing = true;
         }
         if (!self.playing) return;
+        self.drained += out.len;
         for (out) |*sample| sample.* += self.level;
     }
 
@@ -237,6 +241,13 @@ fn alternatingA(poll: usize) ports.Reading {
 
 /// Four seconds: several touches, all inside one clip's five-second guard.
 const guard_blocks: usize = 4 * core.sample_rate / core.block_frames;
+
+fn heldClipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
+    var voice = clipVoice(stream, slot);
+    voice.clips.mode = .hold;
+    voice.clips.gate = 0.0;
+    return voice;
+}
 
 fn clipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
     const State = struct {
@@ -438,4 +449,56 @@ test "one plant left out does not stop the other" {
     try testing.expect(a.requests > 0);
     try testing.expectEqual(@as(usize, 0), b.requests);
     try testing.expect(alone.peak > 0);
+}
+
+test "one plant holding and the other triggering do not borrow each other's rule" {
+    // The two plants are told separately and must stay told separately: plant A
+    // set to hold and plant B to trigger have to answer the same pair of hands
+    // in two different ways, in the same run, in the same block.
+    var a: FakeClips = .{};
+    var b: FakeClips = .{};
+
+    var probe: FakeProbe = .{ .pattern = resting };
+    var sink: FakeSink = .{};
+    const status: ports.StatusSink = .{ .context = &sink, .observe_fn = ignoreStatus };
+
+    var app = Engine.init(
+        .{ true, true },
+        .{
+            .sample_rate = core.sample_rate,
+            .poll_frames = core.sensor_frames,
+            .model = .steady,
+        },
+        probe.source(),
+        sink.port(),
+        status,
+        .{ heldClipVoice(&a, 0), clipVoice(&b, 1) },
+    );
+
+    for (0..settle_blocks) |_| try app.step();
+
+    // Both hands arrive.
+    probe.pattern = heldBoth;
+    probe.poll = 0;
+    for (0..warmup_blocks) |_| try app.step();
+    try testing.expect(a.requests > 0);
+    try testing.expect(b.requests > 0);
+
+    // Both hands leave, for well over the held plant's release.
+    probe.pattern = restingBoth;
+    probe.poll = 0;
+    for (0..warmup_blocks) |_| try app.step();
+
+    const a_after = a.drained;
+    const b_after = b.drained;
+    for (0..100) |_| try app.step();
+
+    // The held plant has stopped consuming its clip; the triggered one is
+    // playing on with nobody there, because that is what triggering means.
+    try testing.expectEqual(a_after, a.drained);
+    try testing.expect(b.drained > b_after);
+}
+
+fn restingBoth(poll: usize) ports.Reading {
+    return .{ .raw_a = flailingA(poll), .raw_bc = flailingA(poll) };
 }

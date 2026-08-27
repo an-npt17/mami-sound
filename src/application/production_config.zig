@@ -89,6 +89,22 @@ test "no overrides is the preset exactly" {
     try std.testing.expectEqual(touch, touchWith(null, null, null, null, .{ false, false }));
 }
 
+test "each plant is told to hold on its own" {
+    // Whichever plant is held, the other keeps whatever it was given. The two
+    // are configured separately and must stay that way through every layer.
+    const a_held = touchWith(null, null, null, null, .{ true, false });
+    try std.testing.expect(a_held.hold);
+    try std.testing.expect(!a_held.hold_bc);
+
+    const both = touchWith(null, null, null, null, .{ true, true });
+    try std.testing.expect(both.hold);
+    try std.testing.expect(both.hold_bc);
+
+    const neither = touchWith(null, null, null, null, .{ false, false });
+    try std.testing.expect(!neither.hold);
+    try std.testing.expect(!neither.hold_bc);
+}
+
 test "a held plant drops its tap window, and only that plant's" {
     // The preset gives plant B a tap window for the rig it was measured on. A
     // plant told to sound while it is held cannot also be asked whether the
