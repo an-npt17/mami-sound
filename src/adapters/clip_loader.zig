@@ -5,13 +5,6 @@ const library = @import("library.zig");
 
 pub const LoadedPool = struct {
     paths: []const []const u8,
-    /// Which directory each path came from, by index into `directoriesFor`.
-    ///
-    /// The pool is flat so a clip can be drawn from both folders without either
-    /// getting its own turn, and this is what is left of the fact that there
-    /// were two. Plant B alternates on it: the next clip comes from whichever
-    /// folder the last one did not.
-    folders: []const u8 = &.{},
     path_capacity: usize = 0,
 
     pub const empty: LoadedPool = .{ .paths = &.{} };
@@ -21,14 +14,9 @@ pub const LoadedPool = struct {
         if (self.path_capacity != 0) {
             gpa.free(@constCast(self.paths.ptr[0..self.path_capacity]));
         }
-        if (self.folders.len != 0) gpa.free(@constCast(self.folders));
         self.* = .empty;
     }
 };
-
-/// The most folders a pool is made of. Two, and the array below is sized for
-/// twice that so adding a third is a change to `directoriesFor` alone.
-const max_directories = 4;
 
 fn nextCapacity(current: usize, needed: usize) usize {
     if (current >= needed) return current;
@@ -83,7 +71,8 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
         // is no folder to return and an empty list would load as a pool with no
         // clips, which is silence nobody can tell from the piece working.
         .drone => unreachable,
-        .recordings => &.{ "interview files", "field records" },
+        .voicebox3 => &.{"Voice Box 3"},
+        .voicebox5 => &.{"Voice Box 5"},
         .insect => &.{"Insect"},
         .tradvn => &.{"Trad Vn Jam"},
         .bell => &.{"Bell Stems"},
@@ -104,79 +93,48 @@ pub fn loadPool(
     io: std.Io,
     which: core.source.Source,
 ) !LoadedPool {
-    const directories = directoriesFor(which);
-    std.debug.assert(directories.len <= max_directories);
-
     var pool: LoadedPool = .empty;
     errdefer pool.deinit(gpa);
 
-    // Where each directory's clips stop, so the folder each path came from can
-    // be written down once the pool has stopped moving under `appendPath`.
-    var ends: [max_directories]usize = undefined;
-
-    for (directories, 0..) |directory, folder| {
+    for (directoriesFor(which)) |directory| {
         const paths = try library.list(gpa, io, directory);
         defer library.freeList(gpa, paths);
 
         for (paths) |path| try appendPath(gpa, &pool, path);
-        ends[folder] = pool.paths.len;
     }
-
-    const folders = try gpa.alloc(u8, pool.paths.len);
-    var start: usize = 0;
-    for (ends[0..directories.len], 0..) |end, folder| {
-        for (folders[start..end]) |*of| of.* = @intCast(folder);
-        start = end;
-    }
-    pool.folders = folders;
 
     return pool;
 }
 
-test "each pool names the folders it is made of" {
-    try std.testing.expectEqual(@as(usize, 2), directoriesFor(.recordings).len);
-    try std.testing.expectEqualStrings("interview files", directoriesFor(.recordings)[0]);
-    try std.testing.expectEqualStrings("field records", directoriesFor(.recordings)[1]);
+test "every source names the one folder it is made of" {
+    // One each. The pool that read two folders as one went when the interviews
+    // became two boxes; a plant that wants both is two plants.
+    const sources = [_]core.source.Source{
+        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .bell, .piano,
+    };
+    for (sources) |which| {
+        try std.testing.expectEqual(@as(usize, 1), directoriesFor(which).len);
+    }
 
-    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.bell).len);
+    try std.testing.expectEqualStrings("Voice Box 3", directoriesFor(.voicebox3)[0]);
+    try std.testing.expectEqualStrings("Voice Box 5", directoriesFor(.voicebox5)[0]);
+    try std.testing.expectEqualStrings("Day bird", directoriesFor(.daybird)[0]);
+    try std.testing.expectEqualStrings("Insect", directoriesFor(.insect)[0]);
+    try std.testing.expectEqualStrings("Trad Vn Jam", directoriesFor(.tradvn)[0]);
     try std.testing.expectEqualStrings("Bell Stems", directoriesFor(.bell)[0]);
-
-    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.piano).len);
     try std.testing.expectEqualStrings("EPiano Stems", directoriesFor(.piano)[0]);
 }
 
-test "the pool remembers which folder each clip came from" {
+test "every source loads into a pool with clips in it" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    var pool = try loadPool(gpa, io, .recordings);
-    defer pool.deinit(gpa);
-
-    try std.testing.expectEqual(pool.paths.len, pool.folders.len);
-
-    const directories = directoriesFor(.recordings);
-    for (directories, 0..) |directory, folder| {
-        const listed = try library.list(gpa, io, directory);
-        defer library.freeList(gpa, listed);
-
-        var counted: usize = 0;
-        for (pool.folders) |of| {
-            if (of == folder) counted += 1;
-        }
-        try std.testing.expectEqual(listed.len, counted);
+    const sources = [_]core.source.Source{
+        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .bell, .piano,
+    };
+    for (sources) |which| {
+        var pool = try loadPool(gpa, std.testing.io, which);
+        defer pool.deinit(gpa);
+        try std.testing.expect(pool.paths.len > 0);
     }
-
-    // Both folders present, or there is nothing for plant B to alternate with.
-    try std.testing.expect(pool.folders[0] != pool.folders[pool.folders.len - 1]);
-}
-
-test "a one-folder pool marks every clip as the same folder" {
-    const gpa = std.testing.allocator;
-    var pool = try loadPool(gpa, std.testing.io, .bell);
-    defer pool.deinit(gpa);
-
-    try std.testing.expect(pool.folders.len > 0);
-    for (pool.folders) |folder| try std.testing.expectEqual(@as(u8, 0), folder);
 }
 
 test "the new folders are named" {
@@ -193,7 +151,5 @@ test "the new folders load into non-empty pools" {
         var pool = try loadPool(gpa, std.testing.io, which);
         defer pool.deinit(gpa);
         try std.testing.expect(pool.paths.len > 0);
-        try std.testing.expectEqual(pool.paths.len, pool.folders.len);
-        for (pool.folders) |folder| try std.testing.expectEqual(@as(u8, 0), folder);
     }
 }

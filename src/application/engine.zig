@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// How many clips a test pool holds. Enough that "not the one just playing"
+/// has somewhere to go.
+const folder_clips: usize = 4;
+
 const core = @import("../core/root.zig");
 const ports = @import("../ports/root.zig");
 const voice_mod = @import("voice.zig");
@@ -254,12 +258,11 @@ fn heldClipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
 fn clipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
     const State = struct {
         var prng: [2]std.Random.DefaultPrng = undefined;
-        var folders = [_]u8{ 0, 0 };
     };
     State.prng[slot] = .init(slot + 1);
     return .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(&State.folders, 5.0, core.sample_rate, State.prng[slot].random()),
+        .selector = .init(folder_clips, 5.0, core.sample_rate, State.prng[slot].random()),
     } };
 }
 

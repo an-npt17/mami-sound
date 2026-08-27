@@ -5,10 +5,13 @@ const library = @import("adapters/library.zig");
 const clip_stream = @import("adapters/clip_stream.zig");
 
 test "worker streams a checked-in clip without blocking the consumer" {
+    const voices = try library.listSorted(std.testing.allocator, std.testing.io, "Voice Box 3");
+    defer library.freeList(std.testing.allocator, voices);
+
     var adapter = try clip_stream.Adapter.init(
         std.testing.io,
         std.testing.allocator,
-        &.{"field records/chum giuoc.mp3"},
+        &.{voices[0]},
         .unlimited,
     );
     defer adapter.deinit();
@@ -32,10 +35,13 @@ test "worker streams a checked-in clip without blocking the consumer" {
 }
 
 test "worker shuts down while its ring is full" {
+    const voices = try library.listSorted(std.testing.allocator, std.testing.io, "Voice Box 3");
+    defer library.freeList(std.testing.allocator, voices);
+
     var adapter = try clip_stream.Adapter.init(
         std.testing.io,
         std.testing.allocator,
-        &.{"field records/chum giuoc.mp3"},
+        &.{voices[0]},
         .unlimited,
     );
     defer adapter.deinit();
@@ -48,10 +54,13 @@ test "worker shuts down while its ring is full" {
 }
 
 test "worker replaces a clip while its ring is full" {
+    const voices = try library.listSorted(std.testing.allocator, std.testing.io, "Voice Box 3");
+    defer library.freeList(std.testing.allocator, voices);
+
     var adapter = try clip_stream.Adapter.init(
         std.testing.io,
         std.testing.allocator,
-        &.{ "field records/chum giuoc.mp3", "field records/chum giuoc.mp3" },
+        &.{ voices[0], voices[1] },
         .unlimited,
     );
     defer adapter.deinit();
@@ -292,10 +301,13 @@ test "an uncapped clip keeps sounding once the head has handed over" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
+    const voices = try library.listSorted(gpa, io, "Voice Box 3");
+    defer library.freeList(gpa, voices);
+
     var adapter = try clip_stream.Adapter.init(
         io,
         gpa,
-        &.{"field records/chum giuoc.mp3"},
+        &.{voices[0]},
         .unlimited,
     );
     defer adapter.deinit();

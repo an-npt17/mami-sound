@@ -1,8 +1,8 @@
 //! Listing the recordings that make up Plant B's clip pool.
 //!
-//! Plant B combines every playable file from `interview files/` and `field
-//! records/`. The loader retains their paths at startup; a background stream
-//! worker decodes the selected clip when a new touch arrives.
+//! A source is one folder. The loader retains its paths at startup; a
+//! background stream worker decodes the selected clip when a new touch
+//! arrives.
 
 const std = @import("std");
 

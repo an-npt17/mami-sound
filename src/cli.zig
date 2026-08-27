@@ -30,7 +30,7 @@ pub const Options = struct {
     device_len: usize = 0,
     /// What each plant plays, indexed as the selection is. The defaults are
     /// what the installation did before either flag took a value.
-    plant_sources: [2]source.Source = .{ .drone, .recordings },
+    plant_sources: [2]source.Source = .{ .drone, .voicebox3 },
     /// How long a touch plays, and how long before the next one is honoured.
     /// `null` leaves the source's own answer standing.
     plant_seconds: [2]?f32 = .{ null, null },
@@ -196,20 +196,22 @@ pub const usage =
     \\--plant-a and --plant-b each name what that plant plays. Either plant
     \\takes any of them:
     \\  drone       the sensor-driven voice, generated rather than played
-    \\  recordings  ./interview files/ and ./field records/ as one pool
+    \\  voicebox3   ./Voice Box 3/
+    \\  voicebox5   ./Voice Box 5/
     \\  daybird     ./Day bird/
     \\  insect      ./Insect/
     \\  tradvn      ./Trad Vn Jam/
     \\  bell        ./Bell Stems/
     \\  piano       ./EPiano Stems/
-    \\Unasked, plant A is the drone and plant B the recordings, which is what
-    \\the installation has always done. Bare --plant-a means --plant-a=daybird.
+    \\Unasked, plant A is the drone and plant B is voicebox3. Bare --plant-a
+    \\means --plant-a=daybird. Every source is one folder: a plant that wants
+    \\two of them is two plants.
     \\
     \\--plant-a-seconds and --plant-b-seconds are how long one touch plays.
     \\Zero plays the clip to its own end, which is how a source that is normally
     \\cut is uncapped, or one that normally runs long is cut. Left off, the
     \\source's own length stands: 4s for the stems, 5s for daybird and insect,
-    \\and to the end for recordings and tradvn.
+    \\and to the end for the voice boxes and tradvn.
     \\
     \\--plant-a-mode and --plant-b-mode are how a plant answers a hand:
     \\  trigger  a touch sets a clip going and it runs its own length
@@ -220,8 +222,8 @@ pub const usage =
     \\--plant-a-retrigger and --plant-b-retrigger are how long a clip is
     \\protected from the next touch, counted from when it started. A touch
     \\inside it is ignored and the clip keeps playing; a touch past it moves the
-    \\plant on to the other folder. Left off, 10s for recordings and 5s for
-    \\everything else. The drone takes neither flag.
+    \\plant on to a different clip. Left off, 10s for the voice boxes and 5s
+    \\for everything else. The drone takes neither flag.
     \\
     \\--touch-model picks what the detector asks each probe:
     \\  deviation  how far the probe has moved from its own recent past
@@ -261,7 +263,7 @@ test "each plant chooses its own source" {
 test "the defaults are what the installation already does" {
     const opts = try parse(&.{});
     try std.testing.expectEqual(source.Source.drone, opts.plant_sources[0]);
-    try std.testing.expectEqual(source.Source.recordings, opts.plant_sources[1]);
+    try std.testing.expectEqual(source.Source.voicebox3, opts.plant_sources[1]);
     try std.testing.expect(opts.plant_seconds[0] == null);
     try std.testing.expect(opts.plant_retrigger[1] == null);
 }

@@ -84,33 +84,28 @@ pub const Limit = struct {
 ///
 /// Serves either plant: nothing here knows which one it is working for.
 pub const ClipSelector = struct {
-    /// Which folder each clip came from, by index into the pool. The pool is
-    /// flat -- one list of paths -- so this is what is left of the fact that it
-    /// was built from two directories.
-    folders: []const u8,
+    /// How many clips the source has. Every source is one folder, so this is
+    /// the whole of what a selector needs to know about it.
+    clip_count: usize,
     random: std.Random,
     previous_touch: bool,
-    /// The folder the clip now playing was drawn from, so the next one can be
-    /// drawn from the other. `null` before anything has played.
-    last_folder: ?u8,
-    /// And which clip it was, so a pool with only one folder still answers a
-    /// touch with something new. `null` before anything has played.
+    /// Which clip is playing, so the next touch answers with a different one.
+    /// `null` before anything has played.
     last_index: ?usize,
     /// Frames since the last clip was started, and how many make ten seconds.
     frames_since_start: u64,
     open_frames: u64,
 
     pub fn init(
-        folders: []const u8,
+        clip_count: usize,
         retrigger_s: f32,
         sample_rate: u32,
         random: std.Random,
     ) ClipSelector {
         return .{
-            .folders = folders,
+            .clip_count = clip_count,
             .random = random,
             .previous_touch = false,
-            .last_folder = null,
             .last_index = null,
             .frames_since_start = 0,
             .open_frames = @intFromFloat(retrigger_s * @as(f32, @floatFromInt(sample_rate))),
@@ -131,7 +126,7 @@ pub const ClipSelector = struct {
 
         const rising = touched and !self.previous_touch;
         self.previous_touch = touched;
-        if (!rising or self.folders.len == 0) return null;
+        if (!rising or self.clip_count == 0) return null;
 
         // A clip still inside its ten seconds is left alone. This is the whole
         // of the fix for a plant that answered every stray edge with the first
@@ -147,10 +142,9 @@ pub const ClipSelector = struct {
     /// guard counting from the clip's start would swap a recording out from
     /// under a hand that never let go.
     pub fn next(self: *ClipSelector) ?usize {
-        if (self.folders.len == 0) return null;
+        if (self.clip_count == 0) return null;
 
         const index = self.pick();
-        self.last_folder = self.folders[index];
         self.last_index = index;
         self.frames_since_start = 0;
         return index;
@@ -162,67 +156,37 @@ pub const ClipSelector = struct {
     /// to go to, so it draws from the whole pool as it always did.
     /// A clip that is not the one just playing.
     ///
-    /// The recordings are two folders read as one, so the rule there is the
-    /// folder: the next clip comes from whichever the last one did not, and a
-    /// different folder is necessarily a different clip. Every other source is
-    /// one folder and has no other to go to, so the rule falls back to the clip
-    /// itself -- without which a touch would restart the same bell about one
-    /// time in four, which is a room hearing the plant fail to answer.
+    /// Without this a touch would restart the same bell about one time in four,
+    /// which in a room reads as the plant failing to answer. A pool of one has
+    /// to answer with what it has, however lately it played.
     fn pick(self: *ClipSelector) usize {
-        const other_folder = self.countOther();
-        if (other_folder > 0) return self.nth(other_folder, .folder);
-
         const choices = self.countUnplayed();
-        return self.nth(choices, .clip);
-    }
-
-    /// Which of the two rules is deciding what counts as a candidate.
-    const Rule = enum { folder, clip };
-
-    fn eligible(self: *const ClipSelector, index: usize, rule: Rule) bool {
-        return switch (rule) {
-            .folder => if (self.last_folder) |last| self.folders[index] != last else true,
-            // A pool of one has to answer a touch with the clip it has, however
-            // lately it played. Said here rather than at the counting, because a
-            // count and a predicate that disagree walk off the end of the pool.
-            .clip => if (self.folders.len <= 1)
-                true
-            else if (self.last_index) |last| index != last else true,
-        };
-    }
-
-    /// The `wanted`-th eligible clip, counting from a fresh draw.
-    fn nth(self: *ClipSelector, choices: usize, rule: Rule) usize {
         var remaining = self.random.uintLessThan(usize, choices);
-        for (0..self.folders.len) |index| {
-            if (!self.eligible(index, rule)) continue;
+        for (0..self.clip_count) |index| {
+            if (!self.unplayed(index)) continue;
             if (remaining == 0) return index;
             remaining -= 1;
         }
         unreachable;
     }
 
+    fn unplayed(self: *const ClipSelector, index: usize) bool {
+        if (self.clip_count <= 1) return true;
+        return if (self.last_index) |last| index != last else true;
+    }
+
     /// How many clips are not the one just playing.
     fn countUnplayed(self: *const ClipSelector) usize {
         var count: usize = 0;
-        for (0..self.folders.len) |index| {
-            if (self.eligible(index, .clip)) count += 1;
-        }
-        return count;
-    }
-
-    fn countOther(self: *const ClipSelector) usize {
-        const last = self.last_folder orelse return self.folders.len;
-        var count: usize = 0;
-        for (self.folders) |folder| {
-            if (folder != last) count += 1;
+        for (0..self.clip_count) |index| {
+            if (self.unplayed(index)) count += 1;
         }
         return count;
     }
 };
 
 test "the recordings spend an allowance that never runs out" {
-    var limit: Limit = .forSource(.recordings, null, .trigger, 44100);
+    var limit: Limit = .forSource(.voicebox3, null, .trigger, 44100);
     var samples = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
 
     try std.testing.expectEqual(@as(usize, 4), limit.take(&samples));
@@ -285,29 +249,29 @@ test "the fade survives being split across reads" {
     try std.testing.expectEqualSlices(f32, &one_run, &runs);
 }
 
-/// A pool shaped like the recordings: two folders read as one flat list.
-const two_folders = [_]u8{ 0, 0, 0, 1, 1, 1 };
+/// A pool with enough clips in it to have a choice.
+const six_clips: usize = 6;
 
 /// The poll the engine runs the selector at, and how many of them a second is.
 const poll_frames: usize = 128;
 const polls_per_s: usize = 44100 / poll_frames;
 
-fn testSelector(folders: []const u8, seed: u64) ClipSelector {
+fn testSelector(clip_count: usize, seed: u64) ClipSelector {
     const State = struct {
         var prng: std.Random.DefaultPrng = undefined;
     };
     State.prng = .init(seed);
-    return ClipSelector.init(folders, 10.0, 44100, State.prng.random());
+    return ClipSelector.init(clip_count, 10.0, 44100, State.prng.random());
 }
 
 test "a touch starts a clip when plant B is silent" {
-    var selector = testSelector(&two_folders, 1);
+    var selector = testSelector(six_clips, 1);
     try std.testing.expect(selector.start(false, false, poll_frames) == null);
     try std.testing.expect(selector.start(true, false, poll_frames) != null);
 }
 
 test "a touch inside the clip's ten seconds is ignored" {
-    var selector = testSelector(&two_folders, 1);
+    var selector = testSelector(six_clips, 1);
     try std.testing.expect(selector.start(true, false, poll_frames) != null);
 
     // Nine seconds of somebody leaning on the plant, touching it over and over.
@@ -319,7 +283,7 @@ test "a touch inside the clip's ten seconds is ignored" {
 }
 
 test "a touch past the ten seconds cuts in" {
-    var selector = testSelector(&two_folders, 1);
+    var selector = testSelector(six_clips, 1);
     _ = selector.start(true, false, poll_frames);
 
     for (0..11 * polls_per_s) |_| {
@@ -331,29 +295,25 @@ test "a touch past the ten seconds cuts in" {
 test "a clip that has already finished answers the next touch at once" {
     // What keeps a four-second stem responsive: the ten seconds only protect a
     // clip that is still sounding.
-    var selector = testSelector(&two_folders, 1);
+    var selector = testSelector(six_clips, 1);
     _ = selector.start(true, false, poll_frames);
     _ = selector.start(false, false, poll_frames);
     try std.testing.expect(selector.start(true, false, poll_frames) != null);
 }
 
-test "consecutive clips come from alternating folders" {
-    var selector = testSelector(&two_folders, 7);
-    var previous: ?u8 = null;
-    for (0..8) |_| {
+test "consecutive clips are different clips" {
+    var selector = testSelector(six_clips, 7);
+    var previous: ?usize = null;
+    for (0..40) |_| {
         const index = selector.start(true, false, poll_frames).?;
-        const folder = two_folders[index];
-        if (previous) |last| try std.testing.expect(folder != last);
-        previous = folder;
+        if (previous) |last| try std.testing.expect(index != last);
+        previous = index;
         _ = selector.start(false, false, poll_frames);
     }
 }
 
-test "a pool built from one folder still draws from all of it" {
-    // Either stem pool. There is no other folder to alternate with, and the
-    // plant must not fall silent for want of one.
-    const one_folder = [_]u8{ 0, 0, 0, 0 };
-    var selector = testSelector(&one_folder, 3);
+test "every clip in a pool is reachable" {
+    var selector = testSelector(4, 3);
     for (0..8) |_| {
         try std.testing.expect(selector.start(true, false, poll_frames) != null);
         _ = selector.start(false, false, poll_frames);
@@ -384,14 +344,13 @@ test "an override replaces the source's length" {
     try std.testing.expectEqual(Limit.unlimited.total, uncapped.total);
 
     // And how a source that runs to its end is capped.
-    const capped: Limit = .forSource(.recordings, 30.0, .trigger, 44100);
+    const capped: Limit = .forSource(.voicebox3, 30.0, .trigger, 44100);
     try std.testing.expectEqual(@as(usize, 30 * 44100), capped.total);
 }
 
 test "the guard length reaches the selector" {
     var prng = std.Random.DefaultPrng.init(1);
-    const folders = [_]u8{ 0, 0 };
-    const selector = ClipSelector.init(&folders, 5.0, 44100, prng.random());
+    const selector = ClipSelector.init(2, 5.0, 44100, prng.random());
     try std.testing.expectEqual(@as(u64, 5 * 44100), selector.open_frames);
 }
 
@@ -416,8 +375,7 @@ test "a touch never restarts the clip that was just playing" {
     // are two folders read as one. Every other source is one folder, so there
     // is no other folder to go to and the only thing standing between a touch
     // and hearing the same bell again is this.
-    const one_folder = [_]u8{ 0, 0, 0, 0 };
-    var selector = testSelector(&one_folder, 11);
+    var selector = testSelector(4, 11);
 
     var previous: ?usize = null;
     for (0..60) |_| {
@@ -431,8 +389,7 @@ test "a touch never restarts the clip that was just playing" {
 test "a pool of one clip has nothing else to offer and says so" {
     // The edge the rule above must not turn into a hang or an unreachable: one
     // clip, and a touch has to be answered with it.
-    const single = [_]u8{0};
-    var selector = testSelector(&single, 3);
+    var selector = testSelector(1, 3);
     for (0..4) |_| {
         try std.testing.expectEqual(@as(usize, 0), selector.start(true, false, poll_frames).?);
         _ = selector.start(false, false, poll_frames);

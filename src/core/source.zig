@@ -19,9 +19,9 @@ pub const Error = error{UnknownSource};
 /// that a room which has heard enough can move it on.
 pub const default_retrigger_s: f32 = 5.0;
 
-/// The recordings run for minutes and are the piece's own voice rather than an
+/// The voice boxes run for minutes and are the piece's own voice rather than an
 /// answer to a hand, so they are given twice as long before a touch may cut in.
-pub const recordings_retrigger_s: f32 = 10.0;
+pub const long_form_retrigger_s: f32 = 10.0;
 
 /// A tuned note plus enough of its tail to hear it as a note.
 pub const stem_play_s: f32 = 4.0;
@@ -31,11 +31,33 @@ pub const stem_play_s: f32 = 4.0;
 /// rather than a plant answering somebody.
 pub const fragment_play_s: f32 = 5.0;
 
+/// Every source name, comma-separated, built from the enum.
+///
+/// So a message listing them cannot fall behind the list: it did once, and
+/// told a room to try a pool that had been deleted.
+pub const names = blk: {
+    const fields = @typeInfo(Source).@"enum".fields;
+    var line: []const u8 = "";
+    for (fields, 0..) |field, i| {
+        line = line ++ field.name;
+        if (i + 2 == fields.len) {
+            line = line ++ " or ";
+        } else if (i + 1 < fields.len) {
+            line = line ++ ", ";
+        }
+    }
+    break :blk line;
+};
+
 pub const Source = enum {
     /// The sensor-driven voice. Generated rather than played, so it has no
     /// folder and neither length means anything to it.
     drone,
-    recordings,
+    /// The two boxes of voices, one folder each. They were one pool read from
+    /// two folders once; every source is its own folder now, and a plant that
+    /// wants both is two plants.
+    voicebox3,
+    voicebox5,
     daybird,
     insect,
     tradvn,
@@ -55,7 +77,7 @@ pub const Source = enum {
     /// a fragment, and a jam cut there is not music.
     pub fn defaultSeconds(self: Source) ?f32 {
         return switch (self) {
-            .drone, .recordings, .tradvn => null,
+            .drone, .voicebox3, .voicebox5, .tradvn => null,
             .daybird, .insect => fragment_play_s,
             .bell, .piano => stem_play_s,
         };
@@ -68,7 +90,7 @@ pub const Source = enum {
     /// says. It matters only where a clip is still sounding.
     pub fn defaultRetriggerSeconds(self: Source) f32 {
         return switch (self) {
-            .recordings => recordings_retrigger_s,
+            .voicebox3, .voicebox5 => long_form_retrigger_s,
             else => default_retrigger_s,
         };
     }
@@ -76,7 +98,8 @@ pub const Source = enum {
 
 test "every source name parses to itself" {
     try std.testing.expectEqual(Source.drone, try Source.parse("drone"));
-    try std.testing.expectEqual(Source.recordings, try Source.parse("recordings"));
+    try std.testing.expectEqual(Source.voicebox3, try Source.parse("voicebox3"));
+    try std.testing.expectEqual(Source.voicebox5, try Source.parse("voicebox5"));
     try std.testing.expectEqual(Source.daybird, try Source.parse("daybird"));
     try std.testing.expectEqual(Source.insect, try Source.parse("insect"));
     try std.testing.expectEqual(Source.tradvn, try Source.parse("tradvn"));
@@ -86,17 +109,20 @@ test "every source name parses to itself" {
 
 test "a name no source has is refused" {
     try std.testing.expectError(Error.UnknownSource, Source.parse("cello"));
+    // The pool that read two folders as one. Every source is its own folder now.
+    try std.testing.expectError(Error.UnknownSource, Source.parse("recordings"));
     try std.testing.expectError(Error.UnknownSource, Source.parse(""));
 }
 
 test "only the drone is the drone" {
     try std.testing.expect(Source.drone.isDrone());
-    try std.testing.expect(!Source.recordings.isDrone());
+    try std.testing.expect(!Source.voicebox3.isDrone());
     try std.testing.expect(!Source.tradvn.isDrone());
 }
 
 test "a source that plays to its own end has no length" {
-    try std.testing.expect(Source.recordings.defaultSeconds() == null);
+    try std.testing.expect(Source.voicebox3.defaultSeconds() == null);
+    try std.testing.expect(Source.voicebox5.defaultSeconds() == null);
     try std.testing.expect(Source.tradvn.defaultSeconds() == null);
     try std.testing.expect(Source.drone.defaultSeconds() == null);
 }
@@ -108,11 +134,25 @@ test "a source that answers with a fragment carries its length" {
     try std.testing.expectEqual(@as(f32, 4.0), Source.piano.defaultSeconds().?);
 }
 
-test "the recordings are protected for longer than anything else" {
+test "the voice boxes are protected for longer than anything else" {
     // They are the piece's own voice and run for minutes; the rest are answers
     // to a hand and want moving on sooner.
-    try std.testing.expectEqual(@as(f32, 10.0), Source.recordings.defaultRetriggerSeconds());
+    try std.testing.expectEqual(@as(f32, 10.0), Source.voicebox3.defaultRetriggerSeconds());
+    try std.testing.expectEqual(@as(f32, 10.0), Source.voicebox5.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.tradvn.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.daybird.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.bell.defaultRetriggerSeconds());
+}
+
+test "the list of names holds every source" {
+    // The message that offers them is built from this, so a source added
+    // without touching the message still gets mentioned by it.
+    inline for (@typeInfo(Source).@"enum".fields) |field| {
+        if (std.mem.indexOf(u8, names, field.name) == null) {
+            std.debug.print("the name list omits {s}\n", .{field.name});
+            return error.SourceMissingFromNames;
+        }
+    }
+    // And nothing that is no longer a source.
+    try std.testing.expect(std.mem.indexOf(u8, names, "recordings") == null);
 }

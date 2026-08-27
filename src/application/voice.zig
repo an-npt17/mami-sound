@@ -10,6 +10,10 @@
 //! neither of them.
 
 const std = @import("std");
+
+/// How many clips a test pool holds. Enough that "not the one just playing"
+/// has somewhere to go.
+const folder_clips: usize = 4;
 const core = @import("../core/root.zig");
 const ports = @import("../ports/root.zig");
 
@@ -161,12 +165,11 @@ const FakeStream = struct {
 fn holdVoice(stream: *FakeStream) Voice {
     const State = struct {
         var prng: std.Random.DefaultPrng = undefined;
-        var folders = [_]u8{ 0, 0 };
     };
     State.prng = .init(1);
     return .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(&State.folders, 5.0, 44100, State.prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, State.prng.random()),
         .mode = .hold,
         .gate = 0.0,
     } };
@@ -179,10 +182,9 @@ fn testDetector() core.touch.Detector {
 test "a clip voice asks for a clip on a touch and plays it" {
     var stream: FakeStream = .{};
     var prng = std.Random.DefaultPrng.init(1);
-    const folders = [_]u8{ 0, 0 };
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(&folders, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
     } };
 
     const probe = testDetector();
@@ -196,10 +198,9 @@ test "a clip voice asks for a clip on a touch and plays it" {
 test "a clip voice does not ask again inside the guard" {
     var stream: FakeStream = .{};
     var prng = std.Random.DefaultPrng.init(1);
-    const folders = [_]u8{ 0, 0 };
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(&folders, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
     } };
 
     const probe = testDetector();
@@ -306,10 +307,9 @@ test "a trigger voice ignores the hand once the clip is away" {
     // stays or not.
     var stream: FakeStream = .{};
     var prng = std.Random.DefaultPrng.init(1);
-    const folders = [_]u8{ 0, 0 };
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(&folders, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
         .mode = .trigger,
     } };
 

@@ -50,9 +50,8 @@ pub fn main(init: std.process.Init) !void {
                 .{cli.device_max},
             ),
             error.InvalidSource => std.debug.print(
-                "--plant-a and --plant-b take a source: drone, recordings, " ++
-                    "daybird, insect, tradvn, bell or piano.\n\n",
-                .{},
+                "--plant-a and --plant-b take a source: {s}.\n\n",
+                .{core.source.names},
             ),
             error.InvalidSeconds => std.debug.print(
                 "--seconds and --retrigger take a number of seconds, zero or more.\n\n",
@@ -207,7 +206,7 @@ fn runComposition(
             .clips = .{
                 .stream = streams[plant].port(),
                 .selector = .init(
-                    pools[plant].folders,
+                    pools[plant].paths.len,
                     retrigger,
                     core.sample_rate,
                     shuffle.random(),
