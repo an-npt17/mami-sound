@@ -195,18 +195,6 @@ fn runComposition(
         if (mode == .hold) {
             held[plant] = true;
             std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
-            // Said out loud because it is a limit of the model rather than a
-            // setting: the deviation model measures how far a probe has moved
-            // from its own recent past, so a hand left in place becomes that
-            // past within about three seconds and the plant falls quiet under
-            // a hand that never left.
-            if ((opts.model orelse touch_preset_model) == .deviation) {
-                std.debug.print(
-                    "warning: plant {s} holds for about three seconds on the deviation model;" ++
-                        " --touch-model=steady holds for as long as the hand is there\n",
-                    .{name},
-                );
-            }
         }
         voices[plant] = .{
             .clips = .{
@@ -279,9 +267,6 @@ fn parseArgs(
 }
 
 /// The generated voice, with the room's preset shape.
-/// The model the compiled preset asks for, for the warning above.
-const touch_preset_model = production_config.touch.model;
-
 fn droneVoice() voice_mod.Voice {
     return .{ .drone = .init(
         core.sample_rate,

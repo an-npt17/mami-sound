@@ -131,6 +131,17 @@ pub const ClipSelector = struct {
         // second of a new recording.
         if (sounding and self.frames_since_start < self.open_frames) return null;
 
+        return self.next();
+    }
+
+    /// A clip now, whatever the guard says.
+    ///
+    /// What `hold` uses. There the release decides when a clip is over, and a
+    /// guard counting from the clip's start would swap a recording out from
+    /// under a hand that never let go.
+    pub fn next(self: *ClipSelector) ?usize {
+        if (self.folders.len == 0) return null;
+
         const index = self.pick();
         self.last_folder = self.folders[index];
         self.last_index = index;
@@ -420,3 +431,15 @@ test "a pool of one clip has nothing else to offer and says so" {
         _ = selector.start(false, false, poll_frames);
     }
 }
+
+/// How long a hand must be off a held plant before the clip is over.
+///
+/// A detector flickers: even a probe reporting a thirty-second hold on 98% of
+/// its polls drops the odd one, and a gate that believed every one of those
+/// would stutter under a hand that never moved. A second is far longer than any
+/// flicker and far shorter than somebody deciding they have heard enough.
+///
+/// It is also what makes letting go mean something. Inside the second the clip
+/// is the same visit and carries on; past it the clip is finished, and the next
+/// hand gets a different recording rather than the one it just heard.
+pub const hold_release_s: f32 = 1.0;

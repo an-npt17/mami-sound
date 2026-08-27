@@ -857,12 +857,12 @@ test "a windowed probe reports a tap, not a hand that stays" {
     try std.testing.expect(polls_on < 500);
 }
 
-test "dropping the window lets a deviation probe report a hand for seconds" {
-    // The fix for the above, and the limit of it. Without the window a held
-    // probe reports the hand for about 950 polls -- near three seconds -- where
-    // a windowed one managed fewer than ten. It does not last, and cannot: the
-    // deviation model measures how far a probe has moved from its own recent
-    // past, and a hand left in place becomes that past within a few seconds.
+test "dropping the window lets a deviation probe report a hand at all" {
+    // Without the window a held probe reports the hand; with one it managed
+    // fewer than ten polls in three thousand. How long it keeps reporting is a
+    // question about the baseline, not the window, and
+    // `a warm baseline does not absorb a hand the way a cold one does` answers
+    // it: with a minute of rest behind the median, 98% of a thirty-second hold.
     var cfg = deviationConfig();
     cfg.window_ms = 1000.0;
     cfg.hold = true;
@@ -906,4 +906,27 @@ test "plant B's window survives when only plant A is held" {
 
     try std.testing.expect(machine.a.window == null);
     try std.testing.expect(machine.bc.window != null);
+}
+
+test "a warm baseline does not absorb a hand the way a cold one does" {
+    // The earlier measurement started from nothing, so a held value was half
+    // the median's window within seconds and the probe read itself back to
+    // rest. In the room the median has a minute of rest behind it before
+    // anybody arrives. This is what that difference is worth.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    // A full minute of the probe at rest, wobbling as a real one does.
+    for (0..70 * 345) |poll| {
+        _ = detector.update(if (poll % 3 == 0) 4 else -4);
+    }
+
+    var polls_reported: usize = 0;
+    const held_polls = 30 * 345;
+    for (0..held_polls) |poll| {
+        if (detector.update(if (poll % 3 == 0) 3004 else 2996)) polls_reported += 1;
+    }
+
+    try std.testing.expect(polls_reported > held_polls / 2);
 }

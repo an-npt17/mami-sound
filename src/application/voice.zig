@@ -22,6 +22,12 @@ pub const Clips = struct {
     /// How open the gate is, 0 to 1. `trigger` leaves it wide; `hold` walks it
     /// between the two so letting go is a fade rather than a cut.
     gate: f32 = 1.0,
+    /// Frames since the hand came off, and whether a clip is still this plant's
+    /// to play. `hold` only: the release is what ends a clip there, so both are
+    /// counted here rather than in the selector.
+    released: u64 = 0,
+    was_touched: bool = false,
+    loaded: bool = false,
 };
 
 /// The most audio one render can ask for. The engine renders a sensor poll at a
@@ -60,20 +66,39 @@ pub const Voice = union(enum) {
     fn renderClips(clips: *Clips, piece: []f32, touched: bool) void {
         std.debug.assert(piece.len <= max_piece);
 
-        // Asked before rendering, so the answer is about the clip already
-        // running rather than the one this poll might start.
-        const sounding = clips.stream.sounding();
-        const request = clips.selector.start(touched, sounding, piece.len);
-
         if (clips.mode == .trigger) {
-            clips.stream.render(piece, request);
+            // Asked before rendering, so the answer is about the clip already
+            // running rather than the one this poll might start.
+            const sounding = clips.stream.sounding();
+            clips.stream.render(piece, clips.selector.start(touched, sounding, piece.len));
             return;
         }
 
+        // In `hold` the release decides when a clip is over, not the guard: a
+        // hand off for a moment is the same visit, and a hand off for longer
+        // than the release has finished with this recording.
+        if (touched) clips.released = 0 else clips.released +|= piece.len;
+        const release_frames: u64 = @intFromFloat(
+            core.clips.hold_release_s * @as(f32, @floatFromInt(core.sample_rate)),
+        );
+        if (clips.released >= release_frames) clips.loaded = false;
+
+        const rising = touched and !clips.was_touched;
+        clips.was_touched = touched;
+
+        var request: ?usize = null;
+        if (rising and !clips.loaded) {
+            request = clips.selector.next();
+            clips.loaded = request != null;
+        }
+
         const target: f32 = if (touched) 1.0 else 0.0;
-        // Shut, released, and nothing asked for: the clip stays exactly where
-        // it is until a hand comes back.
-        if (request == null and clips.gate == 0.0 and target == 0.0) return;
+
+        // Shut and nobody there: the stream is not asked for anything, so the
+        // clip stops where it is rather than running on unheard. Inside the
+        // release that is a pause the next hand resumes; past it the clip is
+        // over and the next hand gets a different one.
+        if (clips.gate == 0.0 and !touched) return;
 
         var scratch: [max_piece]f32 = undefined;
         const heard = scratch[0..piece.len];
@@ -285,4 +310,61 @@ test "a trigger voice ignores the hand once the clip is away" {
     }
     // Still sounding at full level with the hand long gone.
     try std.testing.expectEqual(@as(f32, 0.5), piece[0]);
+}
+
+test "a flicker in the detector does not stop a held clip" {
+    // The case this exists for: a probe reporting a hold drops the odd poll,
+    // and a gate that believed each one would stutter under a still hand.
+    var stream: FakeStream = .{};
+    var voice = holdVoice(&stream);
+    const probe = testDetector();
+    var piece = [_]f32{0.0} ** 128;
+
+    for (0..200) |poll| {
+        @memset(&piece, 0);
+        // One poll in twenty says no hand, which is worse than the rig does.
+        voice.render(&piece, &probe, poll % 20 != 0);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), stream.requests);
+    try std.testing.expect(piece[piece.len - 1] > 0.4);
+}
+
+test "a hand off for longer than the release ends the clip" {
+    var stream: FakeStream = .{};
+    var voice = holdVoice(&stream);
+    const probe = testDetector();
+    var piece = [_]f32{0.0} ** 128;
+
+    for (0..200) |_| voice.render(&piece, &probe, true);
+
+    // A second and a half of nobody there.
+    const polls = @as(usize, @intFromFloat(1.5 * 44100.0)) / piece.len;
+    for (0..polls) |_| {
+        @memset(&piece, 0);
+        voice.render(&piece, &probe, false);
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), piece[piece.len - 1]);
+
+    // And the next hand gets a different recording rather than the one it just
+    // heard, which is what the clip being over means.
+    voice.render(&piece, &probe, true);
+    try std.testing.expectEqual(@as(usize, 2), stream.requests);
+}
+
+test "a hand back inside the release keeps the clip it had" {
+    var stream: FakeStream = .{};
+    var voice = holdVoice(&stream);
+    const probe = testDetector();
+    var piece = [_]f32{0.0} ** 128;
+
+    for (0..200) |_| voice.render(&piece, &probe, true);
+
+    // Half a second away, then back.
+    const polls = @as(usize, @intFromFloat(0.5 * 44100.0)) / piece.len;
+    for (0..polls) |_| voice.render(&piece, &probe, false);
+    for (0..200) |_| voice.render(&piece, &probe, true);
+
+    try std.testing.expectEqual(@as(usize, 1), stream.requests);
+    try std.testing.expect(piece[piece.len - 1] > 0.4);
 }
