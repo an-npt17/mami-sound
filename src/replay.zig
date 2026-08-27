@@ -358,8 +358,14 @@ test "episodes are counted at the edges, and one still open at the end is closed
     var readings: std.ArrayList(Reading) = .empty;
     defer readings.deinit(gpa);
 
-    // Long enough to fill the window and satisfy the hold, then flailing, then
-    // held again to the end of the capture.
+    // Nobody there first, so the detector learns where the probes rest: it
+    // reads a hand as stillness somewhere other than rest, and a probe that has
+    // only ever read one value rests at that value.
+    for (0..6000) |i| try readings.append(gpa, .{
+        .raw_a = if (i % 2 == 0) -4096 else 1,
+        .raw_bc = if (i % 2 == 0) -4096 else 1,
+    });
+    // Then held, then flailing, then held again to the end of the capture.
     for (0..900) |_| try readings.append(gpa, .{ .raw_a = 663, .raw_bc = 663 });
     for (0..900) |i| try readings.append(gpa, .{
         .raw_a = if (i % 2 == 0) -4096 else 1,

@@ -148,6 +148,23 @@ fn neverSounding(_: *anyopaque) bool {
 
 /// A probe A held at a level, with the dropouts this rig throws through it.
 /// Probe BC is left flailing, so nothing here depends on plant B.
+/// How long the harness runs with nobody on the plants before a fixture's hand
+/// arrives, and what it feeds them meanwhile.
+///
+/// The steady model learns where a probe rests and reads a hand as stillness
+/// somewhere else, so a probe that has only ever read one value rests at that
+/// value and no hand can be told from it. Every fixture needs this, so the
+/// harness does it rather than each of them remembering to.
+const settle_blocks: usize = 12 * core.sample_rate / core.block_frames;
+
+fn resting(poll: usize) ports.Reading {
+    return .{ .raw_a = flailingA(poll), .raw_bc = flailingA(poll) };
+}
+
+fn flailingA(poll: usize) i16 {
+    return if (poll % 2 == 0) -4096 else 1;
+}
+
 fn heldA(poll: usize) ports.Reading {
     return .{
         .raw_a = switch (poll % 8) {
@@ -216,10 +233,6 @@ fn alternatingA(poll: usize) ports.Reading {
     };
 }
 
-fn flailingA(poll: usize) i16 {
-    return if (poll % 2 == 0) -4096 else 1;
-}
-
 /// Four seconds: several touches, all inside one clip's five-second guard.
 const guard_blocks: usize = 4 * core.sample_rate / core.block_frames;
 
@@ -245,7 +258,7 @@ fn runVoices(
     selection: core.plant.Selection,
     voices: [2]voice_mod.Voice,
 ) !FakeSink {
-    var probe: FakeProbe = .{ .pattern = pattern };
+    var probe: FakeProbe = .{ .pattern = resting };
     var sink: FakeSink = .{};
     const status: ports.StatusSink = .{ .context = &sink, .observe_fn = ignoreStatus };
 
@@ -261,6 +274,15 @@ fn runVoices(
         status,
         voices,
     );
+
+    // Nobody there, so the detectors learn where the probes rest.
+    for (0..settle_blocks) |_| try app.step();
+
+    // Then the gesture, measured on its own: what the plants did while the room
+    // was empty is not what any of these tests are asking about.
+    probe.pattern = pattern;
+    probe.poll = 0;
+    sink = .{};
 
     for (0..blocks) |_| try app.step();
     return sink;
@@ -326,16 +348,19 @@ test "a held probe A opens the drone's gate, not just its pitch" {
     // the drone idles rather than stopping.
     //
     // The numbers this is pitched between, from this test: held reads an RMS of
-    // 0.032 against an idle 0.0089, and with the touch withheld from the voice
-    // -- the gate shut, the pitch still moving -- it reads 0.012. A ratio of
-    // two and a half sits above what the pitch alone can produce and well under
-    // what the gate does, so the test says the gate opened and not merely that
-    // something changed.
+    // 0.032 against an idle 0.012, and with the touch withheld from the voice
+    // -- the gate shut, the pitch still moving -- the two are within a third of
+    // each other. A ratio of two and a half sits above what the pitch alone can
+    // produce and under what the gate does, so the test says the gate opened
+    // and not merely that something changed.
     const held = try runPlantA(heldA, warmup_blocks);
     const idle = try runPlantA(untouched, warmup_blocks);
 
     try testing.expect(held.rms() > idle.rms() * 2.5);
-    try testing.expect(held.peak > idle.peak * 3);
+    // The gate walks from an idle 0.35 to 1.0, so 2.86 is the most this ratio
+    // can be and measuring 2.85 means the gate opened all the way. Two is
+    // comfortably above what the pitch alone manages, which is 1.3.
+    try testing.expect(held.peak > idle.peak * 2);
 }
 
 test "plant A is audible at all rather than a quiet gate opening on nothing" {

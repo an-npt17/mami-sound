@@ -260,6 +260,20 @@ pub const default_still_window_ms: f32 = 1000.0;
 pub const default_still_range: i16 = 32;
 pub const default_still_release: i16 = 512;
 
+/// How far from its resting level a probe must have gone before its stillness
+/// counts as a hand.
+///
+/// Stillness alone cannot tell a hand from a probe that has stopped moving, and
+/// the second is what the rig gives when nothing is connected to the pair: the
+/// journal shows probe BC reading nought and one for minutes, spread zero, and
+/// the model calling that held for as long as it ran. Nothing is stiller than a
+/// dead probe.
+///
+/// So a hand is stillness somewhere the probe does not normally sit. A hundred
+/// counts is far more than a resting probe's own wobble and far less than the
+/// six hundred and fifty a hand moves it, which is the gap this has to fall in.
+pub const default_still_move: i16 = 100;
+
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
 /// few polls in the middle of a real touch, and releasing on that would end a
@@ -277,6 +291,7 @@ pub const Config = struct {
     still_window_ms: f32 = default_still_window_ms,
     still_range: i16 = default_still_range,
     still_release: i16 = default_still_release,
+    still_move: i16 = default_still_move,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -284,6 +299,7 @@ pub const Config = struct {
     /// sounding, where a wrong latch on BC starts a recording.
     still_range_bc: ?i16 = null,
     still_release_bc: ?i16 = null,
+    still_move_bc: ?i16 = null,
     level: f32 = default_level,
     hold_ms: f32 = default_hold_ms,
     average_ms: f32 = default_average_ms,
@@ -340,8 +356,10 @@ pub const Config = struct {
         bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
         bc.still_range = self.still_range_bc orelse self.still_range;
         bc.still_release = self.still_release_bc orelse self.still_release;
+        bc.still_move = self.still_move_bc orelse self.still_move;
         bc.still_range_bc = null;
         bc.still_release_bc = null;
+        bc.still_move_bc = null;
         bc.counts = self.counts_bc orelse self.counts;
         bc.window_ms = self.window_bc_ms orelse self.window_ms;
         bc.hold = self.hold_bc;
@@ -404,6 +422,7 @@ pub const Detector = struct {
     spread: spread_mod.Spread,
     still_range: i16,
     still_release: i16,
+    still_move: i16,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -441,6 +460,7 @@ pub const Detector = struct {
             .spread = .init(cfg.still_window_ms, cfg.sample_rate, cfg.poll_frames),
             .still_range = cfg.still_range,
             .still_release = cfg.still_release,
+            .still_move = cfg.still_move,
         };
     }
 
@@ -508,12 +528,35 @@ pub const Detector = struct {
 
         const range = self.spread.range;
 
-        // No score to report in this model; what the log gets instead is the
-        // spread in latch-widths, so a number under one is a probe being held.
-        self.z = @as(f32, @floatFromInt(range)) /
-            @as(f32, @floatFromInt(@max(self.still_range, 1)));
+        // Where this probe sits when nobody is on it. A median over a minute,
+        // decimated, so a touch shorter than half of it cannot move the answer
+        // -- which is what lets rest be learned while the piece is running
+        // rather than measured once and typed in.
+        //
+        // And not learned at all while a hand is believed to be there. The
+        // median is touch-proof only up to half its window: a hand held longer
+        // than that becomes the rest it is being measured against, and the
+        // plant lets go with somebody still holding it. That is a fair trade
+        // for a model watching a probe move and no trade at all for one
+        // watching it hold still, where a hand may stay for the length of an
+        // interview. Freezing costs nothing: rest is what the probe reads when
+        // nobody is on it, and this is exactly when somebody is.
+        self.baseline.frozen = self.on;
+        self.baseline.push(self.spread.level);
+        if (!self.baseline.ready()) {
+            self.reset();
+            return false;
+        }
+        const moved = clampedAbsDiff(self.spread.level, self.baseline.base);
 
-        const held = range <= self.still_range;
+        // Still, and somewhere the probe does not normally sit. Stillness on
+        // its own says nothing: a probe with nothing connected to it is stiller
+        // than any hand could hold one.
+        const held = range <= self.still_range and moved >= self.still_move;
+        // And let go once it is wandering again. The spread alone is enough
+        // here: a hand coming off takes the probe from where it was held back
+        // to where it rests, and the window spends a second holding both --
+        // which is a spread of hundreds however still either end of it is.
         const loose = range >= self.still_release;
         self.at_rest = loose;
 
@@ -768,6 +811,14 @@ fn flailing(poll: usize) i16 {
 /// Polls enough to fill the one-second window and satisfy the hold on top.
 const steady_warmup: usize = 800;
 
+/// Feed a detector a spell of nobody being there, so it learns where the probe
+/// rests before a hand is put on it. Every steady fixture needs this now: a
+/// probe that has only ever read one value rests at that value, and stillness
+/// there is not a hand.
+fn settle(detector: *Detector) void {
+    for (0..rest_warmup) |poll| _ = detector.update(flailing(poll));
+}
+
 /// The poll size the engine runs the detector at, which is what makes the hold
 /// in these tests the same number of polls as it is in the room.
 const sensor_poll_frames: usize = 128;
@@ -776,8 +827,9 @@ test "the steady model latches a probe held at any level at all" {
     // Two levels a band would have to be told about in advance, one of which
     // is also the commonest corrupt reading this rig throws. Neither is
     // configured anywhere, and both must latch.
-    for ([_]i16{ 663, 1 }) |level| {
+    for ([_]i16{ 663, -2400 }) |level| {
         var detector: Detector = .init(steadyConfig());
+        settle(&detector);
         for (0..steady_warmup) |_| _ = detector.update(level);
         try std.testing.expect(detector.on);
     }
@@ -797,12 +849,14 @@ test "the steady model latches through the dropouts a held probe throws" {
     // poll, every dropout restarted the run and the longest run the rig offered
     // was shorter than the hold.
     var detector: Detector = .init(steadyConfig());
+    settle(&detector);
     for (0..steady_warmup) |poll| _ = detector.update(heldPlantA(poll));
     try std.testing.expect(detector.on);
 }
 
 test "the steady model lets go once the probe is left alone again" {
     var detector: Detector = .init(steadyConfig());
+    settle(&detector);
     for (0..steady_warmup) |_| _ = detector.update(663);
     try std.testing.expect(detector.on);
 
@@ -812,6 +866,7 @@ test "the steady model lets go once the probe is left alone again" {
 
 test "the pitch follows the level the probe went still at, not a band" {
     var detector: Detector = .init(steadyConfig());
+    settle(&detector);
     for (0..steady_warmup) |_| _ = detector.update(663);
     try std.testing.expectEqual(@as(i16, 663), detector.deviation());
 
@@ -831,6 +886,7 @@ test "the steady model is not subject to the tap window" {
     cfg.window_ms = 1000.0;
     var detector: Detector = .init(cfg);
 
+    settle(&detector);
     for (0..steady_warmup) |_| _ = detector.update(663);
     try std.testing.expect(detector.on);
 }
@@ -845,6 +901,7 @@ test "the preset's plant B window does not silence a steady rig" {
     var machine: Machine = .init(cfg);
 
     var latched = false;
+    for (0..rest_warmup) |poll| _ = machine.update(flailing(poll), flailing(poll));
     for (0..steady_warmup) |poll| {
         _ = machine.update(flailing(poll), 653);
         if (machine.bc.on) latched = true;
@@ -903,6 +960,7 @@ test "the steady model reports a hand for as long as it is there" {
     // Why `hold` wants `--touch-model=steady`. This asks how tightly the
     // readings cluster, which stays true under a hand however long it stays.
     var detector: Detector = .init(steadyConfig());
+    settle(&detector);
 
     var polls_reported: usize = 0;
     for (0..4000) |poll| {
@@ -953,15 +1011,30 @@ test "a warm baseline does not absorb a hand the way a cold one does" {
 
 test "the steady model judges the range and not the value" {
     // The whole of what this model is: a probe held anywhere at all reads as
-    // held, and two probes clamped a thousand counts apart with the same wobble
-    // must give the same answer on the same poll. Nothing here consults where a
-    // drone would map that level to, or anything else about the voice.
-    const levels = [_]i16{ 663, 1, -2000, 12000 };
+    // held, and four probes clamped thousands of counts apart with the same
+    // wobble settle on the same answer. Nothing here consults where a drone
+    // would map that level to, or anything else about the voice.
+    //
+    // Asked of the settled answer rather than of every poll. A level that sorts
+    // inside the resting readings displaces them in a different order from one
+    // that sorts above, so the changeover itself takes a different number of
+    // polls -- which is arithmetic about the window, not the model caring where
+    // the probe sits.
+    const levels = [_]i16{ 663, -900, -2000, 12000 };
     var detectors: [levels.len]Detector = undefined;
-    for (&detectors) |*detector| detector.* = .init(steadyConfig());
+    for (&detectors) |*detector| {
+        detector.* = .init(steadyConfig());
+        settle(detector);
+    }
 
     for (0..steady_warmup) |poll| {
-        // The same shape of wobble around each of them, well inside the range.
+        const wobble: i16 = @intCast(@as(i32, @intCast(poll % 5)) - 2);
+        for (&detectors, levels) |*detector, level| _ = detector.update(level +| wobble);
+    }
+    for (&detectors) |*detector| try std.testing.expect(detector.on);
+
+    // And from here they agree poll for poll, whatever they are sitting at.
+    for (0..steady_warmup) |poll| {
         const wobble: i16 = @intCast(@as(i32, @intCast(poll % 5)) - 2);
         var first: ?bool = null;
         for (&detectors, levels) |*detector, level| {
@@ -973,17 +1046,74 @@ test "the steady model judges the range and not the value" {
             }
         }
     }
-
-    for (&detectors) |*detector| try std.testing.expect(detector.on);
 }
 
 test "a probe wandering further than the range is not held, wherever it sits" {
     // The other half. A slow drift is not a hand, and neither is a probe
     // parked at a plausible-looking level while still moving about.
     var detector: Detector = .init(steadyConfig());
+    settle(&detector);
     for (0..steady_warmup) |poll| {
         const drift: i16 = @intCast(@as(i32, @intCast(poll % 400)) - 200);
         _ = detector.update(663 +| drift);
     }
     try std.testing.expect(!detector.on);
+}
+
+/// The rig's probe BC as the journal shows it: nought and one, for minutes.
+fn flatlined(poll: usize) i16 {
+    return if (poll % 3 == 0) 0 else 1;
+}
+
+/// Long enough for the spread's window and the baseline's median both.
+const rest_warmup: usize = 4 * steady_warmup;
+
+test "a probe that is not moving at all is not a hand" {
+    // Straight off the rig: probe BC reading nought and one for minutes with a
+    // spread of zero, and the model calling it held for as long as it ran --
+    // because stillness is what it looked for, and nothing is stiller than a
+    // probe that has stopped moving. A hand is the opposite of that.
+    var detector: Detector = .init(steadyConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(flatlined(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "stillness at a level the probe does not rest at is a hand" {
+    var detector: Detector = .init(steadyConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(flatlined(poll));
+    try std.testing.expect(!detector.on);
+
+    // A hand takes it to 657 and holds it there.
+    for (0..steady_warmup) |_| _ = detector.update(657);
+    try std.testing.expect(detector.on);
+}
+
+test "a hand coming off lets go even though rest is still as still" {
+    // The release has to watch the level too. A probe back at a rest it never
+    // moves from has a spread of zero, so a release that only watched the
+    // spread would latch on and stay there.
+    var detector: Detector = .init(steadyConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(flatlined(poll));
+    for (0..steady_warmup) |_| _ = detector.update(657);
+    try std.testing.expect(detector.on);
+
+    for (0..steady_warmup) |poll| _ = detector.update(flatlined(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "a hand held for a minute is still a hand" {
+    // The baseline is a median over a minute, and a touch occupying more than
+    // half of it moves the median -- at which point the probe reads as resting
+    // where the hand is holding it, and the plant lets go with somebody still
+    // there. That is fine for a model watching for movement and fatal for one
+    // watching for stillness, because `hold` means somebody may stay for the
+    // length of an interview.
+    var detector: Detector = .init(steadyConfig());
+    settle(&detector);
+
+    // Ninety seconds, well past the minute the median looks back over.
+    const polls_per_s = 44100 / sensor_poll_frames;
+    for (0..90 * polls_per_s) |_| _ = detector.update(657);
+
+    try std.testing.expect(detector.on);
 }
