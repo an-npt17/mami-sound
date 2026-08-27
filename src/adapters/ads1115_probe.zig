@@ -71,14 +71,15 @@ pub const Adapter = struct {
         self.frames_since_switch += frames;
         if (self.frames_since_switch >= switch_frames) {
             const next = self.selected.other();
+            // A switch that fails leaves both the chip and the driver on the
+            // input they were already on -- the low-level write is only
+            // believed once the chip has read it back -- so there is nothing to
+            // put right here. The probe stays where it is and tries again on
+            // the next block, which costs one block of one probe going stale
+            // and never files a reading under the wrong plant.
             if (self.select_op(self, next.mux())) |_| {
                 advanceTiming(&self.selected, &self.frames_since_switch, 0, true);
-            } else |_| {
-                // The low-level driver caches the requested mux before the
-                // write. Restore the real selection so a retry does not
-                // mistake a failed write for a successful switch.
-                self.adc.cfg.mux = self.selected.mux();
-            }
+            } else |_| {}
         }
 
         return .{ .raw_a = self.raw_a, .raw_bc = self.raw_bc };
@@ -116,4 +117,41 @@ fn storeResult(result: ads1115.Error!i16, selected: Probe, raw_a: *i16, raw_bc: 
     if (result) |raw| {
         storeReading(selected, raw, raw_a, raw_bc);
     } else |_| {}
+}
+
+test "a failed switch leaves the probe where it was" {
+    // The fault this guards against is the one the Pi's journal showed: the two
+    // probes swapping wholesale mid-run and staying swapped. A switch that did
+    // not take must not move the driver's idea of which probe it is reading, or
+    // every later reading goes to the wrong plant.
+    var adapter: Adapter = .{
+        .adc = undefined,
+        .selected = .a,
+        .frames_since_switch = 0,
+        .raw_a = 0,
+        .raw_bc = 0,
+        .io_context = undefined,
+        .read_op = struct {
+            fn read(_: *Adapter) ads1115.Error!i16 {
+                return 662;
+            }
+        }.read,
+        .select_op = struct {
+            fn select(_: *Adapter, _: ads1115.Mux) ads1115.Error!void {
+                return ads1115.Error.ConfigUnverified;
+            }
+        }.select,
+    };
+
+    var source_port = adapter.source();
+    // Far enough past `switch_frames` that a switch is attempted every time.
+    for (0..8) |_| {
+        _ = source_port.read(switch_frames);
+        try std.testing.expectEqual(Probe.a, adapter.selected);
+    }
+
+    // And the readings that arrived are all filed under the probe that was
+    // actually being read.
+    try std.testing.expectEqual(@as(i16, 662), adapter.raw_a);
+    try std.testing.expectEqual(@as(i16, 0), adapter.raw_bc);
 }

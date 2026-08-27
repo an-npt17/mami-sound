@@ -2,7 +2,7 @@ const std = @import("std");
 
 const core = @import("../core/root.zig");
 const ports = @import("../ports/root.zig");
-const production_config = @import("production_config.zig");
+const voice_mod = @import("voice.zig");
 
 pub const Engine = struct {
     selection: core.plant.Selection,
@@ -10,9 +10,10 @@ pub const Engine = struct {
     sink: ports.AudioSink,
     status: ports.StatusSink,
     machine: core.touch.Machine,
-    drone: core.noise.Noise,
-    plant_b: core.plant_b.ClipSelector,
-    clip_stream: ports.ClipStream,
+    /// One per plant, indexed as the selection is. The engine reads neither of
+    /// them: it hands each its own probe and its own share of the block, and
+    /// which of them is a drone and which a folder of clips is not its business.
+    voices: [2]voice_mod.Voice,
     block: [core.block_frames]f32,
     pcm: [core.block_frames]i16,
     rendered: usize,
@@ -23,11 +24,9 @@ pub const Engine = struct {
         probe: ports.ProbeSource,
         sink: ports.AudioSink,
         status: ports.StatusSink,
-        clip_stream: ports.ClipStream,
-        /// Which folder each clip in the pool came from, so a touch can move to
-        /// the other one.
-        clip_folders: []const u8,
-        random: std.Random,
+        /// Already built, because what a plant plays is a composition decision
+        /// and this is not where compositions are made.
+        voices: [2]voice_mod.Voice,
     ) Engine {
         return .{
             .selection = selection,
@@ -35,13 +34,7 @@ pub const Engine = struct {
             .sink = sink,
             .status = status,
             .machine = core.touch.Machine.init(touch_config),
-            .drone = core.noise.Noise.init(
-                core.sample_rate,
-                production_config.seed,
-                production_config.drone,
-            ),
-            .plant_b = core.plant_b.ClipSelector.init(clip_folders, core.sample_rate, random),
-            .clip_stream = clip_stream,
+            .voices = voices,
             .block = undefined,
             .pcm = undefined,
             .rendered = 0,
@@ -67,17 +60,11 @@ pub const Engine = struct {
                 detected == .plant_bc or detected == .both,
             });
             state = detected;
-            if (self.selection[0]) {
-                self.drone.render(piece, self.machine.a.deviation(), touched[0]);
+            for (&self.voices, 0..) |*plant_voice, plant| {
+                if (!self.selection[plant]) continue;
+                const probe = if (plant == 0) &self.machine.a else &self.machine.bc;
+                plant_voice.render(piece, probe, touched[plant]);
             }
-            // Asked before rendering, so the answer is about the clip already
-            // running rather than about the one this poll might start.
-            const sounding = self.clip_stream.sounding();
-            const request = if (self.selection[1])
-                self.plant_b.start(touched[1], sounding, core.sensor_frames)
-            else
-                null;
-            self.clip_stream.render(piece, request);
         }
 
         core.pcm.toPcm(&self.block, &self.pcm);
@@ -183,20 +170,87 @@ fn untouched(poll: usize) ports.Reading {
 /// polls a block, a window of a second, and a hold on top of that.
 const warmup_blocks: usize = 400;
 
-fn runPlantA(pattern: *const fn (usize) ports.Reading, blocks: usize) !FakeSink {
+/// A clip stream that answers every request with a steady tone, so a test can
+/// tell plant A's clip voice from its drone by what comes out.
+const FakeClips = struct {
+    playing: bool = false,
+    requests: usize = 0,
+    level: f32 = 0.5,
+
+    fn render(context: *anyopaque, out: []f32, request: ?usize) void {
+        const self: *FakeClips = @ptrCast(@alignCast(context));
+        if (request != null) {
+            self.requests += 1;
+            self.playing = true;
+        }
+        if (!self.playing) return;
+        for (out) |*sample| sample.* += self.level;
+    }
+
+    fn sounding(context: *anyopaque) bool {
+        const self: *FakeClips = @ptrCast(@alignCast(context));
+        return self.playing;
+    }
+
+    fn port(self: *FakeClips) ports.ClipStream {
+        return .{ .context = self, .render_fn = render, .sounding_fn = sounding };
+    }
+};
+
+/// Both probes held, so whichever plant carries a clip voice gets a touch.
+fn heldBoth(poll: usize) ports.Reading {
+    const value = heldA(poll).raw_a;
+    return .{ .raw_a = value, .raw_bc = value };
+}
+
+/// A hand arriving and leaving every second and a half, which is what a room
+/// full of people does to a plant. Enough latch-and-release cycles inside the
+/// guard to tell a guarded selector from an unguarded one.
+fn alternatingA(poll: usize) ports.Reading {
+    const polls_per_s = core.sample_rate / core.sensor_frames;
+    const half_cycle = polls_per_s * 3 / 2;
+    const held = (poll / half_cycle) % 2 == 0;
+    return .{
+        .raw_a = if (held) heldA(poll).raw_a else flailingA(poll),
+        .raw_bc = 0,
+    };
+}
+
+fn flailingA(poll: usize) i16 {
+    return if (poll % 2 == 0) -4096 else 1;
+}
+
+/// Four seconds: several touches, all inside one clip's five-second guard.
+const guard_blocks: usize = 4 * core.sample_rate / core.block_frames;
+
+fn clipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
+    const State = struct {
+        var prng: [2]std.Random.DefaultPrng = undefined;
+        var folders = [_]u8{ 0, 0 };
+    };
+    State.prng[slot] = .init(slot + 1);
+    return .{ .clips = .{
+        .stream = stream.port(),
+        .selector = .init(&State.folders, 5.0, core.sample_rate, State.prng[slot].random()),
+    } };
+}
+
+fn droneVoice() voice_mod.Voice {
+    return .{ .drone = .init(core.sample_rate, 1, .{ .span = 3000 }) };
+}
+
+fn runVoices(
+    pattern: *const fn (usize) ports.Reading,
+    blocks: usize,
+    selection: core.plant.Selection,
+    voices: [2]voice_mod.Voice,
+) !FakeSink {
     var probe: FakeProbe = .{ .pattern = pattern };
     var sink: FakeSink = .{};
     const status: ports.StatusSink = .{ .context = &sink, .observe_fn = ignoreStatus };
-    const clips: ports.ClipStream = .{
-        .context = &sink,
-        .render_fn = ignoreClips,
-        .sounding_fn = neverSounding,
-    };
-    var prng = std.Random.DefaultPrng.init(1);
 
     var app = Engine.init(
-        // Plant A only, so anything heard is plant A's drone and not a clip.
-        .{ true, false },
+        selection,
         .{
             .sample_rate = core.sample_rate,
             .poll_frames = core.sensor_frames,
@@ -205,13 +259,65 @@ fn runPlantA(pattern: *const fn (usize) ports.Reading, blocks: usize) !FakeSink 
         probe.source(),
         sink.port(),
         status,
-        clips,
-        &.{},
-        prng.random(),
+        voices,
     );
 
     for (0..blocks) |_| try app.step();
     return sink;
+}
+
+/// Plant A alone, on the drone. What the drone tests have always asked for.
+fn runPlantA(pattern: *const fn (usize) ports.Reading, blocks: usize) !FakeSink {
+    return runVoices(pattern, blocks, .{ true, false }, .{ droneVoice(), droneVoice() });
+}
+
+fn runClipPlantA(
+    pattern: *const fn (usize) ports.Reading,
+    blocks: usize,
+    clips: *FakeClips,
+) !FakeSink {
+    return runVoices(pattern, blocks, .{ true, false }, .{
+        clipVoice(clips, 0),
+        droneVoice(),
+    });
+}
+
+test "either plant can be either kind of voice" {
+    // The whole point of the change: nothing in the engine knows which plant is
+    // which, so a clip voice on A with a drone on B must work exactly as well
+    // as the other way round.
+    var stream_a: FakeClips = .{};
+    var stream_b: FakeClips = .{};
+
+    const a_clips = try runVoices(heldBoth, warmup_blocks, .{ true, true }, .{
+        clipVoice(&stream_a, 0),
+        droneVoice(),
+    });
+    const b_clips = try runVoices(heldBoth, warmup_blocks, .{ true, true }, .{
+        droneVoice(),
+        clipVoice(&stream_b, 1),
+    });
+
+    try testing.expect(stream_a.requests > 0);
+    try testing.expect(stream_b.requests > 0);
+    try testing.expect(a_clips.rms() > 0.0);
+    try testing.expect(b_clips.rms() > 0.0);
+}
+
+test "a clip voice replaces the drone rather than joining it" {
+    var clips: FakeClips = .{};
+    const sink = try runClipPlantA(heldA, warmup_blocks, &clips);
+
+    try testing.expect(clips.requests > 0);
+    // The fake plays a flat 0.5, so anything the drone added would show up as
+    // movement around it.
+    try testing.expect(sink.peak > 16000);
+}
+
+test "a second touch inside the guard starts nothing" {
+    var clips: FakeClips = .{};
+    _ = try runClipPlantA(alternatingA, guard_blocks, &clips);
+    try testing.expectEqual(@as(usize, 1), clips.requests);
 }
 
 test "a held probe A opens the drone's gate, not just its pitch" {

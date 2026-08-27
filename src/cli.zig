@@ -1,12 +1,17 @@
 const std = @import("std");
-const plant_b = @import("core/plant_b.zig");
+const clips = @import("core/clips.zig");
+const source = @import("core/source.zig");
 const touch = @import("core/touch.zig");
 const select = @import("core/select.zig");
 
 pub const Error = error{
     UnknownFlag,
     InvalidDevice,
-    InvalidPlantB,
+    InvalidSource,
+    InvalidSeconds,
+    InvalidMode,
+    ModeOnDrone,
+    SecondsOnDrone,
     InvalidTouchModel,
     InvalidStillThreshold,
     TooManyArguments,
@@ -23,9 +28,16 @@ pub const Options = struct {
     plants: select.Selection = select.all,
     device_buf: [device_max]u8 = undefined,
     device_len: usize = 0,
-    /// Which recordings a touch on plant B draws from. The interviews and the
-    /// field records unless the room asked for a stem pool instead.
-    pool: plant_b.Pool = .recordings,
+    /// What each plant plays, indexed as the selection is. The defaults are
+    /// what the installation did before either flag took a value.
+    plant_sources: [2]source.Source = .{ .drone, .recordings },
+    /// How long a touch plays, and how long before the next one is honoured.
+    /// `null` leaves the source's own answer standing.
+    plant_seconds: [2]?f32 = .{ null, null },
+    plant_retrigger: [2]?f32 = .{ null, null },
+    /// Whether a touch sets a clip going or has to be kept up to hear it.
+    /// `null` leaves the plant on `trigger`, which is what it has always done.
+    plant_mode: [2]?clips.Mode = .{ null, null },
     test_random_probe: bool = false,
     /// Which question the detector asks each probe, and the two spreads the
     /// `steady` model answers it with. Unset, the compiled-in preset stands.
@@ -54,9 +66,30 @@ pub fn parse(args: []const []const u8) Error!Options {
             if (name.len == 0 or name.len > device_max) return Error.InvalidDevice;
             @memcpy(opts.device_buf[0..name.len], name);
             opts.device_len = name.len;
+        } else if (std.mem.startsWith(u8, arg, "--plant-a=")) {
+            opts.plant_sources[0] = source.Source.parse(arg["--plant-a=".len..]) catch
+                return Error.InvalidSource;
         } else if (std.mem.startsWith(u8, arg, "--plant-b=")) {
-            opts.pool = plant_b.Pool.parse(arg["--plant-b=".len..]) catch
-                return Error.InvalidPlantB;
+            opts.plant_sources[1] = source.Source.parse(arg["--plant-b=".len..]) catch
+                return Error.InvalidSource;
+        } else if (std.mem.startsWith(u8, arg, "--plant-a-seconds=")) {
+            opts.plant_seconds[0] = parseSeconds(arg["--plant-a-seconds=".len..]) orelse
+                return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b-seconds=")) {
+            opts.plant_seconds[1] = parseSeconds(arg["--plant-b-seconds=".len..]) orelse
+                return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--plant-a-retrigger=")) {
+            opts.plant_retrigger[0] = parseSeconds(arg["--plant-a-retrigger=".len..]) orelse
+                return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b-retrigger=")) {
+            opts.plant_retrigger[1] = parseSeconds(arg["--plant-b-retrigger=".len..]) orelse
+                return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
+            opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
+                return Error.InvalidMode;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b-mode=")) {
+            opts.plant_mode[1] = parseMode(arg["--plant-b-mode=".len..]) orelse
+                return Error.InvalidMode;
         } else if (std.mem.startsWith(u8, arg, "--touch-model=")) {
             const name = arg["--touch-model=".len..];
             opts.model = parseModel(name) orelse return Error.InvalidTouchModel;
@@ -66,6 +99,10 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
             opts.still_release = parseCounts(arg["--still-release=".len..]) orelse
                 return Error.InvalidStillThreshold;
+        } else if (std.mem.eql(u8, arg, "--plant-a")) {
+            // The shorthand the flag had when it was a switch, kept so a unit
+            // file already passing it keeps starting.
+            opts.plant_sources[0] = .daybird;
         } else if (std.mem.eql(u8, arg, "--test-random-probe")) {
             opts.test_random_probe = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -77,7 +114,31 @@ pub fn parse(args: []const []const u8) Error!Options {
         }
     }
 
+    // Checked here rather than per-argument because the source and its length
+    // can arrive in either order.
+    for (opts.plant_sources, 0..) |chosen, plant| {
+        if (!chosen.isDrone()) continue;
+        if (opts.plant_seconds[plant] != null or opts.plant_retrigger[plant] != null) {
+            return Error.SecondsOnDrone;
+        }
+        // The drone is held by nature -- its gate opens under a hand and falls
+        // to an idle floor when the hand goes. A mode flag on it would be a
+        // word that changed nothing, which is worse than one that is refused.
+        if (opts.plant_mode[plant] != null) return Error.ModeOnDrone;
+    }
+
     return opts;
+}
+
+/// A length in seconds. Negative is not a length; zero is "to the clip's end"
+/// and is deliberately allowed.
+fn parseSeconds(text: []const u8) ?f32 {
+    const value = std.fmt.parseFloat(f32, text) catch return null;
+    return if (value >= 0.0) value else null;
+}
+
+fn parseMode(name: []const u8) ?clips.Mode {
+    return std.meta.stringToEnum(clips.Mode, name);
 }
 
 fn parseModel(name: []const u8) ?touch.Model {
@@ -94,26 +155,49 @@ fn parseCounts(text: []const u8) ?i16 {
 }
 
 pub const usage =
-    \\usage: mami_sound [PLANTS] [--device=NAME] [--plant-b=POOL]
+    \\usage: mami_sound [PLANTS] [--device=NAME]
+    \\                  [--plant-a=SOURCE] [--plant-a-seconds=N] [--plant-a-retrigger=N]
+    \\                  [--plant-b=SOURCE] [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
-    \\  1  plant A, the sensor-driven drone
-    \\  2  plant B, a random clip
+    \\  1  plant A only
+    \\  2  plant B only
     \\  12 both plants
-    \\
-    \\Plant B draws clips from ./interview files/ and ./field records/, which
-    \\form one pool. Each new touch chooses a clip from it at random.
     \\
     \\--device selects the ALSA device for aplay. It defaults to `default`.
     \\Use `aplay -l` to list cards; for example, `plughw:0,0`.
     \\
-    \\--plant-b swaps that pool for a folder of tuned stems, chosen the same way:
-    \\  bell   ./Bell Stems/
-    \\  piano  ./EPiano Stems/
-    \\Left off, plant B plays the interviews and field records as usual.
-    \\Plant A's drone is generated either way and is not affected.
+    \\--plant-a and --plant-b each name what that plant plays. Either plant
+    \\takes any of them:
+    \\  drone       the sensor-driven voice, generated rather than played
+    \\  recordings  ./interview files/ and ./field records/ as one pool
+    \\  daybird     ./Day bird/
+    \\  insect      ./Insect/
+    \\  tradvn      ./Trad Vn Jam/
+    \\  bell        ./Bell Stems/
+    \\  piano       ./EPiano Stems/
+    \\Unasked, plant A is the drone and plant B the recordings, which is what
+    \\the installation has always done. Bare --plant-a means --plant-a=daybird.
+    \\
+    \\--plant-a-seconds and --plant-b-seconds are how long one touch plays.
+    \\Zero plays the clip to its own end, which is how a source that is normally
+    \\cut is uncapped, or one that normally runs long is cut. Left off, the
+    \\source's own length stands: 4s for the stems, 5s for daybird and insect,
+    \\and to the end for recordings and tradvn.
+    \\
+    \\--plant-a-mode and --plant-b-mode are how a plant answers a hand:
+    \\  trigger  a touch sets a clip going and it runs its own length
+    \\  hold     the clip sounds while the plant is held and fades when it is
+    \\           let go, and the next hold picks it up where it stopped
+    \\Left off, a plant triggers. The drone always holds and takes no mode.
+    \\
+    \\--plant-a-retrigger and --plant-b-retrigger are how long a clip is
+    \\protected from the next touch, counted from when it started. A touch
+    \\inside it is ignored and the clip keeps playing; a touch past it moves the
+    \\plant on to the other folder. Left off, 10s for recordings and 5s for
+    \\everything else. The drone takes neither flag.
     \\
     \\--touch-model picks what the detector asks each probe:
     \\  deviation  how far the probe has moved from its own recent past
@@ -131,19 +215,74 @@ pub const usage =
     \\
 ;
 
-test "parse accepts either stem pool" {
-    try std.testing.expectEqual(plant_b.Pool.bell, (try parse(&.{"--plant-b=bell"})).pool);
-    try std.testing.expectEqual(plant_b.Pool.piano, (try parse(&.{"--plant-b=piano"})).pool);
+test "each plant chooses its own source" {
+    const opts = try parse(&.{ "--plant-a=insect", "--plant-b=tradvn" });
+    try std.testing.expectEqual(source.Source.insect, opts.plant_sources[0]);
+    try std.testing.expectEqual(source.Source.tradvn, opts.plant_sources[1]);
 }
 
-test "plant B plays the recordings when nothing asked otherwise" {
-    try std.testing.expectEqual(plant_b.Pool.recordings, (try parse(&.{})).pool);
-    try std.testing.expectEqual(plant_b.Pool.recordings, (try parse(&.{"12"})).pool);
+test "the defaults are what the installation already does" {
+    const opts = try parse(&.{});
+    try std.testing.expectEqual(source.Source.drone, opts.plant_sources[0]);
+    try std.testing.expectEqual(source.Source.recordings, opts.plant_sources[1]);
+    try std.testing.expect(opts.plant_seconds[0] == null);
+    try std.testing.expect(opts.plant_retrigger[1] == null);
 }
 
-test "parse rejects a pool it has no folder for" {
-    try std.testing.expectError(Error.InvalidPlantB, parse(&.{"--plant-b=cello"}));
-    try std.testing.expectError(Error.InvalidPlantB, parse(&.{"--plant-b="}));
+test "either plant accepts any source, including the drone" {
+    try std.testing.expectEqual(
+        source.Source.drone,
+        (try parse(&.{"--plant-b=drone"})).plant_sources[1],
+    );
+    try std.testing.expectEqual(
+        source.Source.bell,
+        (try parse(&.{"--plant-a=bell"})).plant_sources[0],
+    );
+}
+
+test "bare --plant-a still means the bird calls" {
+    // A unit file already passing the flag keeps starting.
+    const opts = try parse(&.{"--plant-a"});
+    try std.testing.expectEqual(source.Source.daybird, opts.plant_sources[0]);
+}
+
+test "a source no folder answers to is refused" {
+    try std.testing.expectError(Error.InvalidSource, parse(&.{"--plant-a=cello"}));
+    try std.testing.expectError(Error.InvalidSource, parse(&.{"--plant-b="}));
+}
+
+test "both lengths can be set per plant" {
+    const opts = try parse(&.{
+        "--plant-a=insect",
+        "--plant-a-seconds=8",
+        "--plant-b-retrigger=20",
+    });
+    try std.testing.expectEqual(@as(f32, 8.0), opts.plant_seconds[0].?);
+    try std.testing.expectEqual(@as(f32, 20.0), opts.plant_retrigger[1].?);
+}
+
+test "zero seconds is how a source is uncapped" {
+    const opts = try parse(&.{ "--plant-a=bell", "--plant-a-seconds=0" });
+    try std.testing.expectEqual(@as(f32, 0.0), opts.plant_seconds[0].?);
+}
+
+test "a length that is not one is refused" {
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-a-seconds=-1"}));
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-b-seconds=soon"}));
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-a-retrigger=-3"}));
+}
+
+test "a length given to the drone is refused rather than ignored" {
+    // The drone has no clip to cut, so the flag can only be a typo, and a
+    // silently ignored typo is how a room hears the wrong thing with no clue.
+    try std.testing.expectError(
+        Error.SecondsOnDrone,
+        parse(&.{ "--plant-a=drone", "--plant-a-seconds=5" }),
+    );
+    try std.testing.expectError(
+        Error.SecondsOnDrone,
+        parse(&.{ "--plant-b=drone", "--plant-b-retrigger=5" }),
+    );
 }
 
 test "the flag the pool replaced is gone rather than ignored" {
@@ -179,4 +318,26 @@ test "the still thresholds take counts, and refuse what is not one" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-range=0"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-range=-8"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-release=wide"}));
+}
+
+test "a plant can be told to hold rather than trigger" {
+    const opts = try parse(&.{ "--plant-a=insect", "--plant-a-mode=hold" });
+    try std.testing.expectEqual(clips.Mode.hold, opts.plant_mode[0].?);
+    try std.testing.expect(opts.plant_mode[1] == null);
+
+    try std.testing.expectEqual(
+        clips.Mode.trigger,
+        (try parse(&.{ "--plant-b=bell", "--plant-b-mode=trigger" })).plant_mode[1].?,
+    );
+}
+
+test "a mode no plant has is refused" {
+    try std.testing.expectError(Error.InvalidMode, parse(&.{ "--plant-a=bell", "--plant-a-mode=latch" }));
+    try std.testing.expectError(Error.InvalidMode, parse(&.{ "--plant-a=bell", "--plant-a-mode=" }));
+}
+
+test "a mode given to the drone is refused" {
+    // The drone already holds: its gate opens under a hand and falls to an idle
+    // floor when the hand goes. A flag that changed nothing would only mislead.
+    try std.testing.expectError(Error.ModeOnDrone, parse(&.{"--plant-a-mode=hold"}));
 }

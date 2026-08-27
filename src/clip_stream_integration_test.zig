@@ -81,7 +81,7 @@ test "a capped touch plays its allowance and then stops on its own" {
     // than the file. Nothing here asks the stream to stop: the point is that it
     // runs out by itself and waits for the next touch.
     const sample_rate = 44100;
-    const limit: core.plant_b.Limit = .forPool(.bell, sample_rate);
+    const limit: core.clips.Limit = .forSource(.bell, null, sample_rate);
 
     const stems = try library.listSorted(std.testing.allocator, std.testing.io, "Bell Stems");
     defer library.freeList(std.testing.allocator, stems);
@@ -182,11 +182,14 @@ test "the stream picks the clip up exactly where the head stops" {
     port.render(&block, 0);
     try heard.appendSlice(gpa, &block);
 
-    // The worker is given the ring's own second to get ahead before the head
-    // runs out, which is the margin the design counts on rather than a fudge
-    // for the test: the head is twice as long again.
+    // Let the worker spawn ffmpeg and fill the ring before any of it is drained.
+    // Without this the test is racing its own decoder: a ring that runs dry
+    // mixes nothing, the untouched block appends as silence, and the comparison
+    // fails on a gap the room would never hear.
+    std.Io.sleep(io, .fromNanoseconds(500 * std.time.ns_per_ms), .awake) catch {};
+
     while (heard.items.len < want) {
-        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+        std.Io.sleep(io, .fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch {};
         @memset(&block, 0);
         port.render(&block, null);
         try heard.appendSlice(gpa, &block);
@@ -215,7 +218,7 @@ test "a clip reads as sounding until it has actually run out" {
     // playing one second of something and stopping.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const limit: core.plant_b.Limit = .forPool(.bell, 44100);
+    const limit: core.clips.Limit = .forSource(.bell, null, 44100);
 
     const stems = try library.listSorted(gpa, io, "Bell Stems");
     defer library.freeList(gpa, stems);
@@ -248,12 +251,12 @@ test "a stem plays between three and five seconds and then stops" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    for ([_]core.plant_b.Pool{ .bell, .piano }) |pool| {
-        const directory = if (pool == .bell) "Bell Stems" else "EPiano Stems";
+    for ([_]core.source.Source{ .bell, .piano }) |pool| {
+        const directory: []const u8 = if (pool == .bell) "Bell Stems" else "EPiano Stems";
         const stems = try library.listSorted(gpa, io, directory);
         defer library.freeList(gpa, stems);
 
-        const limit: core.plant_b.Limit = .forPool(pool, 44100);
+        const limit: core.clips.Limit = .forSource(pool, null, 44100);
         var adapter = try clip_stream.Adapter.init(io, gpa, &.{stems[0]}, limit);
         defer adapter.deinit();
         try adapter.primeHeads();
@@ -311,4 +314,112 @@ test "an uncapped clip keeps sounding once the head has handed over" {
         port.render(&block, null);
         try std.testing.expect(port.sounding());
     }
+}
+
+test "a bird call plays five seconds and then stops" {
+    // Plant A's pool, under `--plant-a`. The recordings in the folder run from
+    // thirteen seconds to over a minute, so this is entirely down to the cap
+    // holding: without it a touch would answer with the whole dawn chorus.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const calls = try library.listSorted(gpa, io, "Day bird");
+    defer library.freeList(gpa, calls);
+    try std.testing.expect(calls.len > 0);
+
+    const limit: core.clips.Limit = .forSource(.daybird, null, 44100);
+    var adapter = try clip_stream.Adapter.init(io, gpa, &.{calls[0]}, limit);
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+
+    var sounded: usize = 0;
+    var drained: usize = 0;
+    while (drained < 44100 * 10) : (drained += block.len) {
+        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+        @memset(&block, 0);
+        port.render(&block, null);
+        for (block) |sample| {
+            if (sample != 0.0) sounded += 1;
+        }
+    }
+
+    const seconds = @as(f32, @floatFromInt(sounded)) / 44100.0;
+    try std.testing.expect(seconds >= 4.0);
+    try std.testing.expect(seconds <= 5.5);
+    try std.testing.expect(!port.sounding());
+}
+
+test "a capped source sounds for the length it was given" {
+    // insect is cut at five seconds. The folder holds recordings of up to
+    // forty, so this is entirely down to the cap holding.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const paths = try library.listSorted(gpa, io, "Insect");
+    defer library.freeList(gpa, paths);
+    try std.testing.expect(paths.len > 0);
+
+    const limit: core.clips.Limit = .forSource(.insect, null, 44100);
+    var adapter = try clip_stream.Adapter.init(io, gpa, &.{paths[0]}, limit);
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+
+    var sounded: usize = 0;
+    var drained: usize = 0;
+    while (drained < 44100 * 10) : (drained += block.len) {
+        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
+        @memset(&block, 0);
+        port.render(&block, null);
+        for (block) |sample| {
+            if (sample != 0.0) sounded += 1;
+        }
+    }
+
+    const seconds = @as(f32, @floatFromInt(sounded)) / 44100.0;
+    try std.testing.expect(seconds >= 4.0);
+    try std.testing.expect(seconds <= 5.5);
+    try std.testing.expect(!port.sounding());
+}
+
+test "a source that runs to its end is still sounding past five seconds" {
+    // tradvn plays the whole jam. Its guard, not a cut, is what stops the next
+    // hand restarting it, so at eight seconds it must still be playing.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const paths = try library.listSorted(gpa, io, "Trad Vn Jam");
+    defer library.freeList(gpa, paths);
+    try std.testing.expect(paths.len > 0);
+
+    const limit: core.clips.Limit = .forSource(.tradvn, null, 44100);
+    try std.testing.expectEqual(core.clips.Limit.unlimited.total, limit.total);
+
+    var adapter = try clip_stream.Adapter.init(io, gpa, &.{paths[0]}, limit);
+    defer adapter.deinit();
+    try adapter.primeHeads();
+    try adapter.start();
+
+    var port = adapter.port();
+    var block = [_]f32{0.0} ** 512;
+    port.render(&block, 0);
+
+    std.Io.sleep(io, .fromNanoseconds(500 * std.time.ns_per_ms), .awake) catch {};
+
+    var drained: usize = 0;
+    while (drained < 44100 * 8) : (drained += block.len) {
+        std.Io.sleep(io, .fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch {};
+        @memset(&block, 0);
+        port.render(&block, null);
+    }
+    try std.testing.expect(port.sounding());
 }

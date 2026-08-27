@@ -384,10 +384,19 @@ pub const Detector = struct {
             .last_mean = 0,
             .base_override = null,
             .counts = cfg.counts,
-            .window = if (cfg.window_ms) |ms|
-                @max(holdPolls(ms, cfg.sample_rate, cfg.poll_frames), 1)
-            else
-                null,
+            // A deviation-model idea, and only ever applied there. That model
+            // reads an excursion that never comes back as drift, a probe
+            // settling after power-on, or a hand left resting -- none of which
+            // is somebody asking for a recording. The steady model asks the
+            // opposite question: a touch there is a hand that stays, so a tap
+            // window would discard every real one and then block the probe
+            // until it was let go. The preset still carries `window_bc_ms` for
+            // the rig it was measured on, so this cannot be left to the caller
+            // remembering to clear it.
+            .window = if (cfg.model == .deviation) blk: {
+                const ms = cfg.window_ms orelse break :blk null;
+                break :blk @max(holdPolls(ms, cfg.sample_rate, cfg.poll_frames), 1);
+            } else null,
             .over_polls = 0,
             .armed = false,
             .blocked = false,
@@ -769,4 +778,36 @@ test "the pitch follows the level the probe went still at, not a band" {
     // when it left.
     for (0..steady_warmup) |poll| _ = detector.update(flailing(poll));
     try std.testing.expectEqual(@as(i16, 0), detector.deviation());
+}
+
+test "the steady model is not subject to the tap window" {
+    // The live preset carries `window_bc_ms` for the deviation rig, where an
+    // excursion that never comes back is drift or wiring settling rather than
+    // somebody asking for a recording. The steady model asks the opposite
+    // question: a touch there IS a hand that stays, so a tap window discards
+    // every real one and then blocks the probe until it is let go.
+    var cfg = steadyConfig();
+    cfg.window_ms = 1000.0;
+    var detector: Detector = .init(cfg);
+
+    for (0..steady_warmup) |_| _ = detector.update(663);
+    try std.testing.expect(detector.on);
+}
+
+test "the preset's plant B window does not silence a steady rig" {
+    // The same fault as it actually reaches the room: the compiled preset with
+    // only the model swapped, which is exactly what `--touch-model=steady` does.
+    var cfg = steadyConfig();
+    cfg.window_bc_ms = 1000.0;
+    cfg.level_bc = 10.0;
+    cfg.hold_bc_ms = 20.0;
+    var machine: Machine = .init(cfg);
+
+    var latched = false;
+    for (0..steady_warmup) |poll| {
+        _ = machine.update(flailing(poll), 653);
+        if (machine.bc.on) latched = true;
+    }
+    try std.testing.expect(latched);
+    try std.testing.expect(machine.bc.on);
 }

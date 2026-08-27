@@ -1,51 +1,5 @@
 const std = @import("std");
-
-pub const Error = error{UnknownPool};
-
-/// Which pool of recordings a touch on plant B draws from.
-///
-/// The piece's own voice is the interviews and the field records, and that is
-/// what runs when nobody has asked for anything else. The two stem pools are
-/// for the room rather than the work: a set of short tuned notes that makes
-/// what the plant is doing legible in a space where a spoken clip is not, and
-/// makes the rig demonstrable without playing somebody's interview to a
-/// corridor.
-///
-/// A pool is named, not pointed at. The folders are fixed and live beside the
-/// binary, so a path on the command line would only be a way of typing one of
-/// three answers wrong.
-pub const Pool = enum {
-    /// `interview files/` and `field records/` together, as one pool.
-    recordings,
-    bell,
-    piano,
-
-    pub fn parse(name: []const u8) Error!Pool {
-        if (std.mem.eql(u8, name, "bell")) return .bell;
-        if (std.mem.eql(u8, name, "piano")) return .piano;
-        return Error.UnknownPool;
-    }
-
-    /// How long one touch plays a clip from this pool, or `null` where the
-    /// clip runs to its own end.
-    pub fn playSeconds(self: Pool) ?f32 {
-        return switch (self) {
-            .recordings => null,
-            .bell, .piano => stem_play_s,
-        };
-    }
-};
-
-/// How long a touch plays a stem before the clip is faded out and plant B
-/// falls quiet again.
-///
-/// The stems are single tuned notes with long tails, and a plant that answers a
-/// touch with nine seconds of decaying bell reads as a machine finishing its
-/// turn rather than as something that responded: by the time it ends, whoever
-/// touched it has stopped listening and the room has no idea the two were
-/// connected. Four seconds is the note plus enough of its tail to hear it as a
-/// note, and it leaves the room quiet and waiting for the next hand.
-pub const stem_play_s: f32 = 4.0;
+const source_mod = @import("source.zig");
 
 /// The fade that ends a capped clip. Long enough that a stem still ringing at
 /// the cut is not a click through a PA, short enough to be heard as the note
@@ -70,10 +24,22 @@ pub const Limit = struct {
     /// is not a fragment of the piece, it is a fault.
     pub const unlimited: Limit = .{ .total = std.math.maxInt(usize), .fade = 0 };
 
-    pub fn forPool(pool: Pool, sample_rate: u32) Limit {
-        const seconds = pool.playSeconds() orelse return .unlimited;
+    /// The allowance a source asks for, or the one the room asked for instead.
+    ///
+    /// `seconds` of zero means play to the clip's own end. It is the only way
+    /// to uncap a capped source from the command line, and the reason this
+    /// takes an optional rather than a plain float: absent is "use the
+    /// source's own", zero is "use none".
+    pub fn forSource(
+        source: source_mod.Source,
+        seconds: ?f32,
+        sample_rate: u32,
+    ) Limit {
+        const chosen = seconds orelse source.defaultSeconds() orelse return .unlimited;
+        if (chosen <= 0.0) return .unlimited;
+
         const sr: f32 = @floatFromInt(sample_rate);
-        const total = @max(seconds * sr, 1.0);
+        const total = @max(chosen * sr, 1.0);
         return .{
             .total = @intFromFloat(total),
             .fade = @intFromFloat(@min(stem_fade_s * sr, total)),
@@ -107,20 +73,9 @@ pub const Limit = struct {
     }
 };
 
-/// How long a clip is protected from the next touch.
+/// Which clip a touch starts, and whether a touch starts one at all.
 ///
-/// A hand on plant B while a clip is running is somebody enjoying it or
-/// somebody brushing past, and neither is a request to hear the first four
-/// seconds of something else. Ten seconds is long enough that the clip has
-/// established itself and short enough that a room which has heard enough can
-/// move it on.
-///
-/// Counted from the clip starting, and only while it is still sounding: a stem
-/// that has already finished its four seconds answers the next touch at once
-/// rather than sulking for another six.
-pub const open_after_s: f32 = 10.0;
-
-/// Which clip a touch on plant B starts, and whether a touch starts one at all.
+/// Serves either plant: nothing here knows which one it is working for.
 pub const ClipSelector = struct {
     /// Which folder each clip came from, by index into the pool. The pool is
     /// flat -- one list of paths -- so this is what is left of the fact that it
@@ -135,14 +90,19 @@ pub const ClipSelector = struct {
     frames_since_start: u64,
     open_frames: u64,
 
-    pub fn init(folders: []const u8, sample_rate: u32, random: std.Random) ClipSelector {
+    pub fn init(
+        folders: []const u8,
+        retrigger_s: f32,
+        sample_rate: u32,
+        random: std.Random,
+    ) ClipSelector {
         return .{
             .folders = folders,
             .random = random,
             .previous_touch = false,
             .last_folder = null,
             .frames_since_start = 0,
-            .open_frames = @intFromFloat(open_after_s * @as(f32, @floatFromInt(sample_rate))),
+            .open_frames = @intFromFloat(retrigger_s * @as(f32, @floatFromInt(sample_rate))),
         };
     }
 
@@ -200,23 +160,8 @@ pub const ClipSelector = struct {
     }
 };
 
-test "the named pools are the two the command line offers" {
-    try std.testing.expectEqual(Pool.bell, try Pool.parse("bell"));
-    try std.testing.expectEqual(Pool.piano, try Pool.parse("piano"));
-    try std.testing.expectError(Error.UnknownPool, Pool.parse("Bell"));
-    try std.testing.expectError(Error.UnknownPool, Pool.parse(""));
-    // The recordings are what runs unasked, so there is no word for them.
-    try std.testing.expectError(Error.UnknownPool, Pool.parse("recordings"));
-}
-
-test "a stem pool caps a touch, the recordings do not" {
-    try std.testing.expectEqual(@as(?f32, null), Pool.recordings.playSeconds());
-    try std.testing.expectEqual(@as(?f32, stem_play_s), Pool.bell.playSeconds());
-    try std.testing.expectEqual(@as(?f32, stem_play_s), Pool.piano.playSeconds());
-}
-
 test "the recordings spend an allowance that never runs out" {
-    var limit: Limit = .forPool(.recordings, 44100);
+    var limit: Limit = .forSource(.recordings, null, 44100);
     var samples = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
 
     try std.testing.expectEqual(@as(usize, 4), limit.take(&samples));
@@ -227,7 +172,7 @@ test "the recordings spend an allowance that never runs out" {
 }
 
 test "a stem pool's allowance is four seconds of samples" {
-    const limit: Limit = .forPool(.bell, 44100);
+    const limit: Limit = .forSource(.bell, null, 44100);
     try std.testing.expectEqual(@as(usize, 4 * 44100), limit.total);
     try std.testing.expectEqual(@as(usize, 6615), limit.fade); // 150 ms
 }
@@ -291,7 +236,7 @@ fn testSelector(folders: []const u8, seed: u64) ClipSelector {
         var prng: std.Random.DefaultPrng = undefined;
     };
     State.prng = .init(seed);
-    return ClipSelector.init(folders, 44100, State.prng.random());
+    return ClipSelector.init(folders, 10.0, 44100, State.prng.random());
 }
 
 test "a touch starts a clip when plant B is silent" {
@@ -353,3 +298,54 @@ test "a pool built from one folder still draws from all of it" {
         _ = selector.start(false, false, poll_frames);
     }
 }
+
+test "a bird call is capped at five seconds with a fade" {
+    const limit: Limit = .forSource(.daybird, null, 44100);
+    try std.testing.expectEqual(@as(usize, 5 * 44100), limit.total);
+    try std.testing.expect(limit.fade > 0);
+}
+
+test "a source's own length becomes its limit" {
+    const capped: Limit = .forSource(.bell, null, 44100);
+    try std.testing.expectEqual(@as(usize, 4 * 44100), capped.total);
+    try std.testing.expect(capped.fade > 0);
+
+    const uncapped: Limit = .forSource(.tradvn, null, 44100);
+    try std.testing.expectEqual(Limit.unlimited.total, uncapped.total);
+}
+
+test "an override replaces the source's length" {
+    const longer: Limit = .forSource(.bell, 12.0, 44100);
+    try std.testing.expectEqual(@as(usize, 12 * 44100), longer.total);
+
+    // Zero is how a capped source is uncapped from the command line.
+    const uncapped: Limit = .forSource(.bell, 0.0, 44100);
+    try std.testing.expectEqual(Limit.unlimited.total, uncapped.total);
+
+    // And how a source that runs to its end is capped.
+    const capped: Limit = .forSource(.recordings, 30.0, 44100);
+    try std.testing.expectEqual(@as(usize, 30 * 44100), capped.total);
+}
+
+test "the guard length reaches the selector" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const folders = [_]u8{ 0, 0 };
+    const selector = ClipSelector.init(&folders, 5.0, 44100, prng.random());
+    try std.testing.expectEqual(@as(u64, 5 * 44100), selector.open_frames);
+}
+
+/// How a plant answers a hand.
+///
+/// `trigger` is a doorbell: a touch starts a clip and the clip runs its own
+/// length whether the hand stays or not. `hold` is a tap: the clip sounds while
+/// somebody is holding the plant and falls silent when they let go, and the
+/// next hold picks it up where it stopped.
+pub const Mode = enum { trigger, hold };
+
+/// How long a held clip takes to fade in or out, in seconds.
+///
+/// Short enough that letting go feels immediate, long enough that the cut is
+/// heard as the sound stopping rather than as a click through a PA. The same
+/// number both ways: a fade-in that outran its fade-out would click on a quick
+/// re-grip, which is the gesture a room does most.
+pub const hold_fade_s: f32 = 0.04;

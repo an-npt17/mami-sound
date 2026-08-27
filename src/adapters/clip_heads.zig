@@ -29,6 +29,16 @@ const library = @import("library.zig");
 /// against the RAM. Raising it costs 3.5 MB a second across 21 recordings.
 pub const head_s: f32 = 2.0;
 
+/// The longest allowance still worth holding whole.
+///
+/// A capped source is pre-decoded entirely so a touch never waits on `ffmpeg`,
+/// and for four or five seconds across a folder that is a few megabytes. The
+/// command line can ask for any length though, and `--plant-a-seconds=60`
+/// across five clips would be fifty. Past this bound a clip keeps its head and
+/// the streamer carries the rest, which is what an uncapped source has always
+/// done.
+pub const whole_pool_limit_s: f32 = 8.0;
+
 /// The filter the clips are decoded through. Shared with the streamer, which
 /// decodes the same clips from the head's end onwards: a head at one level and
 /// a stream at another would be audible as a step at the seam.
@@ -78,21 +88,20 @@ pub fn decode(
     gpa: std.mem.Allocator,
     io: std.Io,
     paths: []const []const u8,
-    limit: core.plant_b.Limit,
+    limit: core.clips.Limit,
     sample_rate: u32,
 ) !Heads {
     if (paths.len == 0) return .none;
 
     const head_samples: usize = @intFromFloat(head_s * @as(f32, @floatFromInt(sample_rate)));
+    const whole_limit: usize =
+        @intFromFloat(whole_pool_limit_s * @as(f32, @floatFromInt(sample_rate)));
 
-    // A capped pool is taken whole rather than to the head length. Its clips
-    // are four seconds each, so the whole pool is a few megabytes, and holding
-    // all of it means a stem never reaches `ffmpeg` at all -- not on startup
-    // and not on a touch.
-    const want = if (limit.total == core.plant_b.Limit.unlimited.total)
-        head_samples
-    else
-        limit.total;
+    // A source short enough to hold is taken whole, so a touch on it never
+    // reaches `ffmpeg` at all. Anything longer -- capped past the bound, or not
+    // capped, whose total is `maxInt` and comfortably past it -- keeps a head
+    // and streams the remainder.
+    const want = if (limit.total <= whole_limit) limit.total else head_samples;
 
     var samples: std.ArrayList(f32) = .empty;
     errdefer samples.deinit(gpa);
@@ -263,7 +272,7 @@ test "a capped pool is pre-decoded whole, not just to the head length" {
     const stems = try library.listSorted(gpa, std.testing.io, "Bell Stems");
     defer library.freeList(gpa, stems);
 
-    const limit: core.plant_b.Limit = .forPool(.bell, 44100);
+    const limit: core.clips.Limit = .forSource(.bell, null, 44100);
     var heads = try decode(gpa, std.testing.io, &.{stems[0]}, limit, 44100);
     defer heads.deinit(gpa);
 
@@ -271,4 +280,38 @@ test "a capped pool is pre-decoded whole, not just to the head length" {
     // touch never waits on ffmpeg at all.
     try std.testing.expectEqual(limit.total, heads.get(0).len);
     try std.testing.expect(limit.total > @as(usize, @intFromFloat(head_s * 44100.0)));
+}
+
+test "a long allowance keeps a head rather than the whole clip" {
+    // `--plant-a-seconds=60` on a folder of five must not ask for fifty
+    // megabytes. Past the bound a clip keeps its two-second head and the
+    // streamer carries the rest, exactly as an uncapped source does.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const paths = try library.listSorted(gpa, io, "Insect");
+    defer library.freeList(gpa, paths);
+
+    const long: core.clips.Limit = .forSource(.insect, 60.0, 44100);
+    var heads = try decode(gpa, io, &.{paths[0]}, long, 44100);
+    defer heads.deinit(gpa);
+
+    const head_samples: usize = @intFromFloat(head_s * 44100.0);
+    try std.testing.expectEqual(head_samples, heads.get(0).len);
+}
+
+test "a short allowance is still taken whole" {
+    // The property that keeps ffmpeg out of the touch path for the stems and
+    // the five-second sources: their clips are already in memory.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const paths = try library.listSorted(gpa, io, "Insect");
+    defer library.freeList(gpa, paths);
+
+    const short: core.clips.Limit = .forSource(.insect, null, 44100);
+    var heads = try decode(gpa, io, &.{paths[0]}, short, 44100);
+    defer heads.deinit(gpa);
+
+    try std.testing.expectEqual(short.total, heads.get(0).len);
 }

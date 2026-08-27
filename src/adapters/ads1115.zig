@@ -5,6 +5,11 @@
 //! every later read is a two-byte fetch of the conversion register, so a read
 //! costs one I2C transaction and never waits on the chip.
 //!
+//! Both directions are checked. A register read is one combined transaction so
+//! nothing can get between the pointer and the data, and a config write is read
+//! back until the chip agrees with it -- I2C acknowledges a byte that arrived,
+//! not a byte that arrived intact.
+//!
 //! Raw syscalls rather than `std.Io`: an I2C transfer must be exactly one
 //! `write` and one `read` on the device node, with no buffering in between,
 //! and the device address is set with an ioctl that has no `std` wrapper.
@@ -71,6 +76,10 @@ pub const Error = error{
     /// The driver cannot do combined transfers. Recoverable: the caller falls
     /// back to a separate write and read.
     Unsupported,
+    /// The config register did not read back as written, after retries. The
+    /// chip is on an input, gain or rate nobody asked for and the driver has
+    /// no way to know which.
+    ConfigUnverified,
 };
 
 /// Input multiplexer. The first four are differential pairs, the last four are
@@ -148,6 +157,26 @@ pub const Config = struct {
 ///
 /// Bit 15 (OS) is a one-shot trigger that is ignored in continuous mode; it is
 /// set anyway so the same word also works if the mode bit is ever flipped.
+/// How many times a config write is retried before it is called a fault.
+///
+/// A read-back can be corrupted as easily as a write on a marginal bus, so a
+/// single mismatch is not proof of anything. Three is enough that agreement is
+/// unlikely to be luck and few enough that a genuinely broken bus is reported
+/// rather than retried forever.
+const config_attempts: u32 = 3;
+
+/// Whether a config register read back matches what was written.
+///
+/// Bit 15 is the one-shot and status bit: it reads 1 while the chip is idle and
+/// 0 mid-conversion, so it never comes back as written and is masked out.
+/// Everything else must come back exactly -- the mux above all, because a mux
+/// that landed wrong files every later reading under the wrong probe, and does
+/// it silently.
+pub fn configMatches(seen: u16, written: u16) bool {
+    const status_bit: u16 = 0x8000;
+    return (seen & ~status_bit) == (written & ~status_bit);
+}
+
 pub fn configWord(cfg: Config) u16 {
     return (@as(u16, 1) << 15) |
         (@as(u16, @intFromEnum(cfg.mux)) << 12) |
@@ -186,9 +215,10 @@ pub const Ads1115 = struct {
             return Error.AddressFailed;
         }
 
-        try writeConfig(fd, cfg);
+        var chip: Ads1115 = .{ .fd = fd, .address = address, .combined = true, .cfg = cfg };
+        try chip.writeConfig(cfg);
 
-        return .{ .fd = fd, .address = address, .combined = true, .cfg = cfg };
+        return chip;
     }
 
     pub fn close(self: *Ads1115) void {
@@ -206,10 +236,62 @@ pub const Ads1115 = struct {
     /// far enough after the switch, which the probe adapter does by holding the
     /// multiplexer still for a whole block, so the sink's blocking write falls
     /// between the switch and the next read.
+    /// A failed switch leaves `cfg` describing the input the chip was already
+    /// on, because the write is only believed once the chip has agreed to it.
+    /// Before the read-back this cached the new mux first and the caller had to
+    /// put it back, which meant a write corrupted on the wire -- ACKed, so not
+    /// an error -- left the driver certain of an input the chip had left.
     pub fn selectInput(self: *Ads1115, mux: Mux) Error!void {
         if (self.cfg.mux == mux) return;
-        self.cfg.mux = mux;
-        try writeConfig(self.fd, self.cfg);
+
+        var next = self.cfg;
+        next.mux = mux;
+        try self.writeConfig(next);
+        self.cfg = next;
+    }
+
+    /// Write the config register and read it back until the chip agrees.
+    ///
+    /// I2C acknowledges a byte that arrived, not a byte that arrived intact, so
+    /// a write is not evidence that the chip took what was sent. On this rig it
+    /// demonstrably does not always: probe A and probe BC were seen to swap
+    /// wholesale mid-run and stay swapped, which is what a mux write landing
+    /// wrong looks like from the outside.
+    fn writeConfig(self: *Ads1115, cfg: Config) Error!void {
+        const word = configWord(cfg);
+
+        var attempt: u32 = 0;
+        while (attempt < config_attempts) : (attempt += 1) {
+            try writeAll(self.fd, &[3]u8{ reg_config, @truncate(word >> 8), @truncate(word) });
+
+            // A read-back that itself fails is not proof the write was wrong,
+            // so it spends an attempt rather than the whole budget.
+            const seen = self.readRegister(reg_config) catch continue;
+            if (configMatches(seen, word)) return;
+        }
+
+        return Error.ConfigUnverified;
+    }
+
+    /// One register, as an unsigned word. The conversion register is read
+    /// signed by `readRaw`; the config register is a bit pattern.
+    fn readRegister(self: *Ads1115, register: u8) Error!u16 {
+        var data: [2]u8 = undefined;
+
+        if (self.combined) {
+            if (self.readCombined(register, &data)) |_| {
+                return std.mem.readInt(u16, &data, .big);
+            } else |err| switch (err) {
+                Error.Unsupported => self.combined = false,
+                else => return err,
+            }
+        }
+
+        try writeAll(self.fd, &[_]u8{register});
+        const rc = linux.read(self.fd, &data, data.len);
+        if (linux.errno(rc) != .SUCCESS or rc != data.len) return Error.ReadFailed;
+
+        return std.mem.readInt(u16, &data, .big);
     }
 
     /// Point at the conversion register and read it, big-endian and signed.
@@ -221,29 +303,12 @@ pub const Ads1115 = struct {
     ///
     /// Which input this reads is whatever `selectInput` last pointed at.
     pub fn readRaw(self: *Ads1115) Error!i16 {
-        var data: [2]u8 = undefined;
-
-        if (self.combined) {
-            if (self.readCombined(&data)) |_| {
-                return std.mem.readInt(i16, &data, .big);
-            } else |err| switch (err) {
-                // The driver has no repeated START to give. Said once, then
-                // never asked again.
-                Error.Unsupported => self.combined = false,
-                else => return err,
-            }
-        }
-
-        try writeAll(self.fd, &[_]u8{reg_conversion});
-        const rc = linux.read(self.fd, &data, data.len);
-        if (linux.errno(rc) != .SUCCESS or rc != data.len) return Error.ReadFailed;
-
-        return std.mem.readInt(i16, &data, .big);
+        return @bitCast(try self.readRegister(reg_conversion));
     }
 
     /// Pointer write and value read as one transaction.
-    fn readCombined(self: *Ads1115, data: *[2]u8) Error!void {
-        var pointer = [1]u8{reg_conversion};
+    fn readCombined(self: *Ads1115, register: u8, data: *[2]u8) Error!void {
+        var pointer = [1]u8{register};
         var msgs = readMessages(self.address, &pointer, data);
         var request: I2cRdwr = .{ .msgs = &msgs, .nmsgs = msgs.len };
 
@@ -256,11 +321,6 @@ pub const Ads1115 = struct {
         }
     }
 };
-
-fn writeConfig(fd: linux.fd_t, cfg: Config) Error!void {
-    const word = configWord(cfg);
-    try writeAll(fd, &[3]u8{ reg_config, @truncate(word >> 8), @truncate(word) });
-}
 
 /// I2C has no partial transfers: a short write is a failed transaction, not a
 /// reason to loop.
@@ -295,4 +355,38 @@ test "the message struct matches the layout the kernel reads" {
     try std.testing.expectEqual(@as(usize, 2), @offsetOf(I2cMsg, "flags"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(I2cMsg, "len"));
     try std.testing.expectEqual(@sizeOf(usize), @offsetOf(I2cMsg, "buf"));
+}
+
+test "a config register that reads back identically matches" {
+    const word = configWord(.{ .mux = .ain0_ain1 });
+    try std.testing.expect(configMatches(word, word));
+}
+
+test "the status bit is not part of the comparison" {
+    // Bit 15 reads 1 while the chip is idle and 0 mid-conversion, so it never
+    // comes back as written and would fail every check if it counted.
+    const word = configWord(.{ .mux = .ain0_ain1 });
+    try std.testing.expect(configMatches(word & 0x7FFF, word));
+    try std.testing.expect(configMatches(word | 0x8000, word));
+}
+
+test "a mux that came back wrong does not match" {
+    // The whole reason this exists. A config write corrupted on the wire leaves
+    // the chip on an input nobody asked for, and every later reading is filed
+    // under the wrong probe until another corrupted write flips it back.
+    const asked = configWord(.{ .mux = .ain0_ain1 });
+    const got = configWord(.{ .mux = .ain2_ain3 });
+    try std.testing.expect(!configMatches(got, asked));
+}
+
+test "a gain or rate that came back wrong does not match" {
+    const asked = configWord(.{ .mux = .ain0_ain1, .gain = .fs_4_096v, .rate = .sps_860 });
+    try std.testing.expect(!configMatches(
+        configWord(.{ .mux = .ain0_ain1, .gain = .fs_2_048v, .rate = .sps_860 }),
+        asked,
+    ));
+    try std.testing.expect(!configMatches(
+        configWord(.{ .mux = .ain0_ain1, .gain = .fs_4_096v, .rate = .sps_128 }),
+        asked,
+    ));
 }

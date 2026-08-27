@@ -18,7 +18,7 @@ pub const Adapter = struct {
     request_generation: std.atomic.Value(u64),
     /// How much of a clip one touch plays. Spent per clip: each decode takes a
     /// fresh copy, so this one is only ever the template.
-    limit: core.plant_b.Limit,
+    limit: core.clips.Limit,
     /// The opening of every clip, decoded up front. Written by `primeHeads`
     /// before the worker exists and read-only from then on, which is what lets
     /// both the audio thread and the worker hold it without a lock.
@@ -42,7 +42,7 @@ pub const Adapter = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         paths: []const []const u8,
-        limit: core.plant_b.Limit,
+        limit: core.clips.Limit,
     ) !Adapter {
         return .{
             .io = io,
@@ -315,7 +315,7 @@ pub const Adapter = struct {
         self: *Adapter,
         samples: []f32,
         generation: u64,
-        limit: *core.plant_b.Limit,
+        limit: *core.clips.Limit,
     ) void {
         const kept = limit.take(samples);
         var offset: usize = 0;

@@ -77,25 +77,32 @@ fn appendPath(
 /// This is the only place the folder names live. Nothing in `core` knows them:
 /// a pool there is a name, and turning a name into a directory is exactly the
 /// kind of thing that belongs on this side of the port.
-pub fn directoriesFor(pool: core.plant_b.Pool) []const []const u8 {
-    return switch (pool) {
+pub fn directoriesFor(source: core.source.Source) []const []const u8 {
+    return switch (source) {
+        // Asked for by a caller that should have checked `isDrone` first. There
+        // is no folder to return and an empty list would load as a pool with no
+        // clips, which is silence nobody can tell from the piece working.
+        .drone => unreachable,
         .recordings => &.{ "interview files", "field records" },
+        .insect => &.{"Insect"},
+        .tradvn => &.{"Trad Vn Jam"},
         .bell => &.{"Bell Stems"},
+        .daybird => &.{"Day bird"},
         .piano => &.{"EPiano Stems"},
     };
 }
 
-/// List every Plant B clip without decoding it. The stream adapter decodes one
+/// List every clip a source is made of, without decoding any. The stream adapter decodes one
 /// selected path at a time on its worker thread.
 ///
 /// A pool whose folder is missing or holds nothing playable is an error rather
 /// than an empty list. Silence out of plant B is the one failure nobody in the
 /// room can tell from the piece working, and a `--plant-b` that quietly did
 /// nothing would be found out at the opening.
-pub fn loadPlantB(
+pub fn loadPool(
     gpa: std.mem.Allocator,
     io: std.Io,
-    which: core.plant_b.Pool,
+    which: core.source.Source,
 ) !LoadedPool {
     const directories = directoriesFor(which);
     std.debug.assert(directories.len <= max_directories);
@@ -142,7 +149,7 @@ test "the pool remembers which folder each clip came from" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var pool = try loadPlantB(gpa, io, .recordings);
+    var pool = try loadPool(gpa, io, .recordings);
     defer pool.deinit(gpa);
 
     try std.testing.expectEqual(pool.paths.len, pool.folders.len);
@@ -165,9 +172,28 @@ test "the pool remembers which folder each clip came from" {
 
 test "a one-folder pool marks every clip as the same folder" {
     const gpa = std.testing.allocator;
-    var pool = try loadPlantB(gpa, std.testing.io, .bell);
+    var pool = try loadPool(gpa, std.testing.io, .bell);
     defer pool.deinit(gpa);
 
     try std.testing.expect(pool.folders.len > 0);
     for (pool.folders) |folder| try std.testing.expectEqual(@as(u8, 0), folder);
+}
+
+test "the new folders are named" {
+    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.insect).len);
+    try std.testing.expectEqualStrings("Insect", directoriesFor(.insect)[0]);
+
+    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.tradvn).len);
+    try std.testing.expectEqualStrings("Trad Vn Jam", directoriesFor(.tradvn)[0]);
+}
+
+test "the new folders load into non-empty pools" {
+    const gpa = std.testing.allocator;
+    for ([_]core.source.Source{ .insect, .tradvn }) |which| {
+        var pool = try loadPool(gpa, std.testing.io, which);
+        defer pool.deinit(gpa);
+        try std.testing.expect(pool.paths.len > 0);
+        try std.testing.expectEqual(pool.paths.len, pool.folders.len);
+        for (pool.folders) |folder| try std.testing.expectEqual(@as(u8, 0), folder);
+    }
 }
