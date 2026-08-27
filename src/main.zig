@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
             ),
             error.InvalidStillThreshold => std.debug.print(
                 "--still-range, --still-release and --still-window take a number " ++
-                    "above zero.\n--still-band takes LO:HI in counts, low end " ++
+                    "above zero.\n--touch-band takes LO:HI in counts, low end " ++
                     "first, both ends given.\n\n",
                 .{},
             ),
@@ -250,7 +250,7 @@ fn runComposition(
             opts.still_range,
             opts.still_release,
             opts.still_window_ms,
-            opts.still_band,
+            opts.touch_band,
             held,
         ),
         probe.source(),

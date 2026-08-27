@@ -300,8 +300,8 @@ pub const default_still_rest_s: f32 = 5.0;
 ///
 /// Worth setting once a rig has been watched. On this one a hand puts a probe
 /// at 650 to 660 and nothing else does.
-pub const default_still_band_lo: ?i16 = null;
-pub const default_still_band_hi: ?i16 = null;
+pub const default_touch_band_lo: ?i16 = null;
+pub const default_touch_band_hi: ?i16 = null;
 
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
@@ -322,8 +322,8 @@ pub const Config = struct {
     still_release: i16 = default_still_release,
     still_move: i16 = default_still_move,
     still_rest_s: f32 = default_still_rest_s,
-    still_band_lo: ?i16 = default_still_band_lo,
-    still_band_hi: ?i16 = default_still_band_hi,
+    touch_band_lo: ?i16 = default_touch_band_lo,
+    touch_band_hi: ?i16 = default_touch_band_hi,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -457,8 +457,12 @@ pub const Detector = struct {
     still_move: i16,
     /// How many baseline samples the calibration wants before rest is settled.
     rest_samples: u32,
-    /// Where a held probe sits, when the room said so. Unset, rest is learned
-    /// and a hand is stillness away from it.
+    /// Where a held probe sits, when the room said so.
+    ///
+    /// Both models read it, for different reasons. The steady model uses it
+    /// instead of learning rest. The deviation model uses it to tell a hand
+    /// from a rail: it asks how far a probe has moved and not where it went, so
+    /// a slam to the end of the range scores as high as a hand does.
     band_lo: ?i16,
     band_hi: ?i16,
 
@@ -499,8 +503,8 @@ pub const Detector = struct {
             .still_range = cfg.still_range,
             .still_release = cfg.still_release,
             .still_move = cfg.still_move,
-            .band_lo = cfg.still_band_lo,
-            .band_hi = cfg.still_band_hi,
+            .band_lo = cfg.touch_band_lo,
+            .band_hi = cfg.touch_band_hi,
             .rest_samples = @max(
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
@@ -565,6 +569,14 @@ pub const Detector = struct {
         };
     }
 
+    /// Whether a reading is where a held probe sits. True everywhere when the
+    /// room has not said, which is what leaves both models as they were.
+    fn inBand(self: *const Detector, value: i16) bool {
+        if (self.band_lo) |lo| if (value < lo) return false;
+        if (self.band_hi) |hi| if (value > hi) return false;
+        return true;
+    }
+
     /// One poll of the steady model, which sets `on` and `at_rest`.
     ///
     /// Judged on how tightly the last second of readings cluster, never on the
@@ -608,8 +620,7 @@ pub const Detector = struct {
 
         const level = self.spread.level;
         const away = if (banded)
-            (self.band_lo == null or level >= self.band_lo.?) and
-                (self.band_hi == null or level <= self.band_hi.?)
+            self.inBand(level)
         else
             clampedAbsDiff(level, self.baseline.base) >= self.still_move;
 
@@ -672,8 +683,13 @@ pub const Detector = struct {
         }
 
         const dev = self.deviation();
+        // Where the probe went, as well as how far it moved. Without this a
+        // rail scores as high as a hand, and on this rig the rails are the
+        // commonest thing a probe does that nobody asked for.
+        const in_band = self.inBand(self.last_mean);
         const over = @abs(self.z) >= self.level and
-            (self.counts == null or dev >= self.counts.?);
+            (self.counts == null or dev >= self.counts.?) and
+            in_band;
 
         // Back at rest is half of whatever it took to leave it, in both units.
         // Requiring the same number both ways would let a reading sitting on
@@ -699,9 +715,13 @@ pub const Detector = struct {
         // which, on a probe that starts recordings, is heard as clip after
         // clip. So anything with a band waits to be back at rest.
         const banded = self.window != null or self.counts != null;
+        // A probe that has left the band has stopped being a touch whatever its
+        // score says, so the latch decays even where a second threshold would
+        // otherwise hold it: a hand going straight to a rail never passes back
+        // through rest, and waiting for it to would never let go.
         if (over) {
             self.count = @min(self.count + 1, self.hold);
-        } else if (!banded or back) {
+        } else if (!banded or back or !in_band) {
             self.count -|= 1;
         }
 
@@ -1252,8 +1272,8 @@ test "a band says what a touch looks like, so no rest need be learned" {
     // model needs no untouched stretch at power-on to compare against, which is
     // the one failure it could not detect or recover from.
     var cfg = steadyConfig();
-    cfg.still_band_lo = 650;
-    cfg.still_band_hi = 660;
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 660;
     var detector: Detector = .init(cfg);
 
     // Held from the very first poll, with no rest ever observed.
@@ -1263,8 +1283,8 @@ test "a band says what a touch looks like, so no rest need be learned" {
 
 test "stillness outside the band is not a touch, however still" {
     var cfg = steadyConfig();
-    cfg.still_band_lo = 650;
-    cfg.still_band_hi = 660;
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 660;
     var detector: Detector = .init(cfg);
 
     // The dead probe from the journal: nought and one, for as long as you like.
@@ -1279,8 +1299,8 @@ test "stillness outside the band is not a touch, however still" {
 
 test "a banded probe lets go when the hand does" {
     var cfg = steadyConfig();
-    cfg.still_band_lo = 650;
-    cfg.still_band_hi = 660;
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 660;
     var detector: Detector = .init(cfg);
 
     for (0..steady_warmup) |_| _ = detector.update(655);
@@ -1308,8 +1328,8 @@ test "a banded probe lets go even when rest is as still as the touch" {
     // probe left the band, stopped being held, and never came off -- because
     // nothing ever told it to.
     var cfg = steadyConfig();
-    cfg.still_band_lo = 630;
-    cfg.still_band_hi = 690;
+    cfg.touch_band_lo = 630;
+    cfg.touch_band_hi = 690;
     cfg.still_range = 400;
     cfg.still_release = 4000;
     var detector: Detector = .init(cfg);
@@ -1320,4 +1340,57 @@ test "a banded probe lets go even when rest is as still as the touch" {
     // The hand comes off and the probe goes flat at nought, as this rig does.
     for (0..steady_warmup) |poll| _ = detector.update(flatlined(poll));
     try std.testing.expect(!detector.on);
+}
+
+/// A probe that has been sitting at nought and slams to a rail: the shape of a
+/// corrupt read or a wire moving, not of a hand.
+fn railed(poll: usize) i16 {
+    return if (poll % 2 == 0) -20000 else -19998;
+}
+
+test "a band keeps the deviation model from firing on a rail" {
+    // The deviation model asks how far a probe has moved and not where it went,
+    // so a slam to a rail scores as high as a hand does. Told where a hand puts
+    // the probe, it can tell the two apart.
+    var cfg = deviationConfig();
+    cfg.touch_band_lo = 630;
+    cfg.touch_band_hi = 690;
+    var detector: Detector = .init(cfg);
+
+    for (0..rest_warmup) |_| _ = detector.update(0);
+    for (0..steady_warmup) |poll| _ = detector.update(railed(poll));
+    try std.testing.expect(!detector.on);
+
+    // And the same probe taken to where a hand puts it does fire.
+    var hand: Detector = .init(cfg);
+    for (0..rest_warmup) |_| _ = hand.update(0);
+    for (0..steady_warmup) |_| _ = hand.update(660);
+    try std.testing.expect(hand.on);
+}
+
+test "a banded deviation probe lets go when it leaves the band" {
+    var cfg = deviationConfig();
+    cfg.touch_band_lo = 630;
+    cfg.touch_band_hi = 690;
+    // With a second threshold in play the latch waits to be back at rest before
+    // it decays, and a hand going straight to a rail never passes through rest.
+    // Leaving the band has to be enough on its own.
+    cfg.counts = 100;
+    var detector: Detector = .init(cfg);
+
+    for (0..rest_warmup) |_| _ = detector.update(0);
+    for (0..steady_warmup) |_| _ = detector.update(660);
+    try std.testing.expect(detector.on);
+
+    // Straight from a hand to a rail, which never passes back through rest.
+    for (0..steady_warmup) |poll| _ = detector.update(railed(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "without a band the deviation model still fires on any big move" {
+    // Unchanged where nobody has said where a hand puts the probe.
+    var detector: Detector = .init(deviationConfig());
+    for (0..rest_warmup) |_| _ = detector.update(0);
+    for (0..steady_warmup) |poll| _ = detector.update(railed(poll));
+    try std.testing.expect(detector.on);
 }

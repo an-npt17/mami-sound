@@ -56,7 +56,7 @@ pub const Options = struct {
     still_window_ms: ?f32 = null,
     /// Where a held probe sits, when the room can say. Both ends together or
     /// neither: half a band is a typo, not a setting.
-    still_band: ?[2]i16 = null,
+    touch_band: ?[2]i16 = null,
     /// Where to write down what the probes read, and for how long. Unset, the
     /// run measures nothing and writes nothing.
     capture_buf: [path_max]u8 = undefined,
@@ -113,8 +113,8 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidCapture;
             if (secs <= 0.0) return Error.InvalidCapture;
             opts.capture_s = secs;
-        } else if (std.mem.startsWith(u8, arg, "--still-band=")) {
-            opts.still_band = parseBand(arg["--still-band=".len..]) orelse
+        } else if (std.mem.startsWith(u8, arg, "--touch-band=")) {
+            opts.touch_band = parseBand(arg["--touch-band=".len..]) orelse
                 return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
             opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
@@ -212,7 +212,7 @@ pub const usage =
     \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE]
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS] [--still-band=LO:HI]
+    \\                  [--still-window=SECONDS] [--touch-band=LO:HI]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--test-random-probe]
     \\
@@ -268,12 +268,17 @@ pub const usage =
     \\room for the dropouts this rig throws, and --still-range=10 is the number
     \\to use once the conversion reads come back clean.
     \\
-    \\--still-band says where a held probe sits, as LO:HI in counts. Given one,
-    \\the model needs no untouched stretch after power-on to work rest out from,
-    \\and cannot learn the wrong rest because somebody had hold of a plant while
-    \\it was starting. Left off, rest is learned and a touch is stillness a
-    \\hundred counts away from it. Set it once you have watched the rig: the
-    \\status line's l0 and l1 are the levels to read it off.
+    \\--touch-band says where a held probe sits, as LO:HI in counts. Both models
+    \\read it, for different reasons:
+    \\  steady     uses it instead of learning rest, so it needs no untouched
+    \\             stretch after power-on and cannot learn the wrong one because
+    \\             somebody had hold of a plant while it was starting
+    \\  deviation  uses it to tell a hand from a rail. That model asks how far a
+    \\             probe moved and not where it went, so a slam to the end of the
+    \\             range scores as high as a hand; a band throws those out.
+    \\Left off, steady learns rest and calls a touch stillness a hundred counts
+    \\away from it, and deviation fires on any large move. Set it once you have
+    \\watched the rig: the status line's l0 and l1 are the levels to read it off.
     \\
     \\--still-window is how long a stretch of readings that range is measured
     \\over, in seconds. It buys the answer's stability rather than its speed:
@@ -470,19 +475,19 @@ test "the usage banner names every flag the parser takes" {
 }
 
 test "a band takes both ends, low first" {
-    const opts = try parse(&.{"--still-band=650:660"});
-    try std.testing.expectEqual(@as(i16, 650), opts.still_band.?[0]);
-    try std.testing.expectEqual(@as(i16, 660), opts.still_band.?[1]);
-    try std.testing.expect((try parse(&.{})).still_band == null);
+    const opts = try parse(&.{"--touch-band=650:660"});
+    try std.testing.expectEqual(@as(i16, 650), opts.touch_band.?[0]);
+    try std.testing.expectEqual(@as(i16, 660), opts.touch_band.?[1]);
+    try std.testing.expect((try parse(&.{})).touch_band == null);
 }
 
 test "half a band, or one the wrong way round, is refused" {
     // A band with one end open is a threshold wearing a band's name, and one
     // that runs backwards can never contain anything.
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=650"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=660:650"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=650:"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-band=a:b"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=660:650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=650:"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=a:b"}));
 }
 
 test "a run can be told to write down what the probes read" {

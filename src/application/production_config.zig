@@ -50,7 +50,7 @@ pub fn touchWith(
     still_range: ?i16,
     still_release: ?i16,
     still_window_ms: ?f32,
-    still_band: ?[2]i16,
+    touch_band: ?[2]i16,
     /// Which plants sound while they are held. A held probe drops its tap
     /// window: the window asks whether a hand left in time, a hold asks whether
     /// it is still there, and both cannot be answered at once.
@@ -63,9 +63,9 @@ pub fn touchWith(
     if (still_range) |counts| cfg.still_range = counts;
     if (still_release) |counts| cfg.still_release = counts;
     if (still_window_ms) |ms| cfg.still_window_ms = ms;
-    if (still_band) |band| {
-        cfg.still_band_lo = band[0];
-        cfg.still_band_hi = band[1];
+    if (touch_band) |band| {
+        cfg.touch_band_lo = band[0];
+        cfg.touch_band_hi = band[1];
     }
     return cfg;
 }
