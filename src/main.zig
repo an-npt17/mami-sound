@@ -62,6 +62,12 @@ pub fn main(init: std.process.Init) !void {
                 "the drone has no clip, so it takes no length.\n\n",
                 .{},
             ),
+            error.InvalidStillThreshold => std.debug.print(
+                "--still-range, --still-release and --still-window take a number " ++
+                    "above zero.\n--still-band takes LO:HI in counts, low end " ++
+                    "first, both ends given.\n\n",
+                .{},
+            ),
             error.InvalidMode => std.debug.print(
                 "--plant-a-mode and --plant-b-mode take `trigger` or `hold`.\n\n",
                 .{},
