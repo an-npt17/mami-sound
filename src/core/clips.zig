@@ -92,6 +92,10 @@ pub const ClipSelector = struct {
     /// Which clip is playing, so the next touch answers with a different one.
     /// `null` before anything has played.
     last_index: ?usize,
+    /// Which clips this pass through the folder has already dealt. Reset when
+    /// they have all been heard, so every clip plays once before any plays
+    /// twice.
+    dealt: [max_shuffled]bool,
     /// Frames since the last clip was started, and how many make ten seconds.
     frames_since_start: u64,
     open_frames: u64,
@@ -107,6 +111,7 @@ pub const ClipSelector = struct {
             .random = random,
             .previous_touch = false,
             .last_index = null,
+            .dealt = [_]bool{false} ** max_shuffled,
             .frames_since_start = 0,
             .open_frames = @intFromFloat(retrigger_s * @as(f32, @floatFromInt(sample_rate))),
         };
@@ -154,34 +159,56 @@ pub const ClipSelector = struct {
     ///
     /// A pool built from one folder -- either stem pool -- has no other folder
     /// to go to, so it draws from the whole pool as it always did.
-    /// A clip that is not the one just playing.
+    /// The next clip of this pass through the folder.
     ///
-    /// Without this a touch would restart the same bell about one time in four,
-    /// which in a room reads as the plant failing to answer. A pool of one has
-    /// to answer with what it has, however lately it played.
+    /// Not repeating the last one is not enough on its own: with five clips it
+    /// still allows two of them traded back and forth all evening while the
+    /// other three are never heard. So the pool is dealt like a hand of cards,
+    /// every clip once before any comes round again, and the clip that ended
+    /// the last pass cannot start the next -- the seam is the one place a
+    /// shuffle can still repeat itself, and the one place a room would notice.
     fn pick(self: *ClipSelector) usize {
-        const choices = self.countUnplayed();
+        if (self.countEligible() == 0) self.reshuffle();
+
+        const choices = self.countEligible();
+        // A pool of one has to answer with what it has, however lately it
+        // played, and there is nothing to deal.
+        if (choices == 0) return self.last_index orelse 0;
+
         var remaining = self.random.uintLessThan(usize, choices);
         for (0..self.clip_count) |index| {
-            if (!self.unplayed(index)) continue;
-            if (remaining == 0) return index;
+            if (!self.eligible(index)) continue;
+            if (remaining == 0) {
+                if (index < max_shuffled) self.dealt[index] = true;
+                return index;
+            }
             remaining -= 1;
         }
         unreachable;
     }
 
-    fn unplayed(self: *const ClipSelector, index: usize) bool {
+    /// Whether this clip may be dealt now: not already dealt this pass, and not
+    /// the one that just played.
+    fn eligible(self: *const ClipSelector, index: usize) bool {
         if (self.clip_count <= 1) return true;
-        return if (self.last_index) |last| index != last else true;
+        if (self.last_index) |last| if (index == last) return false;
+        // Past the ceiling there is no shuffle, only the rule it replaced.
+        if (index >= max_shuffled) return true;
+        return !self.dealt[index];
     }
 
-    /// How many clips are not the one just playing.
-    fn countUnplayed(self: *const ClipSelector) usize {
+    fn countEligible(self: *const ClipSelector) usize {
         var count: usize = 0;
         for (0..self.clip_count) |index| {
-            if (self.unplayed(index)) count += 1;
+            if (self.eligible(index)) count += 1;
         }
         return count;
+    }
+
+    /// Everything is back in the hand. The clip just played stays out of reach
+    /// through `eligible`, so the new pass cannot open on it.
+    fn reshuffle(self: *ClipSelector) void {
+        self.dealt = [_]bool{false} ** max_shuffled;
     }
 };
 
@@ -362,6 +389,16 @@ test "the guard length reaches the selector" {
 /// next hold picks it up where it stopped.
 pub const Mode = enum { trigger, hold };
 
+/// The largest pool a shuffle is kept for.
+///
+/// A pool is dealt like a hand of cards: every clip once before any of them
+/// comes round again. That wants a mark per clip, and a mark per clip wants a
+/// ceiling, because the selector runs on the audio thread and cannot allocate.
+/// Two hundred and fifty-six is far past any folder here -- the largest holds
+/// nine -- and a pool past it falls back to not repeating the last clip, which
+/// is what the shuffle replaced.
+pub const max_shuffled = 256;
+
 /// How long a held clip takes to fade in or out, in seconds.
 ///
 /// Short enough that letting go feels immediate, long enough that the cut is
@@ -427,4 +464,54 @@ test "a length asked for on the command line is refused a held plant too" {
     // The hold is the one the room gave last and the one it can see.
     const held: Limit = .forSource(.insect, 3.0, .hold, 44100);
     try std.testing.expectEqual(Limit.unlimited.total, held.total);
+}
+
+test "every clip plays before any plays twice" {
+    // Not repeating the last one is not enough: with five clips it still allows
+    // two of them traded back and forth all evening while the other three are
+    // never heard. A pass through the folder is what a room hears as variety.
+    const clips_in_pool: usize = 5;
+    var selector = testSelector(clips_in_pool, 5);
+
+    var seen: [clips_in_pool]bool = undefined;
+    for (0..6) |pass| {
+        @memset(&seen, false);
+        for (0..clips_in_pool) |_| {
+            const index = selector.start(true, false, poll_frames).?;
+            _ = selector.start(false, false, poll_frames);
+            if (seen[index]) {
+                std.debug.print("pass {d} played clip {d} twice\n", .{ pass, index });
+                return error.ClipRepeatedInsidePass;
+            }
+            seen[index] = true;
+        }
+    }
+}
+
+test "a pass never begins with the clip the last one ended on" {
+    // The seam between passes is the one place a shuffle can still repeat
+    // itself, and it is the one place a room would notice.
+    const clips_in_pool: usize = 4;
+    var selector = testSelector(clips_in_pool, 9);
+
+    var previous: ?usize = null;
+    for (0..40) |_| {
+        const index = selector.start(true, false, poll_frames).?;
+        _ = selector.start(false, false, poll_frames);
+        if (previous) |last| try std.testing.expect(index != last);
+        previous = index;
+    }
+}
+
+test "every clip in a pool is reached, and about as often as the others" {
+    const clips_in_pool: usize = 5;
+    var selector = testSelector(clips_in_pool, 3);
+
+    var counts = [_]usize{0} ** clips_in_pool;
+    for (0..clips_in_pool * 40) |_| {
+        counts[selector.start(true, false, poll_frames).?] += 1;
+        _ = selector.start(false, false, poll_frames);
+    }
+    // Forty passes, so exactly forty each: a bag deals every clip once a pass.
+    for (counts) |count| try std.testing.expectEqual(@as(usize, 40), count);
 }
