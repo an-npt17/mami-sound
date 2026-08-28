@@ -108,7 +108,7 @@ test "the simulated phases trigger both production touch states" {
         .poll_frames = core.sensor_frames,
         .level_bc = 20.0,
         .hold_bc_ms = 30.0,
-        .window_bc_ms = 1000.0,
+        .window_bc = .{ .ms = 1000.0 },
     });
     var saw_a = false;
     var saw_bc = false;

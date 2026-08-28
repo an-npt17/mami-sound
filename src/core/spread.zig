@@ -64,6 +64,17 @@ pub const Spread = struct {
     /// pitch. A median rather than a mean because an average of a clamped level
     /// and a rail is a number that was never read.
     level: i16,
+    /// The band a room has said a held probe sits in, and the share of the
+    /// window that is inside it. Nought where nobody has said.
+    ///
+    /// Counted rather than inferred from the percentiles: a room that knows
+    /// where a hand puts the probe is asking a plain question -- how much of
+    /// the last second was there -- and the answer survives a rig that throws
+    /// rails through a perfectly good touch, which a median and a spread only
+    /// survive up to the margin they leave.
+    band_lo: ?i16,
+    band_hi: ?i16,
+    inside: f32,
 
     pub fn init(window_ms: f32, sample_rate: u32, poll_frames: usize) Spread {
         const polls_per_s = @as(f32, @floatFromInt(sample_rate)) /
@@ -80,7 +91,16 @@ pub const Spread = struct {
             .since = 0,
             .range = std.math.maxInt(i16),
             .level = 0,
+            .band_lo = null,
+            .band_hi = null,
+            .inside = 0.0,
         };
+    }
+
+    /// Say where a held probe sits, so the share inside it can be counted.
+    pub fn watch(self: *Spread, lo: ?i16, hi: ?i16) void {
+        self.band_lo = lo;
+        self.band_hi = hi;
     }
 
     /// Whether the window has enough behind it to be worth asking.
@@ -115,6 +135,20 @@ pub const Spread = struct {
         const delta = @as(i32, hi) - @as(i32, lo);
         self.range = @intCast(@min(delta, std.math.maxInt(i16)));
         self.level = scratch[n / 2];
+
+        // Counted in the same pass the sort was for, so asking costs nothing
+        // extra on the audio thread.
+        if (self.band_lo == null and self.band_hi == null) {
+            self.inside = 0.0;
+            return;
+        }
+        var within: usize = 0;
+        for (scratch[0..n]) |sample| {
+            if (self.band_lo) |band_lo| if (sample < band_lo) continue;
+            if (self.band_hi) |band_hi| if (sample > band_hi) continue;
+            within += 1;
+        }
+        self.inside = @as(f32, @floatFromInt(within)) / @as(f32, @floatFromInt(n));
     }
 };
 
@@ -178,3 +212,38 @@ test "a window that has moved on forgets what it held before" {
     for (0..spread.len) |_| spread.push(650);
     try std.testing.expectEqual(@as(i16, 0), spread.range);
 }
+
+test "the share inside a band is what a room can count" {
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watch(650, 660);
+
+    // Four readings in five inside the band, the fifth a rail: what a held
+    // probe on this rig looks like.
+    for (0..spread.len) |i| spread.push(if (i % 5 == 4) -4096 else 655);
+    try std.testing.expect(spread.ready());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), spread.inside, 0.02);
+}
+
+test "a probe that never enters the band shares none of it" {
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watch(650, 660);
+
+    for (0..spread.len) |i| spread.push(if (i % 3 == 0) 0 else 1);
+    try std.testing.expectEqual(@as(f32, 0.0), spread.inside);
+}
+
+test "a probe wandering across the band is only sometimes in it" {
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watch(650, 660);
+
+    // Half the readings land inside, half a long way out.
+    for (0..spread.len) |i| spread.push(if (i % 2 == 0) 655 else 3000);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), spread.inside, 0.02);
+}
+
+test "with no band nothing is inside one" {
+    var spread: Spread = .init(1000.0, 44100, 128);
+    for (0..spread.len) |_| spread.push(655);
+    try std.testing.expectEqual(@as(f32, 0.0), spread.inside);
+}
+

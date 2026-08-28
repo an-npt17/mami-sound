@@ -42,6 +42,15 @@ pub const Options = struct {
     /// Whether a touch sets a clip going or has to be kept up to hear it.
     /// `null` leaves the plant on `trigger`, which is what it has always done.
     plant_mode: [2]?clips.Mode = .{ null, null },
+    /// How long a touch may last and still count, per plant. `null` leaves the
+    /// preset's answer standing, which is a second on plant B and nothing on
+    /// plant A.
+    ///
+    /// On the command line because it is the flag that decides whether a plant
+    /// answers a hand that arrives and stays: with a window it wants a tap, and
+    /// which of the two a rig needs is a property of the room rather than of
+    /// the piece.
+    plant_window: [2]?touch.Window = .{ null, null },
     test_random_probe: bool = false,
     /// Which question the detector asks each probe, and the two spreads the
     /// `steady` model answers it with. Unset, the compiled-in preset stands.
@@ -54,9 +63,13 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
-    /// Where a held probe sits, when the room can say. Both ends together or
-    /// neither: half a band is a typo, not a setting.
-    touch_band: ?[2]i16 = null,
+    /// Where a held probe sits, per plant, when the room can say. Both ends
+    /// together or neither: half a band is a typo, not a setting.
+    ///
+    /// Per plant because the two probes do not sit at the same place: on this
+    /// rig a hand puts one near six hundred and sixty and the other near
+    /// twenty-five thousand.
+    plant_band: [2]?[2]i16 = .{ null, null },
     /// Where to write down what the probes read, and for how long. Unset, the
     /// run measures nothing and writes nothing.
     capture_buf: [path_max]u8 = undefined,
@@ -113,8 +126,11 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidCapture;
             if (secs <= 0.0) return Error.InvalidCapture;
             opts.capture_s = secs;
-        } else if (std.mem.startsWith(u8, arg, "--touch-band=")) {
-            opts.touch_band = parseBand(arg["--touch-band=".len..]) orelse
+        } else if (std.mem.startsWith(u8, arg, "--plant-a-band=")) {
+            opts.plant_band[0] = parseBand(arg["--plant-a-band=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b-band=")) {
+            opts.plant_band[1] = parseBand(arg["--plant-b-band=".len..]) orelse
                 return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
             opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
@@ -122,6 +138,12 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--plant-b-mode=")) {
             opts.plant_mode[1] = parseMode(arg["--plant-b-mode=".len..]) orelse
                 return Error.InvalidMode;
+        } else if (std.mem.startsWith(u8, arg, "--plant-a-window=")) {
+            opts.plant_window[0] = parseWindow(arg["--plant-a-window=".len..]) orelse
+                return Error.InvalidSeconds;
+        } else if (std.mem.startsWith(u8, arg, "--plant-b-window=")) {
+            opts.plant_window[1] = parseWindow(arg["--plant-b-window=".len..]) orelse
+                return Error.InvalidSeconds;
         } else if (std.mem.startsWith(u8, arg, "--touch-model=")) {
             const name = arg["--touch-model=".len..];
             opts.model = parseModel(name) orelse return Error.InvalidTouchModel;
@@ -188,6 +210,17 @@ fn parseBand(text: []const u8) ?[2]i16 {
     return if (lo < hi) .{ lo, hi } else null;
 }
 
+/// A tap window: a length in seconds, or `off` for a plant that takes none.
+///
+/// Zero is not a window -- a touch cannot end before the hold that starts it is
+/// satisfied -- so it is refused rather than quietly read as `off`. A room that
+/// wants no window says so in the word.
+fn parseWindow(text: []const u8) ?touch.Window {
+    if (std.mem.eql(u8, text, "off")) return .off;
+    const seconds = std.fmt.parseFloat(f32, text) catch return null;
+    return if (seconds > 0.0) .{ .ms = seconds * 1000.0 } else null;
+}
+
 fn parseMode(name: []const u8) ?clips.Mode {
     return std.meta.stringToEnum(clips.Mode, name);
 }
@@ -207,12 +240,12 @@ fn parseCounts(text: []const u8) ?i16 {
 
 pub const usage =
     \\usage: mami_sound [PLANTS] [--device=NAME]
-    \\                  [--plant-a=SOURCE] [--plant-a-mode=MODE]
-    \\                  [--plant-a-seconds=N] [--plant-a-retrigger=N]
-    \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE]
-    \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
+    \\                  [--plant-a=SOURCE] [--plant-a-mode=MODE] [--plant-a-band=LO:HI]
+    \\                  [--plant-a-seconds=N] [--plant-a-retrigger=N] [--plant-a-window=N|off]
+    \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE] [--plant-b-band=LO:HI]
+    \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS] [--touch-band=LO:HI]
+    \\                  [--still-window=SECONDS]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--test-random-probe]
     \\
@@ -256,6 +289,16 @@ pub const usage =
     \\plant on to a different clip. Left off, 10s for the voice boxes and 5s
     \\for everything else. The drone takes neither flag.
     \\
+    \\--plant-a-window and --plant-b-window are how long a touch may last and
+    \\still count, in seconds, under the deviation model. With a window the plant
+    \\wants a tap: a hand that arrives and stays is read as drift or as somebody
+    \\leaning on the plant, and is ignored until it lets go. `off` takes the
+    \\window away, and the plant then answers a hand for as long as it is there.
+    \\Left off, plant B gets a second and plant A gets none, which is what the
+    \\rig was measured on. A plant on --plant-X-mode=hold drops its window
+    \\whatever this says: a held voice has to know the hand is still there.
+    \\The steady model takes no window at all.
+    \\
     \\--touch-model picks what the detector asks each probe:
     \\  deviation  how far the probe has moved from its own recent past
     \\  steady     how tightly the last second of readings clusters, at any level
@@ -268,23 +311,33 @@ pub const usage =
     \\room for the dropouts this rig throws, and --still-range=10 is the number
     \\to use once the conversion reads come back clean.
     \\
-    \\--touch-band says where a held probe sits, as LO:HI in counts. Both models
-    \\read it, for different reasons:
-    \\  steady     uses it instead of learning rest, so it needs no untouched
-    \\             stretch after power-on and cannot learn the wrong one because
-    \\             somebody had hold of a plant while it was starting
-    \\  deviation  uses it to tell a hand from a rail. That model asks how far a
-    \\             probe moved and not where it went, so a slam to the end of the
-    \\             range scores as high as a hand; a band throws those out.
+    \\--plant-a-band and --plant-b-band say where a hand puts that plant's probe,
+    \\as LO:HI in counts. One each, because the two probes do not sit at the same
+    \\place: on this rig a hand puts one near 660 and the other near 25000.
+    \\
+    \\Given a band, steady asks one plain question -- how much of the last window
+    \\was the probe in there -- and calls three fifths or more a hand. The window
+    \\is 400 readings, so three fifths is 240 of them where a hand puts it. That
+    \\survives a rig throwing rails through a perfectly good touch, and needs no
+    \\untouched stretch after power-on to learn anything from, so it cannot learn
+    \\the wrong thing because somebody had hold of a plant while it was starting.
+    \\The deviation model uses the band differently: it asks how far a probe
+    \\moved and not where it went, so a slam to the end of the range scores as
+    \\high as a hand, and a band throws those out.
+    \\
+    \\A band is the detector's answer to "is somebody there", so it decides for
+    \\trigger and hold alike, and for the guard between one touch and the next.
     \\Left off, steady learns rest and calls a touch stillness a hundred counts
     \\away from it, and deviation fires on any large move. Set it once you have
     \\watched the rig: the status line's l0 and l1 are the levels to read it off.
     \\
     \\--still-window is how long a stretch of readings that range is measured
-    \\over, in seconds. It buys the answer's stability rather than its speed:
-    \\shortening it to a quarter of a second finds one hand fifteen times over
-    \\rather than finding more hands. Default 1. `zig build replay -- CAPTURE
-    \\--sweep` picks all three from a recording rather than from the room.
+    \\over, in seconds, and how many readings a band is counted over. It buys the
+    \\answer's stability rather than its speed: shortening it to a quarter of a
+    \\second finds one hand fifteen times over rather than finding more hands.
+    \\Default 1.161, which is 400 readings at this rig's poll rate. `zig build
+    \\replay -- CAPTURE --sweep` picks all three from a recording rather than
+    \\from the room.
     \\
     \\--capture writes down what the probes actually read, every poll of both,
     \\to a file `zig build replay` can sweep. Start it, touch each plant a few
@@ -474,20 +527,54 @@ test "the usage banner names every flag the parser takes" {
     }
 }
 
-test "a band takes both ends, low first" {
-    const opts = try parse(&.{"--touch-band=650:660"});
-    try std.testing.expectEqual(@as(i16, 650), opts.touch_band.?[0]);
-    try std.testing.expectEqual(@as(i16, 660), opts.touch_band.?[1]);
-    try std.testing.expect((try parse(&.{})).touch_band == null);
+test "each plant's tap window is set, or taken away, on the command line" {
+    // The preset's window is what makes plant B want a tap rather than a hand
+    // that stays. A room whose hands stay has to be able to say so without a
+    // rebuild.
+    const opts = try parse(&.{ "--plant-a-window=0.5", "--plant-b-window=off" });
+    try std.testing.expectEqual(@as(f32, 500.0), opts.plant_window[0].?.ms);
+    try std.testing.expectEqual(touch.Window.off, opts.plant_window[1].?);
+
+    // Unasked, the preset's answer stands rather than being overwritten with a
+    // default this layer invented.
+    const bare = try parse(&.{});
+    try std.testing.expect(bare.plant_window[0] == null);
+    try std.testing.expect(bare.plant_window[1] == null);
+}
+
+test "a window of no length is refused rather than read as none" {
+    // Zero would be a touch that had to end before the hold that starts it was
+    // satisfied, which no gesture can do. `off` is the word for no window.
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-a-window=0"}));
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-b-window=-1"}));
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-b-window="}));
+    try std.testing.expectError(Error.InvalidSeconds, parse(&.{"--plant-a-window=none"}));
+}
+
+test "each plant takes its own band, both ends, low first" {
+    // The two probes do not sit at the same place, so one band for both would
+    // serve neither.
+    const opts = try parse(&.{ "--plant-a-band=650:660", "--plant-b-band=24000:26000" });
+    try std.testing.expectEqual(@as(i16, 650), opts.plant_band[0].?[0]);
+    try std.testing.expectEqual(@as(i16, 660), opts.plant_band[0].?[1]);
+    try std.testing.expectEqual(@as(i16, 24000), opts.plant_band[1].?[0]);
+    try std.testing.expectEqual(@as(i16, 26000), opts.plant_band[1].?[1]);
+
+    // And one plant may have a band while the other has none.
+    const only_b = try parse(&.{"--plant-b-band=24000:26000"});
+    try std.testing.expect(only_b.plant_band[0] == null);
+    try std.testing.expect(only_b.plant_band[1] != null);
+
+    try std.testing.expect((try parse(&.{})).plant_band[0] == null);
 }
 
 test "half a band, or one the wrong way round, is refused" {
     // A band with one end open is a threshold wearing a band's name, and one
     // that runs backwards can never contain anything.
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=650"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=660:650"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=650:"}));
-    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-band=a:b"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--plant-a-band=650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--plant-b-band=660:650"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--plant-a-band=650:"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--plant-b-band=a:b"}));
 }
 
 test "a run can be told to write down what the probes read" {

@@ -214,7 +214,8 @@ pub const Model = enum { deviation, steady };
 
 /// How wide the window the `steady` model measures a probe's spread over.
 ///
-/// A second, and the number that matters most in this model.
+/// Four hundred polls of this rig's poll rate, and the number that matters most
+/// in this model.
 ///
 /// It buys the answer's stability, not its speed. Swept against the capture in
 /// `touch.csv`, probe BC gives 39 touches averaging 5.5 seconds over a
@@ -226,6 +227,11 @@ pub const Model = enum { deviation, steady };
 /// fragments -- it waits a second of no hand before letting a clip go -- so a
 /// rig that wants to hear a hand sooner can trade the stability it no longer
 /// needs.
+///
+/// A band is answered by counting, so the count wants to be worth something:
+/// four hundred readings at three fifths is two hundred and forty of them where
+/// a hand puts the probe, and nothing else on this rig sits there that long.
+/// At 44100 over 128 frames a poll that is 1161 ms.
 pub const default_still_window_ms: f32 = 1000.0;
 
 /// The spread, in counts, at or below which a probe counts as held, and the one
@@ -303,11 +309,30 @@ pub const default_still_rest_s: f32 = 5.0;
 pub const default_touch_band_lo: ?i16 = null;
 pub const default_touch_band_hi: ?i16 = null;
 
+/// How much of the window has to be inside the band before it is a hand.
+///
+/// A band asks a plain question -- how much of the last second was the probe
+/// where a hand puts it -- and this is the answer that counts as yes. Three
+/// fifths is comfortably more than a rig throwing rails through a good touch
+/// costs, and comfortably more than a probe passing through the band on its way
+/// somewhere else ever manages.
+pub const default_band_share: f32 = 0.6;
+
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
 /// few polls in the middle of a real touch, and releasing on that would end a
 /// clip, or with `--touch-window-bc` start one.
 pub const default_drop_ms: f32 = 90.0;
+
+/// A tap window as a room asked for it: a length, or none at all.
+///
+/// A plain optional cannot carry both answers for probe BC, where `null`
+/// already means "whatever plant A was given". A room turning BC's window off
+/// is saying something else, and this is the word for it.
+pub const Window = union(enum) {
+    off,
+    ms: f32,
+};
 
 pub const Config = struct {
     sample_rate: u32,
@@ -324,6 +349,14 @@ pub const Config = struct {
     still_rest_s: f32 = default_still_rest_s,
     touch_band_lo: ?i16 = default_touch_band_lo,
     touch_band_hi: ?i16 = default_touch_band_hi,
+    /// Probe BC's own band. `null` puts it on A's.
+    ///
+    /// The two probes do not sit at the same place: on this rig a hand puts one
+    /// near six hundred and sixty and the other near twenty-five thousand, so
+    /// one band for both cannot serve either.
+    touch_band_lo_bc: ?i16 = null,
+    touch_band_hi_bc: ?i16 = null,
+    band_share: f32 = default_band_share,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -378,7 +411,10 @@ pub const Config = struct {
     /// Timed from the moment the hold has been satisfied, so the whole gesture
     /// may last the hold plus this.
     window_ms: ?f32 = null,
-    window_bc_ms: ?f32 = null,
+    /// Probe BC's own answer to the same question. `null` gives it A's, and
+    /// `.off` is the room saying this plant takes no window at all -- which
+    /// `null` cannot say, because there it already means "whatever A has".
+    window_bc: ?Window = null,
 
     /// This config as probe BC sees it: its own threshold and hold where it was
     /// given them, A's everywhere else.
@@ -389,17 +425,24 @@ pub const Config = struct {
         bc.still_range = self.still_range_bc orelse self.still_range;
         bc.still_release = self.still_release_bc orelse self.still_release;
         bc.still_move = self.still_move_bc orelse self.still_move;
+        if (self.touch_band_lo_bc) |lo| bc.touch_band_lo = lo;
+        if (self.touch_band_hi_bc) |hi| bc.touch_band_hi = hi;
+        bc.touch_band_lo_bc = null;
+        bc.touch_band_hi_bc = null;
         bc.still_range_bc = null;
         bc.still_release_bc = null;
         bc.still_move_bc = null;
         bc.counts = self.counts_bc orelse self.counts;
-        bc.window_ms = self.window_bc_ms orelse self.window_ms;
+        bc.window_ms = if (self.window_bc) |chosen| switch (chosen) {
+            .off => null,
+            .ms => |ms| ms,
+        } else self.window_ms;
         bc.hold = self.hold_bc;
         bc.hold_bc = false;
         bc.level_bc = null;
         bc.hold_bc_ms = null;
         bc.counts_bc = null;
-        bc.window_bc_ms = null;
+        bc.window_bc = null;
         return bc;
     }
 };
@@ -465,6 +508,7 @@ pub const Detector = struct {
     /// a slam to the end of the range scores as high as a hand does.
     band_lo: ?i16,
     band_hi: ?i16,
+    band_share: f32,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -484,7 +528,7 @@ pub const Detector = struct {
             // is somebody asking for a recording. The steady model asks the
             // opposite question: a touch there is a hand that stays, so a tap
             // window would discard every real one and then block the probe
-            // until it was let go. The preset still carries `window_bc_ms` for
+            // until it was let go. The preset still carries `window_bc` for
             // the rig it was measured on, so this cannot be left to the caller
             // remembering to clear it.
             .window = if (cfg.model == .deviation and !cfg.hold) blk: {
@@ -499,12 +543,18 @@ pub const Detector = struct {
             .drop = @max(holdPolls(cfg.drop_ms, cfg.sample_rate, cfg.poll_frames), 1),
             .dropped = 0,
             .at_rest = true,
-            .spread = .init(cfg.still_window_ms, cfg.sample_rate, cfg.poll_frames),
+            .spread = blk: {
+                var window: spread_mod.Spread =
+                    .init(cfg.still_window_ms, cfg.sample_rate, cfg.poll_frames);
+                window.watch(cfg.touch_band_lo, cfg.touch_band_hi);
+                break :blk window;
+            },
             .still_range = cfg.still_range,
             .still_release = cfg.still_release,
             .still_move = cfg.still_move,
             .band_lo = cfg.touch_band_lo,
             .band_hi = cfg.touch_band_hi,
+            .band_share = cfg.band_share,
             .rest_samples = @max(
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
@@ -619,15 +669,22 @@ pub const Detector = struct {
         }
 
         const level = self.spread.level;
+
+        // Told where a hand puts the probe, the question is how much of the
+        // last second was there. One count, which a rail thrown through a
+        // perfectly good touch cannot move much -- where a median and a spread
+        // survive that only up to the margin the percentiles leave.
+        //
+        // Told nothing, the probe has to be still and somewhere other than
+        // where it rests, because neither of those says anything on its own: a
+        // probe with nothing connected to it is stiller than any hand could
+        // hold one, and a probe wandering past the right level is not a hand.
         const away = if (banded)
-            self.inBand(level)
+            self.spread.inside >= 0.0
         else
             clampedAbsDiff(level, self.baseline.base) >= self.still_move;
 
-        // Still, and somewhere the probe does not normally sit. Stillness on
-        // its own says nothing: a probe with nothing connected to it is stiller
-        // than any hand could hold one.
-        const held = range <= self.still_range and away;
+        const held = if (banded) away else range <= self.still_range and away;
         // And let go once it is wandering again, or once it is no longer where
         // a held probe sits.
         //
@@ -968,7 +1025,7 @@ test "the pitch follows the level the probe went still at, not a band" {
 }
 
 test "the steady model is not subject to the tap window" {
-    // The live preset carries `window_bc_ms` for the deviation rig, where an
+    // The live preset carries `window_bc` for the deviation rig, where an
     // excursion that never comes back is drift or wiring settling rather than
     // somebody asking for a recording. The steady model asks the opposite
     // question: a touch there IS a hand that stays, so a tap window discards
@@ -986,7 +1043,7 @@ test "the preset's plant B window does not silence a steady rig" {
     // The same fault as it actually reaches the room: the compiled preset with
     // only the model swapped, which is exactly what `--touch-model=steady` does.
     var cfg = steadyConfig();
-    cfg.window_bc_ms = 1000.0;
+    cfg.window_bc = .{ .ms = 1000.0 };
     cfg.level_bc = 10.0;
     cfg.hold_bc_ms = 20.0;
     var machine: Machine = .init(cfg);
@@ -1065,11 +1122,23 @@ test "the steady model reports a hand for as long as it is there" {
     try std.testing.expect(detector.on);
 }
 
+test "a plant B told to take no window keeps none while plant A has one" {
+    // On BC `null` already means "whatever A was given", so a room turning
+    // that plant's window off needs a word of its own or it inherits A's.
+    var cfg = deviationConfig();
+    cfg.window_ms = 1000.0;
+    cfg.window_bc = .off;
+    const machine: Machine = .init(cfg);
+
+    try std.testing.expect(machine.a.window != null);
+    try std.testing.expect(machine.bc.window == null);
+}
+
 test "plant B's window survives when only plant A is held" {
     // The two probes are told separately. A held plant A must not quietly
     // retire the tap window plant B was given.
     var cfg = deviationConfig();
-    cfg.window_bc_ms = 1000.0;
+    cfg.window_bc = .{ .ms = 1000.0 };
     cfg.hold = true;
     const machine: Machine = .init(cfg);
 
@@ -1422,4 +1491,119 @@ test "how long the steady model takes to notice a hand arriving and leaving" {
     // this, and this test is here so the next person does not have to guess.
     try std.testing.expect(to_latch < 2 * polls_per_s);
     try std.testing.expect(to_release < 2 * polls_per_s);
+}
+
+test "a band counts how much of the second the probe was there" {
+    // The rule a room can check by eye: most of the last second inside the
+    // band is a hand, and a rig throwing rails through a good touch does not
+    // change the answer.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    var detector: Detector = .init(cfg);
+
+    // Four readings in five where a hand puts it, the fifth from nowhere.
+    for (0..steady_warmup) |poll| {
+        _ = detector.update(if (poll % 5 == 4) -4096 else 660);
+    }
+    try std.testing.expect(detector.on);
+}
+
+test "a probe passing through the band is not a hand" {
+    // Half in and half a long way out, which is a probe on its way somewhere
+    // rather than one somebody is holding.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    var detector: Detector = .init(cfg);
+
+    for (0..steady_warmup) |poll| {
+        _ = detector.update(if (poll % 2 == 0) 660 else 12000);
+    }
+    try std.testing.expect(!detector.on);
+}
+
+test "the two probes are given their own bands" {
+    // A hand puts one probe near six hundred and sixty and the other near
+    // twenty-five thousand. One band for both would serve neither.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    cfg.touch_band_lo_bc = 24000;
+    cfg.touch_band_hi_bc = 26000;
+    var machine: Machine = .init(cfg);
+
+    for (0..steady_warmup) |_| {
+        _ = machine.update(660, 25000);
+    }
+    try std.testing.expect(machine.a.on);
+    try std.testing.expect(machine.bc.on);
+}
+
+test "a probe in the other plant's band is not a hand on this one" {
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    cfg.touch_band_lo_bc = 24000;
+    cfg.touch_band_hi_bc = 26000;
+    var machine: Machine = .init(cfg);
+
+    // Each probe sitting where the other one's hand would put it.
+    for (0..steady_warmup) |_| {
+        _ = machine.update(25000, 660);
+    }
+    try std.testing.expect(!machine.a.on);
+    try std.testing.expect(!machine.bc.on);
+}
+
+test "a band is asked of a whole window, not of a share of one still enough" {
+    // A probe that is still and only sometimes where a hand puts it is not a
+    // hand. The share is the whole question a band asks, so it has to be a
+    // share worth having: a third of the window inside the band is a probe
+    // that wandered past, and the rig has more of those than it has hands.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    var detector: Detector = .init(cfg);
+
+    // Calm readings, a third of them in the band and the rest just outside it,
+    // so nothing but the share can tell this from a touch.
+    for (0..steady_warmup) |poll| {
+        _ = detector.update(if (poll % 3 == 0) 660 else 700);
+    }
+    try std.testing.expect(!detector.on);
+}
+
+test "the share a band wants is the one the config was given" {
+    // Above the share and it is a hand, below it and it is not, and the line
+    // is the number in the config rather than one buried in the model.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 650;
+    cfg.touch_band_hi = 670;
+    cfg.band_share = 0.9;
+    var strict: Detector = .init(cfg);
+
+    // Four readings in five inside the band: a hand under the preset's three
+    // fifths, and not one under nine tenths.
+    for (0..steady_warmup) |poll| {
+        _ = strict.update(if (poll % 5 == 4) 700 else 660);
+    }
+    try std.testing.expect(!strict.on);
+
+    cfg.band_share = default_band_share;
+    var lenient: Detector = .init(cfg);
+    for (0..steady_warmup) |poll| {
+        _ = lenient.update(if (poll % 5 == 4) 700 else 660);
+    }
+    try std.testing.expect(lenient.on);
+}
+
+test "the preset window is four hundred polls of the rig's poll rate" {
+    // What a band is asked of. Four hundred readings is enough that a share of
+    // them means something: at three fifths that is two hundred and forty
+    // readings where a hand puts the probe, which nothing but a hand manages
+    // for that long.
+    const window: spread_mod.Spread =
+        .init(default_still_window_ms, 44100, sensor_poll_frames);
+    try std.testing.expectEqual(@as(u32, 400), window.len);
 }

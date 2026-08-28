@@ -656,3 +656,60 @@ test "without a band that same level is a touch" {
     });
     try testing.expect(outside.requests > 0);
 }
+
+/// Each probe where a hand puts it on this rig: one near six hundred and sixty,
+/// the other near twenty-five thousand.
+fn heldBothBands(poll: usize) ports.Reading {
+    return .{
+        .raw_a = if (poll % 7 == 6) -4096 else 660,
+        .raw_bc = if (poll % 7 == 6) -4096 else 25000,
+    };
+}
+
+test "per-plant bands drive a held plant and a triggered one alike" {
+    // What the room runs: two probes that sit at quite different places, one
+    // plant gated on the hand and the other fired by it, and one band each.
+    // The band is the detector's answer to "is somebody there", so both modes
+    // and the guard between touches all read the same boolean.
+    var banded = steadyTouchConfig();
+    banded.touch_band_lo = 650;
+    banded.touch_band_hi = 670;
+    banded.touch_band_lo_bc = 24000;
+    banded.touch_band_hi_bc = 26000;
+
+    var a: FakeClips = .{};
+    var b: FakeClips = .{};
+    const sink = try runVoicesWith(heldBothBands, warmup_blocks, .{ true, true }, .{
+        heldClipVoice(&a, 0),
+        clipVoice(&b, 1),
+    }, banded);
+
+    try testing.expect(a.requests > 0);
+    try testing.expect(b.requests > 0);
+    try testing.expect(sink.rms() > 0.0);
+}
+
+test "a band on one plant does not answer for the other" {
+    // Swap the probes over: each now sits where the other plant's hand would
+    // put it, and neither band is satisfied.
+    var banded = steadyTouchConfig();
+    banded.touch_band_lo = 650;
+    banded.touch_band_hi = 670;
+    banded.touch_band_lo_bc = 24000;
+    banded.touch_band_hi_bc = 26000;
+
+    var a: FakeClips = .{};
+    var b: FakeClips = .{};
+    _ = try runVoicesWith(swappedBands, warmup_blocks, .{ true, true }, .{
+        heldClipVoice(&a, 0),
+        clipVoice(&b, 1),
+    }, banded);
+
+    try testing.expectEqual(@as(usize, 0), a.requests);
+    try testing.expectEqual(@as(usize, 0), b.requests);
+}
+
+fn swappedBands(poll: usize) ports.Reading {
+    _ = poll;
+    return .{ .raw_a = 25000, .raw_bc = 660 };
+}
