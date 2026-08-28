@@ -96,9 +96,17 @@ pub const ClipSelector = struct {
     /// they have all been heard, so every clip plays once before any plays
     /// twice.
     dealt: [max_shuffled]bool,
-    /// Frames since the last clip was started, and how many make ten seconds.
+    /// Frames since the last clip was started, and how many make the guard.
     frames_since_start: u64,
     open_frames: u64,
+    /// Frames since the hand came off, and how many make a real departure.
+    ///
+    /// A clip is replaced on a rising edge, and a detector that drops out for a
+    /// poll and comes back gives one. Without this a five-minute recording is
+    /// swapped for another by nobody, halfway through a sentence -- which is
+    /// what a room hears as the piece breaking.
+    released_frames: u64,
+    settled_frames: u64,
 
     pub fn init(
         clip_count: usize,
@@ -106,6 +114,9 @@ pub const ClipSelector = struct {
         sample_rate: u32,
         random: std.Random,
     ) ClipSelector {
+        const settled: u64 = @intFromFloat(
+            hold_release_s * @as(f32, @floatFromInt(sample_rate)),
+        );
         return .{
             .clip_count = clip_count,
             .random = random,
@@ -114,6 +125,10 @@ pub const ClipSelector = struct {
             .dealt = [_]bool{false} ** max_shuffled,
             .frames_since_start = 0,
             .open_frames = @intFromFloat(retrigger_s * @as(f32, @floatFromInt(sample_rate))),
+            // Nobody has ever been holding it, so the first hand to arrive has
+            // been away long enough by definition.
+            .released_frames = settled,
+            .settled_frames = settled,
         };
     }
 
@@ -129,9 +144,25 @@ pub const ClipSelector = struct {
     ) ?usize {
         self.frames_since_start +|= frames;
 
+        // How long the hand had been off before this poll. Read before it is
+        // cleared, because on the poll a hand returns this is the length of the
+        // gap it is returning from.
+        const gone_for = self.released_frames;
+        if (touched) {
+            self.released_frames = 0;
+        } else {
+            self.released_frames +|= frames;
+        }
+
         const rising = touched and !self.previous_touch;
         self.previous_touch = touched;
         if (!rising or self.clip_count == 0) return null;
+
+        // A hand that was only away for a moment never left: it is the same
+        // visit, and the same clip carries on. Only while something is playing,
+        // because a flicker with nothing to cut short cuts nothing short, and a
+        // plant that has fallen quiet should answer the next hand at once.
+        if (sounding and gone_for < self.settled_frames) return null;
 
         // A clip still inside its ten seconds is left alone. This is the whole
         // of the fix for a plant that answered every stray edge with the first
@@ -282,6 +313,14 @@ const six_clips: usize = 6;
 /// The poll the engine runs the selector at, and how many of them a second is.
 const poll_frames: usize = 128;
 const polls_per_s: usize = 44100 / poll_frames;
+
+fn testSelectorGuard(clip_count: usize, retrigger_s: f32, seed: u64) ClipSelector {
+    const State = struct {
+        var prng: std.Random.DefaultPrng = undefined;
+    };
+    State.prng = .init(seed);
+    return ClipSelector.init(clip_count, retrigger_s, 44100, State.prng.random());
+}
 
 fn testSelector(clip_count: usize, seed: u64) ClipSelector {
     const State = struct {
@@ -514,4 +553,32 @@ test "every clip in a pool is reached, and about as often as the others" {
     }
     // Forty passes, so exactly forty each: a bag deals every clip once a pass.
     for (counts) |count| try std.testing.expectEqual(@as(usize, 40), count);
+}
+
+test "a flicker in the detector does not count as a new visit" {
+    // What cuts an interview off mid-sentence. A clip is replaced on a rising
+    // edge past the guard, and a detector that drops out for a poll and comes
+    // back gives one -- so a five-minute recording is swapped for another by
+    // nobody, halfway through a sentence.
+    // A three-second guard, as a room that wants to be able to move a clip on
+    // would set.
+    var selector = testSelectorGuard(six_clips, 3.0, 4);
+    try std.testing.expect(selector.start(true, false, poll_frames) != null);
+
+    // Well past the guard, then a flicker: one poll of nothing, straight back
+    // to the same hand.
+    for (0..5 * polls_per_s) |_| _ = selector.start(true, true, poll_frames);
+    try std.testing.expect(selector.start(false, true, poll_frames) == null);
+    try std.testing.expect(selector.start(true, true, poll_frames) == null);
+}
+
+test "a hand that really left does count as a new visit" {
+    // And the other half: the guard is still the thing that decides, once
+    // somebody has actually let go.
+    var selector = testSelectorGuard(six_clips, 3.0, 4);
+    _ = selector.start(true, false, poll_frames);
+
+    for (0..5 * polls_per_s) |_| _ = selector.start(true, true, poll_frames);
+    for (0..2 * polls_per_s) |_| _ = selector.start(false, true, poll_frames);
+    try std.testing.expect(selector.start(true, true, poll_frames) != null);
 }
