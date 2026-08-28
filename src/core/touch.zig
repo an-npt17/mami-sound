@@ -1394,3 +1394,32 @@ test "without a band the deviation model still fires on any big move" {
     for (0..steady_warmup) |poll| _ = detector.update(railed(poll));
     try std.testing.expect(detector.on);
 }
+
+test "how long the steady model takes to notice a hand arriving and leaving" {
+    // The room's complaint is a wait between touching a plant and hearing it
+    // change. This is the detector's share of that, measured with the settings
+    // a room is actually running: a band where a hand puts the probe, a loose
+    // range, and a probe that reads nought when nobody is there.
+    var cfg = steadyConfig();
+    cfg.touch_band_lo = 630;
+    cfg.touch_band_hi = 690;
+    cfg.still_range = 400;
+    var detector: Detector = .init(cfg);
+
+    const polls_per_s: usize = 44100 / sensor_poll_frames;
+    for (0..3 * polls_per_s) |poll| _ = detector.update(flatlined(poll));
+
+    var to_latch: usize = 0;
+    while (!detector.on) : (to_latch += 1) _ = detector.update(660);
+
+    var to_release: usize = 0;
+    while (detector.on) : (to_release += 1) _ = detector.update(flatlined(to_release));
+
+    // Measured: 314 polls to latch and 116 to release, which is 0.91s and
+    // 0.34s. Asserted loosely because the exact figure is arithmetic about the
+    // window; what matters is the order of magnitude. A room waiting ten
+    // seconds between touching a plant and hearing it change is not waiting for
+    // this, and this test is here so the next person does not have to guess.
+    try std.testing.expect(to_latch < 2 * polls_per_s);
+    try std.testing.expect(to_release < 2 * polls_per_s);
+}
