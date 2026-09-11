@@ -57,6 +57,14 @@ pub const Options = struct {
     /// Where a held probe sits, when the room can say. Both ends together or
     /// neither: half a band is a typo, not a setting.
     touch_band: ?[2]i16 = null,
+    /// How big a move a touch must be, in the counts the probe reads, per
+    /// probe. Unset keeps the measured preset; zero asks for no floor at all.
+    ///
+    /// On the command line for the same reason the thresholds are: the number
+    /// is a property of the rig on the day. A probe whose dropouts get worse
+    /// wants a higher floor, and finding that out should not want a rebuild.
+    counts: ?i16 = null,
+    counts_bc: ?i16 = null,
     /// Where to write down what the probes read, and for how long. Unset, the
     /// run measures nothing and writes nothing.
     capture_buf: [path_max]u8 = undefined,
@@ -115,6 +123,12 @@ pub fn parse(args: []const []const u8) Error!Options {
             opts.capture_s = secs;
         } else if (std.mem.startsWith(u8, arg, "--touch-band=")) {
             opts.touch_band = parseBand(arg["--touch-band=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts=")) {
+            opts.counts = parseFloor(arg["--counts=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts-b=")) {
+            opts.counts_bc = parseFloor(arg["--counts-b=".len..]) orelse
                 return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
             opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
@@ -205,6 +219,14 @@ fn parseCounts(text: []const u8) ?i16 {
     return if (value > 0) value else null;
 }
 
+/// A floor in counts. Zero is the room asking for no floor, which is a setting
+/// and not a typo -- unlike `parseCounts`, where zero would mean a threshold
+/// nothing can clear. A negative move is not a move.
+fn parseFloor(text: []const u8) ?i16 {
+    const value = std.fmt.parseInt(i16, text, 10) catch return null;
+    return if (value >= 0) value else null;
+}
+
 pub const usage =
     \\usage: mami_sound [PLANTS] [--device=NAME]
     \\                  [--plant-a=SOURCE] [--plant-a-mode=MODE]
@@ -213,6 +235,7 @@ pub const usage =
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--still-window=SECONDS] [--touch-band=LO:HI]
+    \\                  [--counts=N] [--counts-b=N]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--test-random-probe]
     \\
@@ -248,6 +271,8 @@ pub const usage =
     \\  trigger  a touch sets a clip going and it runs its own length
     \\  hold     the clip sounds while the plant is held and fades when it is
     \\           let go, and the next hold picks it up where it stopped
+    \\  tap      a hand that arrives and leaves again sets a clip going; one
+    \\           left resting is drift or settling and starts nothing
     \\Left off, a plant triggers. The drone always holds and takes no mode.
     \\
     \\--plant-a-retrigger and --plant-b-retrigger are how long a clip is
@@ -279,6 +304,19 @@ pub const usage =
     \\Left off, steady learns rest and calls a touch stillness a hundred counts
     \\away from it, and deviation fires on any large move. Set it once you have
     \\watched the rig: the status line's l0 and l1 are the levels to read it off.
+    \\
+    \\--counts and --counts-b are how big a move a touch has to be on each
+    \\probe, in the counts the status line's l0 and l1 show. `deviation` only.
+    \\
+    \\The score on its own cannot answer this: it divides a move by how much
+    \\the probe normally wanders, and a probe that goes quiet scores enormous
+    \\deviations on a move that is, in counts, nothing. On this rig plant B
+    \\reads the supply rail to within seventy counts while about one poll in
+    \\fifteen drops toward ground, and the density of those dropouts alone
+    \\moves its average far enough to fire. Defaults are 4000 for plant A,
+    \\which a hand moves about 9000, and 10000 for plant B, which a hand moves
+    \\about 24000. Zero asks for no floor and puts a probe back on the score
+    \\alone; left off, the measured default stands.
     \\
     \\--still-window is how long a stretch of readings that range is measured
     \\over, in seconds. It buys the answer's stability rather than its speed:
@@ -458,6 +496,8 @@ test "the usage banner names every flag the parser takes" {
         "--still-range=",
         "--still-release=",
         "--still-window=",
+        "--counts=",
+        "--counts-b=",
         "--test-random-probe",
     };
     const banner_end = std.mem.indexOf(u8, usage, "\nPLANTS").?;
@@ -505,4 +545,65 @@ test "a capture with no path or no time is refused" {
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture="}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=0"}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=-5"}));
+}
+
+test "a plant can be asked for a tap" {
+    // The third gesture. It was in the detector all along and reachable only by
+    // being plant B, which is how a room got a plant that ignored a hand.
+    try std.testing.expectEqual(
+        clips.Mode.tap,
+        (try parse(&.{"--plant-b-mode=tap"})).plant_mode[1].?,
+    );
+    // On plant A too, which the drone refuses -- so it is asked of a folder.
+    try std.testing.expectEqual(
+        clips.Mode.tap,
+        (try parse(&.{ "--plant-a=bell", "--plant-a-mode=tap" })).plant_mode[0].?,
+    );
+}
+
+test "the usage names every mode a plant can be given" {
+    // A mode the usage does not mention is a mode nobody asks for, which is how
+    // plant B came to answer taps in a room that rested its hands.
+    inline for (@typeInfo(clips.Mode).@"enum".fields) |field| {
+        if (std.mem.indexOf(u8, usage, field.name) == null) {
+            std.debug.print("the usage omits the {s} mode\n", .{field.name});
+            return error.ModeMissingFromUsage;
+        }
+    }
+}
+
+test "each probe's counts floor can be set from the room" {
+    const opts = try parse(&.{ "--counts=2500", "--counts-b=15000" });
+    try std.testing.expectEqual(@as(i16, 2500), opts.counts.?);
+    try std.testing.expectEqual(@as(i16, 15000), opts.counts_bc.?);
+
+    // Left off, the measured preset stands rather than being overwritten with
+    // a null the caller never asked for.
+    const quiet = try parse(&.{});
+    try std.testing.expect(quiet.counts == null);
+    try std.testing.expect(quiet.counts_bc == null);
+}
+
+test "a floor of zero is a setting, not a typo" {
+    // The one way back to the score alone without a rebuild. Distinct from
+    // --still-range=0, where zero is a threshold nothing could ever clear.
+    const opts = try parse(&.{ "--counts=0", "--counts-b=0" });
+    try std.testing.expectEqual(@as(i16, 0), opts.counts.?);
+    try std.testing.expectEqual(@as(i16, 0), opts.counts_bc.?);
+}
+
+test "a floor that is not a move is refused" {
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts=-1"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts-b=lots"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts="}));
+}
+
+test "one probe's floor is set without touching the other's" {
+    const only_a = try parse(&.{"--counts=3000"});
+    try std.testing.expectEqual(@as(i16, 3000), only_a.counts.?);
+    try std.testing.expect(only_a.counts_bc == null);
+
+    const only_b = try parse(&.{"--counts-b=12000"});
+    try std.testing.expect(only_b.counts == null);
+    try std.testing.expectEqual(@as(i16, 12000), only_b.counts_bc.?);
 }

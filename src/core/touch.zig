@@ -1677,3 +1677,76 @@ test "a probe that never comes back to rest learns anyway in the end" {
     try std.testing.expect(!detector.on);
     try std.testing.expect(detector.at_rest);
 }
+
+/// Probe B as the new rig's journal shows it: pinned at the supply rail, with a
+/// share of its polls dropping toward ground between the readings a status line
+/// prints. The dropouts are the difference between the 25761 the line shows and
+/// the 23977 the averaging reads, and it is their *density* that wanders --
+/// which is a move in the mean that nobody's hand had anything to do with.
+fn pinnedWithDropouts(poll: usize, in_fifteen: usize) i16 {
+    return if (poll % 15 < in_fifteen) 0 else 25761;
+}
+
+test "a wandering dropout density scores as a touch on the score alone" {
+    // The fault as the rig hands it over. One dropout in fifteen puts the mean
+    // at about 24000; two puts it at about 22300. That is seventeen hundred
+    // counts of movement with the plant untouched, and against a probe this
+    // smooth the median absolute deviation is on its floor -- so the score
+    // divides seventeen hundred by twenty-five and calls it sixty-eight
+    // deviations. Nothing about the score can tell this from a hand.
+    var detector: Detector = .init(deviationConfig());
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(pinnedWithDropouts(poll, 1));
+    try std.testing.expect(!detector.on);
+
+    for (0..5 * poll_rate) |poll| _ = detector.update(pinnedWithDropouts(poll, 2));
+    try std.testing.expect(detector.on);
+}
+
+test "a counts floor refuses the move the score could not" {
+    // The same readings against a threshold in the units the probe reads. A
+    // touch on this probe is the whole way to ground, twenty-four thousand
+    // counts; seventeen hundred is not a small touch, it is not a touch.
+    var cfg = deviationConfig();
+    cfg.counts = 10000;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(pinnedWithDropouts(poll, 1));
+    for (0..5 * poll_rate) |poll| {
+        _ = detector.update(pinnedWithDropouts(poll, 2));
+        try std.testing.expect(!detector.on);
+    }
+}
+
+test "a counts floor still lets the hand through" {
+    // And the floor has to be a floor rather than a gag: the move it is set
+    // against is the one the room actually makes.
+    var cfg = deviationConfig();
+    cfg.counts = 10000;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(pinnedWithDropouts(poll, 1));
+    for (0..5 * poll_rate) |_| _ = detector.update(0);
+    try std.testing.expect(detector.on);
+
+    // And lets go again, which the floor's own half-way release decides.
+    for (0..10 * poll_rate) |poll| _ = detector.update(pinnedWithDropouts(poll, 1));
+    try std.testing.expect(!detector.on);
+}
+
+test "each probe carries its own floor" {
+    // The two probes move by different amounts on this rig -- plant A goes
+    // about nine thousand counts up, plant B twenty-four thousand down -- so
+    // one floor cannot serve both, and BC must not silently inherit A's.
+    var cfg = deviationConfig();
+    cfg.counts = 4000;
+    cfg.counts_bc = 10000;
+
+    const bc = cfg.forBc();
+    try std.testing.expectEqual(@as(i16, 10000), bc.counts.?);
+
+    // Unset, BC takes A's, which is the behaviour every other paired field has.
+    var shared = deviationConfig();
+    shared.counts = 4000;
+    try std.testing.expectEqual(@as(i16, 4000), shared.forBc().counts.?);
+}

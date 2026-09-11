@@ -17,6 +17,7 @@
 //!
 //!     zig build replay -- touch.csv
 //!     zig build replay -- touch.csv --model=steady --still-range=64
+//!     zig build replay -- touch.csv --model=deviation --counts=4000 --counts-b=10000
 //!     zig build replay -- touch.csv --sweep
 
 const std = @import("std");
@@ -194,6 +195,12 @@ const Args = struct {
     model: core.touch.Model = .steady,
     latch: ?i16 = null,
     release: ?i16 = null,
+    /// The deviation model's counts floors, per probe. Null is the score
+    /// alone, which is what this replayed before the floors existed -- so a
+    /// capture swept without them is answering a question the room no longer
+    /// asks.
+    counts: ?i16 = null,
+    counts_bc: ?i16 = null,
     sweep: bool = false,
     list: bool = false,
 };
@@ -209,6 +216,10 @@ fn parseArgs(argv: []const []const u8) Args {
             out.latch = std.fmt.parseInt(i16, arg["--still-range=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
             out.release = std.fmt.parseInt(i16, arg["--still-release=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--counts=")) {
+            out.counts = std.fmt.parseInt(i16, arg["--counts=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--counts-b=")) {
+            out.counts_bc = std.fmt.parseInt(i16, arg["--counts-b=".len..], 10) catch null;
         } else if (std.mem.eql(u8, arg, "--sweep")) {
             out.sweep = true;
         } else if (std.mem.eql(u8, arg, "--list")) {
@@ -283,6 +294,8 @@ pub fn main(init: std.process.Init) !void {
     };
     if (args.latch) |v| base.still_range = v;
     if (args.release) |v| base.still_release = v;
+    if (args.counts) |v| base.counts = v;
+    if (args.counts_bc) |v| base.counts_bc = v;
 
     if (args.sweep) {
         std.debug.print("sweeping the range, release held at {d}:\n", .{@as(u16, @intCast(base.still_release))});
@@ -311,6 +324,13 @@ pub fn main(init: std.process.Init) !void {
             @as(u16, @intCast(base.still_range)),
             @as(u16, @intCast(base.still_release)),
         });
+    } else {
+        // Printed even when unset, because "none" is the answer that explains
+        // a replay reporting four hundred touches nobody made.
+        std.debug.print("  counts ", .{});
+        if (base.counts) |v| std.debug.print("{d}", .{v}) else std.debug.print("none", .{});
+        std.debug.print("  counts-b ", .{});
+        if (base.counts_bc) |v| std.debug.print("{d}", .{v}) else std.debug.print("none", .{});
     }
     std.debug.print("\n", .{});
 
