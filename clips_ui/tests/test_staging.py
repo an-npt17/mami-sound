@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from clips_ui.folders import UnsafeName
 from clips_ui.staging import Pending, Staging, WouldEmptyPool
 
 
@@ -157,3 +158,63 @@ def test_apply_clears_staged_state_so_a_second_apply_has_nothing_to_do(
     payload = json.loads((tmp_path / "reload.request").read_text())
     assert payload["sources"] == []
     assert payload["id"] == second_id
+
+
+def test_an_interrupted_apply_cannot_leave_a_touched_source_empty(
+    tmp_path: Path, upload: Path
+) -> None:
+    # The reviewer's scenario: "piano" is live with [a.mp3, b.mp3]; staff
+    # stage removing both plus one offsetting add. would_empty correctly
+    # says the net result is non-empty, so the precheck passes. Then
+    # b.mp3 vanishes out-of-band (a concurrent process, a manual cleanup)
+    # before apply's own unlink() reaches it -- simulated here by deleting
+    # it right before calling apply. That unlink must still fail loudly
+    # (this is not testing missing_ok=True), but because adds run before
+    # removes within a source, new.mp3 is already in place by the time the
+    # failing unlink is reached: the folder ends up with an extra file,
+    # never with none.
+    _seed(tmp_path, "EPiano Stems", ["a.mp3", "b.mp3"])
+    s = Staging()
+    s.stage_remove("piano", "a.mp3")
+    s.stage_remove("piano", "b.mp3")
+    s.stage_add("piano", upload, "new.mp3")
+
+    (tmp_path / "EPiano Stems" / "b.mp3").unlink()  # the out-of-band race
+
+    with pytest.raises(FileNotFoundError):
+        s.apply(tmp_path)
+
+    remaining = list((tmp_path / "EPiano Stems").iterdir())
+    assert remaining, "an interrupted apply must never leave a touched source empty"
+    assert (tmp_path / "EPiano Stems" / "new.mp3").exists()
+    assert not (tmp_path / "reload.request").exists()
+
+
+def test_an_unsafe_staged_filename_is_caught_before_any_file_moves(
+    tmp_path: Path, upload: Path
+) -> None:
+    _seed(tmp_path, "EPiano Stems", ["old.mp3"])
+    s = Staging()
+    s.stage_add("piano", upload, "new.mp3")
+    s.stage_remove("piano", "../evil.mp3")
+
+    with pytest.raises(UnsafeName):
+        s.apply(tmp_path)
+
+    assert not (tmp_path / "EPiano Stems" / "new.mp3").exists()
+    assert upload.exists()  # the staged add was never moved
+    assert (tmp_path / "EPiano Stems" / "old.mp3").exists()  # nothing was removed
+    assert not (tmp_path / "reload.request").exists()
+
+
+def test_double_staging_the_same_removal_does_not_duplicate_it(tmp_path: Path) -> None:
+    _seed(tmp_path, "Insect", ["a.wav", "b.wav"])
+    s = Staging()
+    s.stage_remove("insect", "a.wav")
+    s.stage_remove("insect", "a.wav")
+
+    assert s.pending_for("insect").removes["insect"] == ["a.wav"]
+
+    s.apply(tmp_path)  # a second unlink() of a.wav would raise otherwise
+    assert not (tmp_path / "Insect" / "a.wav").exists()
+    assert (tmp_path / "Insect" / "b.wav").exists()

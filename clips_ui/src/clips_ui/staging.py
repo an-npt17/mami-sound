@@ -12,12 +12,23 @@ The rule that matters most: a source whose applied changes would leave it
 with no clips at all must never reach the filesystem. A plant whose pool is
 empty plays silence, and silence is the one failure nobody in the room can
 tell apart from the installation working correctly. :meth:`Staging.apply`
-therefore checks :meth:`Staging.would_empty` for every touched source
-*before* moving or deleting a single file, and raises
-:class:`WouldEmptyPool` naming the folder if any of them would empty. This
-check is the page's own guard -- the first line of defence. The
-installation refusing a reload that would empty a pool is the second line,
-not a substitute for this one.
+therefore checks :meth:`Staging.would_empty` -- and that every staged
+filename is a safe target -- for every touched source *before* moving or
+deleting a single file, and raises :class:`WouldEmptyPool` naming the
+folder if any of them would empty. This check is the page's own guard --
+the first line of defence. The installation refusing a reload that would
+empty a pool is the second line, not a substitute for this one.
+
+That precheck is not the whole story: a filesystem operation can still fail
+partway through the mutation phase, after every check has passed (a file
+disappearing out from under ``apply``, for instance). ``apply`` cannot make
+that phase fully atomic without more machinery than a museum installation's
+reload protocol needs, so instead it orders the mutation so that a partial
+failure is never a *fatal* one: every staged add is moved into place before
+any staged removal runs, for each touched source. Because ``would_empty``
+already verified the net result -- adds included -- is non-empty, a source
+can end up with more clips than intended if a later removal fails, but it
+can never end up with none.
 """
 
 import logging
@@ -92,13 +103,21 @@ class Staging:
     def stage_remove(self, source: str, filename: str) -> None:
         """Queue deleting ``filename`` from ``source``'s folder.
 
+        Staging the same ``(source, filename)`` pair twice queues it once --
+        two ``unlink`` calls for the same path at apply time would mean the
+        second one raises against a file the first one already deleted,
+        which is exactly the partial-failure hazard :meth:`apply` otherwise
+        guards against.
+
         Args:
             source: As :meth:`stage_add`.
             filename: The clip to remove. The file is untouched until
                 :meth:`apply` runs -- this call does not even check that it
                 exists.
         """
-        self._removes.setdefault(source, []).append(filename)
+        bucket = self._removes.setdefault(source, [])
+        if filename not in bucket:
+            bucket.append(filename)
 
     def pending_for(self, source: str) -> Pending:
         """What is staged for ``source``, for display before Apply.
@@ -155,12 +174,25 @@ class Staging:
     def apply(self, root: Path) -> str:
         """Apply every staged change as one batch, and request one reload.
 
-        Every touched source is checked with :meth:`would_empty` -- against
-        its actual current contents on disk -- before any file is moved or
-        deleted. If any touched source would end up empty, this raises
-        :class:`WouldEmptyPool` and leaves every clip folder exactly as it
-        was; only once every check has passed does this method delete or
-        move anything.
+        Every touched source is checked before anything is mutated: every
+        staged filename (add or remove) must resolve through
+        :func:`~clips_ui.folders.safe_target`, and :meth:`would_empty` --
+        run against that source's actual current contents on disk -- must
+        be false. If any touched source fails either check, this raises
+        (:class:`~clips_ui.folders.UnsafeName`,
+        :class:`~clips_ui.folders.UnknownSource`, or
+        :class:`WouldEmptyPool`) before a single file has moved or been
+        deleted, and every clip folder is left exactly as it was.
+
+        Once every touched source has cleared both checks, mutation begins.
+        Within each source, every staged add is moved into place before any
+        staged removal runs -- see the module docstring for why. This
+        method is therefore not fully atomic: if a filesystem operation
+        fails partway through the mutation phase (after the precheck has
+        already passed), a touched source can be left with extra clips and
+        no ``reload.request`` written at all, and the exception propagates
+        to the caller with staged state left as it was. What it guarantees
+        even then is that no touched source is left with none.
 
         Args:
             root: The installation's working directory (see
@@ -179,6 +211,11 @@ class Staging:
         touched = self._touched_sources()
 
         for source in touched:
+            for filename in self._removes.get(source, []):
+                safe_target(root, source, filename)
+            for _tmp_path, filename in self._adds.get(source, []):
+                safe_target(root, source, filename)
+
             live_names = self._live_names(root, source)
             if self.would_empty(source, live_names):
                 folder = folder_for(root, source)
@@ -188,12 +225,12 @@ class Staging:
                 raise WouldEmptyPool(folder.name)
 
         for source in touched:
-            for filename in self._removes.get(source, []):
-                target = safe_target(root, source, filename)
-                target.unlink()
             for tmp_path, filename in self._adds.get(source, []):
                 target = safe_target(root, source, filename)
                 shutil.move(str(tmp_path), str(target))
+            for filename in self._removes.get(source, []):
+                target = safe_target(root, source, filename)
+                target.unlink()
 
         request_id = new_request_id()
         write_request(root, request_id, touched)
