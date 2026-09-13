@@ -896,7 +896,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/mami-sound
 ExecStart=/usr/bin/python3 -m clips_ui --root /home/pi/mami-sound --bind ${MAMI_CLIPS_BIND} --port 8080
-Environment=MAMI_CLIPS_BIND=127.0.0.1
+Environment=MAMI_CLIPS_BIND=100.83.113.99
 Restart=on-failure
 RestartSec=10
 
@@ -904,17 +904,25 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-**The bind address is a decision, not a default.** It ships as `127.0.0.1`,
-which reaches nobody, so that a wrong value is a UI that does not work rather
-than a UI that is exposed. There is no authentication, so whoever can reach
-the port can delete every clip in every pool. Pick one before enabling:
+**Bind address: the box's own Tailscale address.** Decided by the user. On
+Mami-Sound2 that is `100.83.113.99`, which is what the unit above ships.
 
-- the Tailscale address (`100.83.113.99` on Mami-Sound2) — reachable only from
-  the tailnet, the tightest option, but staff must be on Tailscale
-- the museum wifi address — reachable by anyone on that wifi, which is what
-  the spec assumed and accepted
-- `0.0.0.0` — every interface, tailnet and wifi and anything else. Do not use
-  this while there is no authentication.
+It is an `Environment=` line rather than a literal in `ExecStart` because the
+five boxes each have their own Tailscale address (`Mami-Sound` .. `Mami-Sound5`
+in `~/.ssh/config`). Deploying to another box means changing one line, not
+editing the command.
+
+Binding the tailnet address and nothing else is what substitutes for the
+authentication this service does not have: the port is unreachable from the
+museum wifi, from the wired network, and from the internet. Two rules follow,
+and both are load-bearing:
+
+- **Never widen this to `0.0.0.0`** while there is no authentication. That
+  would expose delete-any-clip to everyone on the museum wifi.
+- **Never bind the museum wifi address** for the same reason.
+
+If staff who are not on the tailnet ever need the page, that is not a bind
+change -- it is a request for authentication, and it belongs in a new spec.
 
 - [ ] **Step 2: Deploy**
 
