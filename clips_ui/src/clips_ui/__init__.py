@@ -13,6 +13,7 @@ from clips_ui.folders import (
     is_audio,
     safe_target,
 )
+from clips_ui.protocol import Outcome, Result, new_request_id, read_result, write_request
 
 __all__ = [
     "SOURCES",
@@ -22,4 +23,9 @@ __all__ = [
     "folder_for",
     "safe_target",
     "is_audio",
+    "Outcome",
+    "Result",
+    "new_request_id",
+    "write_request",
+    "read_result",
 ]
