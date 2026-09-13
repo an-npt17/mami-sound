@@ -4,6 +4,7 @@ Runtime is Python standard library only -- this ships to a Raspberry Pi
 Zero 2 W with no pip.
 """
 
+from clips_ui.audio import is_decodable
 from clips_ui.folders import (
     AUDIO_EXTENSIONS,
     SOURCES,
@@ -23,6 +24,7 @@ __all__ = [
     "folder_for",
     "safe_target",
     "is_audio",
+    "is_decodable",
     "Outcome",
     "Result",
     "new_request_id",
