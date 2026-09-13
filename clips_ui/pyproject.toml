@@ -1,0 +1,21 @@
+[project]
+name = "clips-ui"
+version = "0.1.0"
+description = "Web UI backend for adding and removing mami-sound clip files without ssh."
+authors = [
+    { name = "an-npt17", email = "truongan1412@gmail.com" }
+]
+requires-python = ">=3.12"
+# Runtime is Python standard library only: this ships to a Raspberry Pi Zero
+# 2 W with no pip, so src/clips_ui/ may not depend on anything installed by
+# uv. pytest below is a dev-only dependency for running the test suite here.
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
