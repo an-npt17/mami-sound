@@ -106,4 +106,11 @@ pub fn build(b: *std.Build) void {
         "Run adapter tests from the adapter root",
     );
     adapter_test_step.dependOn(&run_adapters_tests.step);
+
+    // The detector and the drone are pure and depend on nothing outside
+    // `src/core/`, so a change to either can be checked without compiling the
+    // six other test binaries. On a machine that cannot hold twelve parallel
+    // LLVM jobs in memory, that is the difference between a loop and a wait.
+    const core_test_step = b.step("test-core", "Run core tests only");
+    core_test_step.dependOn(&run_core_tests.step);
 }

@@ -63,6 +63,14 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// How big a move a touch must be, in the counts the probe reads, per
+    /// probe. Unset keeps the measured preset; zero asks for no floor at all.
+    ///
+    /// On the command line for the same reason the thresholds are: the number
+    /// is a property of the rig on the day. A probe whose dropouts get worse
+    /// wants a higher floor, and finding that out should not want a rebuild.
+    counts: ?i16 = null,
+    counts_bc: ?i16 = null,
     /// Where a held probe sits, per plant, when the room can say. Both ends
     /// together or neither: half a band is a typo, not a setting.
     ///
@@ -153,6 +161,12 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
             opts.still_release = parseCounts(arg["--still-release=".len..]) orelse
                 return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts=")) {
+            opts.counts = parseFloor(arg["--counts=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts-b=")) {
+            opts.counts_bc = parseFloor(arg["--counts-b=".len..]) orelse
+                return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--still-window=")) {
             const ms = parseSeconds(arg["--still-window=".len..]) orelse
                 return Error.InvalidStillThreshold;
@@ -231,6 +245,14 @@ fn parseModel(name: []const u8) ?touch.Model {
     return null;
 }
 
+/// A floor in counts. Zero is the room asking for no floor, which is a setting
+/// and not a typo -- unlike `parseCounts`, where zero would mean a threshold
+/// nothing can clear. A negative move is not a move.
+fn parseFloor(text: []const u8) ?i16 {
+    const value = std.fmt.parseInt(i16, text, 10) catch return null;
+    return if (value >= 0) value else null;
+}
+
 /// A threshold in counts. Negative is not a range, and zero would latch on
 /// nothing at all, so both are refused rather than clamped.
 fn parseCounts(text: []const u8) ?i16 {
@@ -245,7 +267,7 @@ pub const usage =
     \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE] [--plant-b-band=LO:HI]
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS]
+    \\                  [--still-window=SECONDS] [--counts=N] [--counts-b=N]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--test-random-probe]
     \\
@@ -310,6 +332,17 @@ pub const usage =
     \\32 and 512. A hand actually holds a probe to about three counts; 32 is
     \\room for the dropouts this rig throws, and --still-range=10 is the number
     \\to use once the conversion reads come back clean.
+    \\
+    \\--counts and --counts-b are how big a move a touch has to be on each probe,
+    \\in the counts the status line's l0 and l1 show. `deviation` only.
+    \\
+    \\The score on its own cannot answer this: it divides a move by how much the
+    \\probe normally wanders, so a probe that goes quiet scores enormous
+    \\deviations on a move that is, in counts, nothing at all. This rig reads
+    \\plant A at 0 or 1 untouched and about 25000 under a hand, so its floor is
+    \\set well under the whole excursion -- a hand that only half connects still
+    \\counts. Zero asks for no floor and puts a probe back on the score alone;
+    \\left off, the measured default stands.
     \\
     \\--plant-a-band and --plant-b-band say where a hand puts that plant's probe,
     \\as LO:HI in counts. One each, because the two probes do not sit at the same
@@ -511,6 +544,8 @@ test "the usage banner names every flag the parser takes" {
         "--still-range=",
         "--still-release=",
         "--still-window=",
+        "--counts=",
+        "--counts-b=",
         "--test-random-probe",
     };
     const banner_end = std.mem.indexOf(u8, usage, "\nPLANTS").?;
@@ -592,4 +627,37 @@ test "a capture with no path or no time is refused" {
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture="}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=0"}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=-5"}));
+}
+
+test "each probe's counts floor can be set from the room" {
+    const opts = try parse(&.{ "--counts=2500", "--counts-b=15000" });
+    try std.testing.expectEqual(@as(i16, 2500), opts.counts.?);
+    try std.testing.expectEqual(@as(i16, 15000), opts.counts_bc.?);
+
+    // Left off, the measured preset stands rather than being overwritten with
+    // a number nobody chose.
+    const quiet = try parse(&.{});
+    try std.testing.expect(quiet.counts == null);
+    try std.testing.expect(quiet.counts_bc == null);
+}
+
+test "a floor of zero is the room asking for no floor" {
+    // Different from leaving the flag off: off keeps the preset, zero puts the
+    // probe back on the score alone. `parseCounts` refuses zero for the
+    // thresholds, where it would mean a line nothing can cross.
+    const opts = try parse(&.{ "--counts=0", "--counts-b=0" });
+    try std.testing.expectEqual(@as(i16, 0), opts.counts.?);
+    try std.testing.expectEqual(@as(i16, 0), opts.counts_bc.?);
+}
+
+test "a floor that is not a move is refused" {
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts=-1"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts-b=lots"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--counts="}));
+}
+
+test "one probe's floor may be set without the other's" {
+    const only_a = try parse(&.{"--counts=3000"});
+    try std.testing.expectEqual(@as(i16, 3000), only_a.counts.?);
+    try std.testing.expect(only_a.counts_bc == null);
 }

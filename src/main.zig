@@ -253,6 +253,7 @@ fn runComposition(
             opts.plant_band,
             opts.plant_window,
             held,
+            .{ .counts = opts.counts, .counts_bc = opts.counts_bc },
         ),
         probe.source(),
         sink_port,

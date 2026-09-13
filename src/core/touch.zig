@@ -82,8 +82,12 @@ pub const Mean = struct {
     }
 };
 
-/// The longest baseline worth keeping, about a hundred seconds of pushes.
-pub const max_baseline_samples = 1024;
+/// The longest baseline worth keeping, about seven minutes of pushes.
+///
+/// Pushes, not seconds: the deviation model only pushes while the probe is at
+/// rest, so this is seven minutes of nobody touching the plant however long the
+/// wall clock took to supply them.
+pub const max_baseline_samples = 4096;
 
 /// How many baseline samples a second. The median only has to track a probe's
 /// resting level, which moves over minutes; pushing every poll would need
@@ -157,6 +161,22 @@ pub const Baseline = struct {
         self.recompute();
     }
 
+    /// Throw the window away and measure again from the next reading.
+    ///
+    /// What a long hand leaves behind. The rest a probe returns to is not
+    /// always the rest it left: fifteen minutes of a hand at twenty-five
+    /// thousand warms an electrode and moves where it settles afterwards, and
+    /// samples taken before the hand describe a probe that no longer exists.
+    /// Dragging a three-thousand-sample median onto the new level takes
+    /// minutes; starting over takes the warmup.
+    pub fn clear(self: *Baseline) void {
+        self.count = 0;
+        self.head = 0;
+        self.since = 0;
+        self.base = 0;
+        self.mad = 0.0;
+    }
+
     /// Whether enough has arrived for the numbers to mean anything.
     pub fn ready(self: *const Baseline) bool {
         return self.count >= warmup_samples;
@@ -187,8 +207,17 @@ pub const default_hold_ms: f32 = 100.0;
 /// How long the reading is averaged over before the score sees it.
 pub const default_average_ms: f32 = 200.0;
 
-/// How long the median looks back.
-pub const default_baseline_s: f32 = 60.0;
+/// How long the median looks back, in seconds of rest.
+///
+/// Five minutes rather than the one this started with. Gating the pushes on
+/// rest is what makes the number affordable: a window of wall clock has to be
+/// short enough to follow a probe's drift and long enough that no hand fills
+/// half of it, and against ten-minute hands there is no number that is both. A
+/// window of rest has no such conflict -- hands are not in it -- so it can be
+/// long enough that a stray reading slipping through the gate on a slow release
+/// is one sample in three thousand, and still track drift, because drift only
+/// happens on the clock the window is now made of.
+pub const default_baseline_s: f32 = 300.0;
 
 /// How long the other probe is given to settle after this one is touched,
 /// before its crosstalk level is taken as its temporary rest.
@@ -334,6 +363,30 @@ pub const Window = union(enum) {
     ms: f32,
 };
 
+/// How long the deviation model holds an unlearned rest before it measures
+/// rest again wherever the probe now sits, in seconds.
+///
+/// The ceiling on everything the gating can get wrong. Rest is learned only
+/// while the probe is at rest, which is what lets a ten-minute hand be a hand
+/// rather than something the median swallows -- but it means a probe that never
+/// comes back never learns, and there are two ways that happens. A wrong latch
+/// is one. A hand that leaves the electrode somewhere new is the worse one:
+/// the probe reads four hundred where it used to read nought, the old median
+/// calls that a touch, and the touch never ends because the reading never
+/// moves.
+///
+/// Neither can be told apart from a hand that is genuinely still there --
+/// stillness at a level is stillness at a level, and no amount of looking at
+/// the readings separates them. Time is the only thing that does. So the
+/// number is a bet: longer than the longest hand the room expects, so a real
+/// hand is never cut off, and short enough that a probe which has gone wrong
+/// fixes itself while the room is still open.
+///
+/// Twenty minutes against holds of ten to fifteen. A hand that outlasts it
+/// stops sounding and rest is measured under the hand; a probe that drifted is
+/// deaf for at most this long after the hand that moved it.
+pub const default_baseline_stale_s: f32 = 1200.0;
+
 pub const Config = struct {
     sample_rate: u32,
     poll_frames: usize,
@@ -369,6 +422,9 @@ pub const Config = struct {
     hold_ms: f32 = default_hold_ms,
     average_ms: f32 = default_average_ms,
     baseline_s: f32 = default_baseline_s,
+    /// How long the deviation model may go without learning rest before it
+    /// learns regardless. `deviation` only.
+    baseline_stale_s: f32 = default_baseline_stale_s,
     settle_ms: f32 = default_settle_ms,
     /// Probe BC's own threshold and hold, when it wants asking a different
     /// question from A's. `null` gives it A's.
@@ -468,6 +524,11 @@ pub const Detector = struct {
     /// Set while the other probe has this one pulled off its rest. The score is
     /// then measured from where the pull left it, so only a further move counts.
     base_override: ?i16,
+    /// Polls the baseline has been held back for, and how many it may go before
+    /// the probe is taken to be stuck rather than held and rest is measured
+    /// where it now sits. `deviation` only.
+    held: u32,
+    stale_polls: u32,
     /// A move in counts that a touch must also clear, on top of the score.
     counts: ?i16,
     /// Polls an excursion may last and still be a tap. `null` latches instead.
@@ -521,6 +582,11 @@ pub const Detector = struct {
             .z = 0.0,
             .last_mean = 0,
             .base_override = null,
+            .held = 0,
+            .stale_polls = @max(
+                holdPolls(cfg.baseline_stale_s * 1000.0, cfg.sample_rate, cfg.poll_frames),
+                1,
+            ),
             .counts = cfg.counts,
             // A deviation-model idea, and only ever applied there. That model
             // reads an excursion that never comes back as drift, a probe
@@ -720,21 +786,64 @@ pub const Detector = struct {
         return true;
     }
 
+    /// Feed the median what rest looks like, and nothing else.
+    ///
+    /// A rolling median stays honest without any touch detection only while
+    /// touches take up less than half its window. Ten-minute hands do not, so
+    /// the median is told what to swallow: readings from a probe that is
+    /// unlatched, unblocked and back inside the release band. The window then
+    /// measures five minutes of rest rather than five minutes of wall clock,
+    /// and a hand of any length contributes nothing at all.
+    ///
+    /// A probe letting go resumes the window it had, and never starts a new
+    /// one. Throwing the window away means a warmup, and a warmup learns
+    /// whatever it is given: a hand coming back inside those three seconds is
+    /// learned as rest, and from then on the plant sounds when nobody is on it
+    /// and goes quiet under a hand. Hand after hand, that is what the room sees
+    /// as the effect reversing. There is nothing to gain against it either --
+    /// a probe that got back inside the release band has just shown the old
+    /// window to be right about where rest is.
+    ///
+    /// Circular only in appearance. The state doing the gating was decided by a
+    /// median with a warmup behind it, and the one way the gate could wedge shut
+    /// -- a probe that never comes back, drifted or wrongly latched -- is what
+    /// `stale_polls` is for. Past it the hand is not a hand: the window is
+    /// thrown away and rest is measured where the probe now sits, latch and all
+    /// forgotten. That resample can be given a hand to learn, which is why it
+    /// waits out a length no real hand lasts.
+    fn learnRest(self: *Detector, back: bool) void {
+        if (!self.on and !self.blocked and back) {
+            self.held = 0;
+            self.baseline.push(self.last_mean);
+            return;
+        }
+
+        self.held +|= 1;
+        if (self.held >= self.stale_polls) {
+            self.baseline.clear();
+            self.held = 0;
+            self.reset();
+        }
+    }
+
     /// One poll of the deviation model, which sets `on` and `at_rest`.
     ///
     /// Returns false when the baseline has nothing behind it yet, which is the
     /// one case where this model cannot answer at all.
     fn stepDeviation(self: *Detector, raw: i16) bool {
         self.last_mean = self.mean.push(raw);
-        self.baseline.push(self.last_mean);
 
         const denom = @max(self.baseline.mad, mad_floor);
         self.z = (@as(f32, @floatFromInt(self.last_mean)) -
             @as(f32, @floatFromInt(self.base()))) / denom;
 
         // Before the median has anything behind it the score is noise about
-        // noise, and acting on it would start a clip at power-on.
+        // noise, and acting on it would start a clip at power-on. Nothing is
+        // known well enough to be choosy about what gets learned yet, so the
+        // warmup takes every reading -- which is why the few seconds after
+        // power-on want nobody's hand on a plant.
         if (!self.baseline.ready()) {
+            self.baseline.push(self.last_mean);
             self.reset();
             return false;
         }
@@ -754,6 +863,7 @@ pub const Detector = struct {
         const back = @abs(self.z) < self.level / 2.0 and
             (self.counts == null or dev < @divTrunc(self.counts.?, 2));
         self.at_rest = back;
+        self.learnRest(back);
 
         // A hand that outlasted the window is still on the plant, and reads as
         // over the threshold for as long as it stays. Nothing may start again
@@ -1606,4 +1716,177 @@ test "the preset window is four hundred polls of the rig's poll rate" {
     const window: spread_mod.Spread =
         .init(default_still_window_ms, 44100, sensor_poll_frames);
     try std.testing.expectEqual(@as(u32, 400), window.len);
+}
+
+/// Polls a second, at the size the engine runs the detector at.
+const poll_rate: usize = 345;
+
+/// A probe at rest on the deviation rig: a couple of counts of wobble, which is
+/// what gives the median something to measure a deviation against.
+fn restingWobble(poll: usize) i16 {
+    return if (poll % 3 == 0) 4 else -4;
+}
+
+/// The same wobble around a hand's level.
+fn heldWobble(poll: usize) i16 {
+    return if (poll % 3 == 0) 3004 else 2996;
+}
+
+test "the deviation model holds a hand that outlasts the baseline window" {
+    // The fault this rig actually shows: the median is a minute long, a hand
+    // stays for three, and after thirty seconds the hand is most of the window.
+    // The median walks onto the hand, the score falls to nothing, and the probe
+    // reads itself back to rest with somebody still holding the plant.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+
+    const held_polls = 180 * poll_rate;
+    var polls_reported: usize = 0;
+    for (0..held_polls) |poll| {
+        if (detector.update(heldWobble(poll))) polls_reported += 1;
+    }
+
+    try std.testing.expect(detector.on);
+    try std.testing.expect(polls_reported > held_polls * 95 / 100);
+}
+
+test "a probe is at rest again once a long hand comes off" {
+    // The other half of the same fault. A median that learned the hand is a
+    // median measuring rest as an excursion, so letting go reads as a touch --
+    // which on plant B starts a recording nobody asked for.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+    for (0..180 * poll_rate) |poll| _ = detector.update(heldWobble(poll));
+
+    var polls_reported: usize = 0;
+    for (0..5 * poll_rate) |poll| {
+        if (detector.update(restingWobble(poll))) polls_reported += 1;
+    }
+
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.at_rest);
+    // The hand let go once, so the latch falls once. Nothing fires on the way
+    // back down.
+    try std.testing.expect(polls_reported < poll_rate);
+}
+
+test "a long hand at the level this rig reads is held for all of it" {
+    // The rig's own numbers: a hand puts the probe near twenty-five thousand
+    // and leaves it there for a quarter of an hour. Every sample of that is a
+    // sample the median must not take.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+
+    const held_polls = 15 * 60 * poll_rate;
+    var polls_reported: usize = 0;
+    for (0..held_polls) |poll| {
+        const raw: i16 = if (poll % 3 == 0) 25004 else 24996;
+        if (detector.update(raw)) polls_reported += 1;
+    }
+
+    try std.testing.expect(detector.on);
+    try std.testing.expect(polls_reported > held_polls * 95 / 100);
+}
+
+test "a hand that leaves the probe somewhere new does not deafen it for good" {
+    // The failure the resample exists for. Fifteen minutes of a hand moves
+    // where the electrode settles, so the probe comes back to four hundred
+    // rather than nought. Measured against a median full of samples from
+    // before the hand, that is a touch -- and one that never ends, because the
+    // reading never moves again.
+    //
+    // Nothing in the readings tells this from a hand still sitting there, so
+    // the ceiling is what ends it: past it, rest is measured where the probe
+    // now is. Shortened here to keep the test quick; in the room it is twenty
+    // minutes.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    cfg.baseline_stale_s = 60.0;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+    for (0..30 * poll_rate) |poll| {
+        _ = detector.update(if (poll % 3 == 0) 25004 else 24996);
+    }
+    try std.testing.expect(detector.on);
+
+    // The hand comes off, and the probe does not return to where it was.
+    const drifted = struct {
+        fn read(poll: usize) i16 {
+            return if (poll % 3 == 0) 404 else 396;
+        }
+    }.read;
+    for (0..90 * poll_rate) |poll| _ = detector.update(drifted(poll));
+
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.at_rest);
+
+    // And it hears the next hand, measured against the rest it actually has.
+    for (0..5 * poll_rate) |poll| {
+        _ = detector.update(if (poll % 3 == 0) 25004 else 24996);
+    }
+    try std.testing.expect(detector.on);
+}
+
+test "hand after hand does not end up with the answer inside out" {
+    // The fault the room reports: hold the plant over and over and at some
+    // point the effect reverses -- the plant sounds when nobody is on it and
+    // goes quiet under a hand. That is the median having learned the hand as
+    // rest, and once it has, every reading means the opposite of what it says.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+
+    // Twenty hands of a minute each, let go of for barely a third of a second
+    // between them -- less than the median's warmup, which is what made the
+    // answer turn over when letting go threw the window away.
+    for (0..20) |_| {
+        for (0..60 * poll_rate) |poll| {
+            _ = detector.update(if (poll % 3 == 0) 25004 else 24996);
+        }
+        for (0..poll_rate / 3) |poll| _ = detector.update(restingWobble(poll));
+    }
+
+    // A plant nobody is touching is silent.
+    for (0..5 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+    try std.testing.expect(!detector.on);
+
+    // And the next hand is still heard.
+    for (0..5 * poll_rate) |poll| {
+        _ = detector.update(if (poll % 3 == 0) 25004 else 24996);
+    }
+    try std.testing.expect(detector.on);
+}
+
+test "a probe that never comes back to rest learns anyway in the end" {
+    // Learning only at rest is what saves the ten-minute hand, and it is also
+    // how a probe goes deaf: one that has genuinely drifted, or latched by
+    // mistake, is never at rest again and would refuse to learn forever. The
+    // refusal expires, the median drags onto the new level, and the probe
+    // hears the next hand.
+    var cfg = deviationConfig();
+    cfg.hold = true;
+    cfg.baseline_stale_s = 20.0;
+    var detector: Detector = .init(cfg);
+
+    for (0..70 * poll_rate) |poll| _ = detector.update(restingWobble(poll));
+
+    // Well inside the refusal: still reading the drift as a hand.
+    for (0..15 * poll_rate) |poll| _ = detector.update(heldWobble(poll));
+    try std.testing.expect(detector.on);
+
+    for (0..120 * poll_rate) |poll| _ = detector.update(heldWobble(poll));
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.at_rest);
 }
