@@ -15,6 +15,7 @@ from clips_ui.folders import (
     safe_target,
 )
 from clips_ui.protocol import Outcome, Result, new_request_id, read_result, write_request
+from clips_ui.staging import Pending, Staging, WouldEmptyPool
 
 __all__ = [
     "SOURCES",
@@ -30,4 +31,7 @@ __all__ = [
     "new_request_id",
     "write_request",
     "read_result",
+    "Pending",
+    "Staging",
+    "WouldEmptyPool",
 ]
