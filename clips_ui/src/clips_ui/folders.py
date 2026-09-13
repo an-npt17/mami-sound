@@ -72,6 +72,20 @@ class UnsafeName(Exception):
     """Raised when a filename could not be trusted to stay inside its folder."""
 
 
+def _is_control_character(char: str) -> bool:
+    """Whether ``char`` is a C0 or C1 control character.
+
+    Covers ``\x00``-``\x1f`` (NUL, newline, tab, escape, ...) and
+    ``\x7f``-``\x9f`` (DEL and the C1 set). These are never legitimate in a
+    filename an upload names itself, and are a live risk one layer up from
+    this module -- e.g. header injection in an HTTP response, or breaking a
+    naive log line or directory listing -- even though they cannot by
+    themselves defeat the containment check below.
+    """
+    code_point = ord(char)
+    return code_point < 0x20 or 0x7F <= code_point <= 0x9F
+
+
 def folder_for(root: Path, source: str) -> Path:
     """The folder a source's clips live in, under ``root``.
 
@@ -103,6 +117,22 @@ def safe_target(root: Path, source: str, filename: str) -> Path:
     by inspection first (any of the checks below), and only then is the
     result resolved and re-checked for containment in the target folder.
 
+    What this function guarantees: the returned path is contained in
+    ``source``'s folder (no traversal out of it, however the input is
+    spelled), and the filename carries no C0 or C1 control character (no
+    embedded newline, tab, or other byte a naive HTTP header, log line, or
+    directory listing would not expect).
+
+    What this function does NOT guarantee: it is not HTML-escaping, not
+    shell-quoting, and not a substitute for correct escaping at whatever
+    layer renders or shells out with the name later. Shell metacharacters
+    ($, backticks, parentheses, spaces, quotes) are deliberately accepted --
+    they occur in real audio filenames (this project's own folders are
+    named things like ``Trad Vn Jam`` and ``EPiano Stems``) -- so a caller
+    that passes a filename to a shell or an HTML template must quote or
+    escape it there; banning characters here would not help that caller and
+    would reject legitimate names.
+
     Args:
         root: As for :func:`folder_for`.
         source: As for :func:`folder_for`.
@@ -117,14 +147,16 @@ def safe_target(root: Path, source: str, filename: str) -> Path:
     Raises:
         UnknownSource: as :func:`folder_for`.
         UnsafeName: if ``filename`` is empty, ``.``, ``..``, contains a NUL
-            byte, contains a path separator (so it cannot name a directory
-            component), starts with ``.`` (hidden files and macOS resource
-            forks are never a legitimate upload name), or -- after all of
-            that -- still does not resolve inside the target folder.
+            byte or any other C0/C1 control character (``\x00``-``\x1f``,
+            ``\x7f``-``\x9f`` -- covers newlines, tabs, and escape), contains
+            a path separator (so it cannot name a directory component),
+            starts with ``.`` (hidden files and macOS resource forks are
+            never a legitimate upload name), or -- after all of that --
+            still does not resolve inside the target folder.
     """
     folder = folder_for(root, source)
 
-    if "\x00" in filename:
+    if any(_is_control_character(c) for c in filename):
         raise UnsafeName(filename)
 
     name = Path(filename).name

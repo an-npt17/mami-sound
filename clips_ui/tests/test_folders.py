@@ -42,6 +42,20 @@ def test_traversal_is_refused(evil: str) -> None:
         safe_target(Path("/srv"), "piano", evil)
 
 
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "evil\ntrack.mp3",  # embedded newline -- header/log-line injection one layer up
+        "evil\ttrack.mp3",  # embedded tab
+        "evil\x7ftrack.mp3",  # DEL
+        "\x1b",  # bare escape
+    ],
+)
+def test_control_characters_are_refused(evil: str) -> None:
+    with pytest.raises(UnsafeName):
+        safe_target(Path("/srv"), "piano", evil)
+
+
 def test_a_plain_name_lands_in_its_folder() -> None:
     assert safe_target(Path("/srv"), "piano", "new.mp3") == Path("/srv/EPiano Stems/new.mp3")
 
