@@ -10,7 +10,10 @@ request's answer.
 """
 
 import json
+import re
+from datetime import UTC, datetime
 
+import clips_ui.protocol as protocol
 from clips_ui.protocol import Outcome, Result, new_request_id, read_result, write_request
 
 
@@ -55,14 +58,31 @@ def test_no_result_file_yet_reads_as_not_ready(tmp_path):
     assert read_result(tmp_path, "id-1") is None
 
 
-def test_new_request_id_sorts_chronologically_and_does_not_collide():
+def test_new_request_id_has_a_timestamp_prefix_and_a_random_suffix():
+    id_ = new_request_id()
+    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{6}", id_)
+
+
+def test_new_request_id_does_not_collide_within_the_same_second():
     ids = {new_request_id() for _ in range(50)}
-    assert len(ids) == 50  # no collisions among 50 rapid calls
-    assert sorted(ids) == sorted(ids, key=lambda i: i)  # each id itself sorts lexicographically
-    # A later id sorts after an earlier one when timestamps differ.
+    assert len(ids) == 50
+
+
+def test_new_request_id_sorts_chronologically(monkeypatch):
+    class _FixedClock:
+        def __init__(self, moments):
+            self._moments = iter(moments)
+
+        def now(self, tz):
+            return next(self._moments)
+
+    earlier = datetime(2026, 9, 13, 18, 53, 1, tzinfo=UTC)
+    later = datetime(2026, 9, 13, 18, 53, 2, tzinfo=UTC)
+    monkeypatch.setattr(protocol, "datetime", _FixedClock([earlier, later]))
+
     first = new_request_id()
     second = new_request_id()
-    assert first < second or first[:15] == second[:15]
+    assert first < second
 
 
 def test_write_request_uses_no_leftover_tmp_file_on_repeated_writes(tmp_path):
