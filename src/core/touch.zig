@@ -891,7 +891,6 @@ pub const Detector = struct {
             return false;
         }
 
-        const range = self.spread.range;
         const level = self.spread.level;
 
         // The window's own middle, fed to the long median. Not the raw reading:
@@ -942,11 +941,24 @@ pub const Detector = struct {
             // hand of the evening is answered on this, and teaches the rest.
             clampedAbsDiff(level, rest) >= self.still_move;
 
-        // Still, as well as elsewhere. A probe wandering the whole range is
-        // away from rest for most of the window and is not a hand: it is a
-        // probe with nothing connected to it.
-        const held = range <= self.still_range and away;
-        const loose = range >= self.still_release or !away;
+        // The count is the whole test, and stillness is not asked at all.
+        //
+        // The other two models ask it because they have to: told nothing about
+        // where a hand puts the probe, stillness is the only thing separating a
+        // hand from a probe wandering past the right level. Here the band is
+        // known, so the share answers that on its own -- a probe flipping
+        // between the two rails spends about half the window past the line and
+        // cannot reach three fifths, while a hand holding it there spends
+        // nearly all of it.
+        //
+        // And stillness is the one thing this rig will not give. A held probe
+        // here reads its level, throws the far rail, and comes back, over and
+        // over: on the room's own journal plant A ran 25886, 735, 10, 12, 25886
+        // through a single touch. Between percentiles that is a range of the
+        // full scale, so a stillness gate is not merely strict on this rig --
+        // it can never open, and the plant is deaf for the evening.
+        const held = away;
+        const loose = !away;
         self.at_rest = loose;
 
         return self.settle(held, loose);
@@ -2226,4 +2238,36 @@ test "the first hand of the evening is answered before any rig is known" {
     for (0..rest_warmup) |poll| _ = detector.update(restingAt(0, poll));
     for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
     try std.testing.expect(detector.on);
+}
+
+/// The rig as the room's journal actually shows it: a probe that flips between
+/// the two rails from one reading to the next, touched or not. `share` is how
+/// much of the time it sits at the far rail.
+fn flipping(poll: usize, rest: i16, far: i16, share: usize) i16 {
+    return if (poll % 10 < share) far + @as(i16, if (poll % 3 == 0) 2 else -2) else rest;
+}
+
+test "a probe flailing between the rails with nobody on it stays quiet" {
+    // Plant A on the journal, untouched: 25886, 735, 10, 12, 25886, 9, 1, 25616.
+    // A third of its readings are at the far rail and it is still nobody. A
+    // model that answered this would sound all evening with an empty room.
+    var detector: Detector = .init(learnedConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    try std.testing.expect(!detector.on);
+}
+
+test "a hand on a probe that drops out half the time is still a hand" {
+    // The same rig with somebody holding it: the probe still throws the home
+    // rail constantly, but it is at the far one far more of the time than not.
+    // Between percentiles both look identical -- full scale either way -- which
+    // is why stillness cannot be the question here and the share is.
+    var detector: Detector = .init(learnedConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 8));
+    try std.testing.expect(detector.on);
+
+    // And it goes quiet again when the hand comes off.
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    try std.testing.expect(!detector.on);
 }
