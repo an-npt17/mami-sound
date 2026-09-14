@@ -1,7 +1,6 @@
 //! Box 5. Probe B reads the supply rail and drops toward ground about one poll
 //! in fifteen, so its floor is read in counts rather than in deviations.
 
-const core = @import("../../core/root.zig");
 const defaults = @import("defaults.zig");
 
 /// Measured over fourteen seconds of the journal: probe B's rest reached 4.4
@@ -45,4 +44,15 @@ test "the floors clear what the rig's rest actually does" {
     const touch_move_bc: i16 = 23977;
     try std.testing.expect(preset.touch.counts.? < touch_move_a);
     try std.testing.expect(preset.touch.counts_bc.? < touch_move_bc);
+}
+
+test "the span is the move plant A's probe actually makes" {
+    // Not a ratio of the floor: the span is the deviation that should reach the
+    // top of the pitch range, so it is the move itself. Plant A's touch takes
+    // its probe from about 16300 up past 25000. The branch left this at the
+    // core default of 3000, under this rig's own floor of 4000, where every
+    // touch that counted at all arrived at the top of the range -- which is the
+    // one thing the drone must not do.
+    const touch_move_a: i16 = 8674;
+    try std.testing.expectEqual(touch_move_a, preset.drone.span);
 }

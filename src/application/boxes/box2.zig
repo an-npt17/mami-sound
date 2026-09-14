@@ -1,6 +1,5 @@
 //! Box 2. Probe A behaves as a switch rather than as a sensor.
 
-const core = @import("../../core/root.zig");
 const defaults = @import("defaults.zig");
 
 /// How big a move a touch must be, in the counts the probe actually reads.
