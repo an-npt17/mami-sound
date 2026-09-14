@@ -3,6 +3,7 @@ const clips = @import("core/clips.zig");
 const source = @import("core/source.zig");
 const touch = @import("core/touch.zig");
 const select = @import("core/select.zig");
+const boxes = @import("application/boxes/root.zig");
 
 pub const Error = error{
     UnknownFlag,
@@ -15,6 +16,7 @@ pub const Error = error{
     InvalidTouchModel,
     InvalidStillThreshold,
     InvalidCapture,
+    InvalidBox,
     TooManyArguments,
 } || select.Error;
 
@@ -83,6 +85,13 @@ pub const Options = struct {
     capture_buf: [path_max]u8 = undefined,
     capture_len: usize = 0,
     capture_s: f32 = default_capture_s,
+    /// Which box's measured numbers to run, where the room said so. `null` is
+    /// the room not having said, and the hostname is asked instead.
+    ///
+    /// On the command line rather than compiled in because one binary serves
+    /// all five Pis: a bench can then run box 5's floors against box 5's
+    /// capture without a cross-build, and a deploy is the same everywhere.
+    box: ?boxes.Box = null,
 
     /// The capture path, or null in a run that is not measuring the rig.
     pub fn capture(self: *const Options) ?[]const u8 {
@@ -176,6 +185,8 @@ pub fn parse(args: []const []const u8) Error!Options {
             // The shorthand the flag had when it was a switch, kept so a unit
             // file already passing it keeps starting.
             opts.plant_sources[0] = .daybird;
+        } else if (std.mem.startsWith(u8, arg, "--box=")) {
+            opts.box = parseBox(arg["--box=".len..]) orelse return Error.InvalidBox;
         } else if (std.mem.eql(u8, arg, "--test-random-probe")) {
             opts.test_random_probe = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -239,6 +250,15 @@ fn parseMode(name: []const u8) ?clips.Mode {
     return std.meta.stringToEnum(clips.Mode, name);
 }
 
+/// A box by its number: `--box=3` rather than `--box=box3`, because the number
+/// is what is written on the lid.
+fn parseBox(text: []const u8) ?boxes.Box {
+    if (text.len != 1) return null;
+    const which = std.fmt.parseInt(u8, text, 10) catch return null;
+    if (which < 1 or which > 5) return null;
+    return @enumFromInt(which - 1);
+}
+
 fn parseModel(name: []const u8) ?touch.Model {
     if (std.mem.eql(u8, name, "deviation")) return .deviation;
     if (std.mem.eql(u8, name, "steady")) return .steady;
@@ -269,6 +289,7 @@ pub const usage =
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--still-window=SECONDS] [--counts=N] [--counts-b=N]
     \\                  [--capture=PATH] [--capture-seconds=N]
+    \\                  [--box=N]
     \\                  [--test-random-probe]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
@@ -278,6 +299,14 @@ pub const usage =
     \\
     \\--device selects the ALSA device for aplay. It defaults to `default`.
     \\Use `aplay -l` to list cards; for example, `plughw:0,0`.
+    \\
+    \\--box is which of the five installations this is, 1 to 5. It picks the
+    \\numbers that box's rig was measured at: the counts floor each probe needs,
+    \\how far the drone's pitch spends its range, and what each plant plays.
+    \\Left off, the hostname is read -- box3, box3.local and box3-pi are all
+    \\box 3 -- and a machine that is none of the five runs the unmeasured
+    \\defaults and says so on the loading line. Every other flag still wins over
+    \\whatever the box says.
     \\
     \\--plant-a and --plant-b each name what that plant plays. Either plant
     \\takes any of them:
@@ -704,4 +733,25 @@ test "one probe's floor may be set without the other's" {
     const only_b = try parse(&.{"--counts-b=12000"});
     try std.testing.expect(only_b.counts == null);
     try std.testing.expectEqual(@as(i16, 12000), only_b.counts_bc.?);
+}
+
+test "a room names its box on the command line" {
+    const opts = try parse(&.{"--box=3"});
+    try std.testing.expectEqual(boxes.Box.box3, opts.box.?);
+}
+
+test "no --box is the room not having said, which is not the same as box 1" {
+    const opts = try parse(&.{});
+    try std.testing.expect(opts.box == null);
+}
+
+test "a box that does not exist is refused rather than rounded" {
+    // Six boxes would be a typo and zero would be a misreading of the range.
+    // Either one silently answered with box1's floors is a rig running numbers
+    // measured somewhere else, which is the fault this whole directory exists
+    // to stop.
+    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=6"}));
+    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=0"}));
+    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box="}));
+    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=two"}));
 }
