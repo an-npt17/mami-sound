@@ -29,16 +29,12 @@ fn clampedAbsDiff(a: i16, b: i16) i16 {
 
 /// One reading offset by another, saturating rather than wrapping.
 ///
-/// Rest plus a margin runs off the end of the type on a rig whose probe rests
-/// at a rail, and a band edge that wrapped to the far rail would call the whole
-/// range a touch.
+/// A line drawn halfway between rest and a rail runs off the end of the type on
+/// a rig whose probe rests at one, and an edge that wrapped to the far rail
+/// would call the whole range a touch.
 fn saturatingAdd(value: i16, delta: i16) i16 {
     const sum = @as(i32, value) + @as(i32, delta);
-    return @intCast(std.math.clamp(
-        sum,
-        std.math.minInt(i16),
-        std.math.maxInt(i16),
-    ));
+    return @intCast(std.math.clamp(sum, std.math.minInt(i16), std.math.maxInt(i16)));
 }
 
 /// The longest window worth averaging over, about three seconds of polls.
@@ -136,6 +132,16 @@ pub const Baseline = struct {
     since: u32,
     /// The median, recomputed on each push and held between them.
     base: i16,
+    /// The two levels the window actually holds, on the same schedule.
+    ///
+    /// A probe in this piece lives at one level and is taken to another by a
+    /// hand. Over minutes the window therefore holds two clusters, and these
+    /// are their ends: the untouched one is whichever is nearer the median,
+    /// because nobody holds a plant for most of an evening, and the other is
+    /// where a touch goes. That is how a rig can be read off the probe instead
+    /// of measured with a meter and typed in.
+    low: i16,
+    high: i16,
     /// The median absolute deviation, on the same schedule.
     mad: f32,
     /// While set, readings are dropped rather than learned. Crosstalk must not
@@ -156,6 +162,8 @@ pub const Baseline = struct {
             .decim = @intFromFloat(decim),
             .since = 0,
             .base = 0,
+            .low = 0,
+            .high = 0,
             .mad = 0.0,
             .frozen = false,
         };
@@ -188,6 +196,8 @@ pub const Baseline = struct {
         self.head = 0;
         self.since = 0;
         self.base = 0;
+        self.low = 0;
+        self.high = 0;
         self.mad = 0.0;
     }
 
@@ -201,6 +211,12 @@ pub const Baseline = struct {
         @memcpy(self.scratch[0..n], self.samples[0..n]);
         std.mem.sort(i16, self.scratch[0..n], {}, std.sort.asc(i16));
         self.base = self.scratch[n / 2];
+        // The two levels the probe actually visits, off the sort the median
+        // needed anyway. Taken inside the ends rather than at them, because the
+        // extremes of a long window are a dropout and a rail rather than a
+        // level the probe ever sits at.
+        self.low = self.scratch[n * level_percentile / 100];
+        self.high = self.scratch[@min(n * (100 - level_percentile) / 100, n - 1)];
 
         for (self.scratch[0..n], self.samples[0..n]) |*out, sample| {
             out.* = clampedAbsDiff(sample, self.base);
@@ -253,7 +269,13 @@ const mad_floor: f32 = 25.0;
 /// on it and it flails over the whole range and slams the rails, and a hand
 /// clamps it to about 660 counts and holds it there. There the touch is the
 /// stillness, and a rolling median of the flailing is a number about nothing.
-pub const Model = enum { deviation, steady };
+/// Where the two levels a rig shows are taken from, as a percentile of the
+/// long window. A twentieth in from each end: far enough past a dropout or a
+/// rail to be a level the probe genuinely sits at, near enough the end that a
+/// touch occupying a tenth of an evening is still found.
+const level_percentile: u32 = 5;
+
+pub const Model = enum { deviation, steady, learned };
 
 /// How wide the window the `steady` model measures a probe's spread over.
 ///
@@ -698,7 +720,9 @@ pub const Detector = struct {
     pub fn compared(self: *const Detector) i16 {
         return switch (self.model) {
             .deviation => self.last_mean,
-            .steady => self.spread.level,
+            // Both window models are looking at the middle of the window, so
+            // the status line shows the same thing for either.
+            .steady, .learned => self.spread.level,
         };
     }
 
@@ -724,6 +748,15 @@ pub const Detector = struct {
             // ran and never fall home -- the release would be a gate closing
             // over a pitch that never moved.
             .steady => if (self.on) @max(self.spread.level, 0) else 0,
+            // How far the hand has taken the probe from where it lives. This
+            // model knows both, so the pitch can be the distance rather than
+            // the level -- a rig that rests at a rail and one that rests at
+            // nought then answer a hand the same way round, which the raw
+            // level could not do.
+            .learned => if (self.on)
+                clampedAbsDiff(self.spread.level, self.baseline.base)
+            else
+                0,
         };
     }
 
@@ -774,45 +807,24 @@ pub const Detector = struct {
                 self.reset();
                 return false;
             }
-            // Rest is known now, so the band can be built from it rather than
-            // typed in. A touch is the window being further than `still_move`
-            // from where the probe lives, on either side: up on a rig whose
-            // hand boosts the probe, down on one whose hand pulls it to
-            // ground, and either way on a plant that rests in the middle.
-            self.spread.watchRest(
-                saturatingAdd(self.baseline.base, -self.still_move),
-                saturatingAdd(self.baseline.base, self.still_move),
-            );
         }
 
-        // Either way the question is a count over the last window, and either
-        // way a rail thrown through a perfectly good touch costs one reading of
-        // it -- where a median and a spread survive that only as far as the
-        // percentiles' margin.
+        const level = self.spread.level;
+
+        // Told where a hand puts the probe, the question is how much of the
+        // last second was there. One count, which a rail thrown through a
+        // perfectly good touch cannot move much -- where a median and a spread
+        // survive that only up to the margin the percentiles leave.
         //
-        // What differs is only who drew the band. Told one, it is where a hand
-        // puts the probe and the count is of the window inside it. Told
-        // nothing, rest is learned and the band is drawn around it, and the
-        // count is of the window anywhere else.
+        // Told nothing, the probe has to be still and somewhere other than
+        // where it rests, because neither of those says anything on its own: a
+        // probe with nothing connected to it is stiller than any hand could
+        // hold one, and a probe wandering past the right level is not a hand.
         const away = if (banded)
             self.spread.inside >= self.band_share
         else
-            // The same counting question as a told band, asked of a learned
-            // rest: how much of the last window was the probe somewhere it does
-            // not live. A median of the window said only where the middle of it
-            // was, which a hand that drops out one poll in fifteen drags back
-            // to rest -- and a range over that window is the dropout's full
-            // height, which reads as nobody there. Neither survives this rig;
-            // a count does.
-            self.spread.outside >= self.band_share;
+            clampedAbsDiff(level, self.baseline.base) >= self.still_move;
 
-        // Still, as well as somewhere it does not live. Dropping the stillness
-        // test looked tempting once the count replaced the median -- the count
-        // is what survives a dropout -- but the two are not the same question.
-        // A probe wandering the whole range is outside rest for most of the
-        // window and is not a hand; it is a probe with nothing connected to it.
-        // Told a band, where the room has said what a touch looks like, being
-        // in it is enough. Left to learn, being away from rest is not.
         const held = if (banded) away else range <= self.still_range and away;
         // And let go once it is wandering again, or once it is no longer where
         // a held probe sits.
@@ -828,6 +840,15 @@ pub const Detector = struct {
         const loose = range >= self.still_release or !away;
         self.at_rest = loose;
 
+        return self.settle(held, loose);
+    }
+
+    /// Move the latch on one poll's answer, and say whether the poll counted.
+    ///
+    /// Shared by every model that judges a window rather than a score: the
+    /// hysteresis is the same question wherever the two booleans came from, and
+    /// two copies of it would be two places for a release to rot.
+    fn settle(self: *Detector, held: bool, loose: bool) bool {
         if (self.blocked) {
             if (loose) self.blocked = false;
             self.count = 0;
@@ -847,6 +868,88 @@ pub const Detector = struct {
             if (self.dropped == self.drop) self.on = false;
         }
         return true;
+    }
+
+    /// The model that is told nothing at all.
+    ///
+    /// `steady` asks how tightly the window clusters and needs a band before it
+    /// can say where; `deviation` asks how far the probe moved from its own
+    /// past and needs a rest it can only learn while it is already right. Both
+    /// want a number from the room first. This one reads the rig off the probe:
+    /// a plant in this piece lives at one level and is taken to another by a
+    /// hand, so over minutes the long window holds two clusters, and which of
+    /// them is rest is decided by which the probe keeps coming back to.
+    ///
+    /// The four shapes a rig takes are then one question. Rest at nought and a
+    /// hand at twenty-five thousand, rest at twenty-five thousand and a hand
+    /// pulling to ground, rest in the middle thrown either way: the far
+    /// cluster is wherever it is, and the line between them is halfway.
+    fn stepLearned(self: *Detector, raw: i16) bool {
+        self.spread.push(raw);
+        if (!self.spread.ready()) {
+            self.reset();
+            return false;
+        }
+
+        const range = self.spread.range;
+        const level = self.spread.level;
+
+        // The window's own middle, fed to the long median. Not the raw reading:
+        // a rail thrown through a good touch would otherwise be a sample of
+        // where this probe lives.
+        // Never frozen, unlike the other two models. They freeze because they
+        // learn only rest, and a window that kept taking samples through a
+        // hand would learn the hand. This one has to see BOTH levels -- a
+        // frozen window holds one cluster and can never find the other, and
+        // the line between them is the whole method.
+        //
+        // Safe because the median is the thing being protected, and a median
+        // survives anything that takes up less than half the window. Five
+        // minutes of window against the longest hand a room has ever given a
+        // plant is not close.
+        self.baseline.push(level);
+        if (self.baseline.count < self.rest_samples) {
+            self.reset();
+            return false;
+        }
+
+        // Which end a hand takes this probe to, and the line between there and
+        // home. Whichever of the two levels sits further from where the probe
+        // keeps returning is the touched one -- that is the whole of the
+        // detection, and it needs nobody to say which way the rig goes.
+        const rest = self.baseline.base;
+        const up = clampedAbsDiff(self.baseline.high, rest);
+        const down = clampedAbsDiff(self.baseline.low, rest);
+        const reach = @max(up, down);
+
+        const away = if (reach >= self.still_move) blk: {
+            // A touch has been seen, so the rig is known and the question is a
+            // count: how much of the last window was past the halfway line.
+            // Counted rather than measured, because a hand that drops out one
+            // poll in fifteen has a median dragged home and a range the height
+            // of the dropout, and neither reads as the hand that is there.
+            const half = @divTrunc(reach, 2);
+            if (up >= down) {
+                self.spread.watch(saturatingAdd(rest, half), null);
+            } else {
+                self.spread.watch(null, saturatingAdd(rest, -half));
+            }
+            break :blk self.spread.inside >= self.band_share;
+        } else
+            // Nobody has touched it yet, so there is no second cluster to find
+            // and no line to draw. Until there is, a touch is the plain thing:
+            // the window sitting somewhere the probe does not live. The first
+            // hand of the evening is answered on this, and teaches the rest.
+            clampedAbsDiff(level, rest) >= self.still_move;
+
+        // Still, as well as elsewhere. A probe wandering the whole range is
+        // away from rest for most of the window and is not a hand: it is a
+        // probe with nothing connected to it.
+        const held = range <= self.still_range and away;
+        const loose = range >= self.still_release or !away;
+        self.at_rest = loose;
+
+        return self.settle(held, loose);
     }
 
     /// Feed the median what rest looks like, and nothing else.
@@ -976,6 +1079,7 @@ pub const Detector = struct {
         switch (self.model) {
             .deviation => if (!self.stepDeviation(raw)) return false,
             .steady => if (!self.stepSteady(raw)) return false,
+            .learned => if (!self.stepLearned(raw)) return false,
         }
 
         // The tap layer is the same question of either model: did the state go
@@ -2031,26 +2135,26 @@ test "each probe carries its own floor" {
     try std.testing.expectEqual(@as(i16, 4000), shared.forBc().counts.?);
 }
 
+fn learnedConfig() Config {
+    return .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+    };
+}
+
 /// A probe sitting at a level with the couple of counts of wobble any real one
 /// has. Flat enough to be still, alive enough not to be a fixture nobody has
 /// wired up.
 fn restingAt(level: i16, poll: usize) i16 {
-    return level + @as(i16, if (poll % 3 == 0) 2 else -2);
-}
-
-/// Settle a detector at a level of the caller's choosing, so what it learns as
-/// rest is that level rather than the fixture's own.
-fn settleAt(detector: *Detector, level: i16) void {
-    for (0..rest_warmup) |poll| _ = detector.update(restingAt(level, poll));
+    return level +% @as(i16, if (poll % 3 == 0) 2 else -2);
 }
 
 test "a touch is answered wherever the probe rests and whichever way it goes" {
-    // The four shapes a rig in this piece actually takes, which used to be four
-    // different things to configure and are now one question. Rest is learned,
-    // the band is drawn around it, and a touch is the window spending itself
-    // somewhere the probe does not live -- so which side of rest the hand takes
-    // it, and whether rest is a rail or the middle of the range, is not
-    // something anybody has to tell the program.
+    // The four shapes a rig in this piece takes, which used to be four things
+    // to measure and type in. Nothing here is configured: the model finds the
+    // two levels the probe visits, decides which one it lives at by which it
+    // keeps returning to, and puts the line halfway between.
     //
     //     rest ~0      ->  touch ~25000
     //     rest ~25000  ->  touch ~0
@@ -2067,32 +2171,59 @@ test "a touch is answered wherever the probe rests and whichever way it goes" {
         const rest = rig[0];
         const touch = rig[1];
 
-        var detector: Detector = .init(steadyConfig());
-        settleAt(&detector, rest);
-        // Nobody there yet, however long it has been sitting.
+        var detector: Detector = .init(learnedConfig());
+        for (0..rest_warmup) |poll| _ = detector.update(restingAt(rest, poll));
         try std.testing.expect(!detector.on);
 
         for (0..steady_warmup) |poll| _ = detector.update(restingAt(touch, poll));
         try std.testing.expect(detector.on);
 
-        // And the hand comes off again. A rig that latches and never lets go is
-        // the fault this model was reached for in the first place.
+        // And it lets go. A rig that latches and never releases is the fault
+        // this model was reached for.
         for (0..steady_warmup) |poll| _ = detector.update(restingAt(rest, poll));
         try std.testing.expect(!detector.on);
     }
 }
 
+test "the rig is read off the probe, not off a flag" {
+    // What the model works out on its own, held here because it is the whole
+    // claim: where the probe lives, and where a hand takes it.
+    var detector: Detector = .init(learnedConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(24000, poll));
+    for (0..steady_warmup * 2) |poll| _ = detector.update(restingAt(300, poll));
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(24000, poll));
+
+    // Rest is the level it keeps coming back to, and the other cluster is
+    // where the hand went -- below it on this rig, which nobody said.
+    try std.testing.expect(@abs(@as(i32, detector.baseline.base) - 24000) < 500);
+    try std.testing.expect(detector.baseline.low < 12000);
+}
+
 test "a hand that drops out is still a hand" {
-    // What a count buys over a median and a range. Probe B reads its held level
+    // What a count buys over a median and a range. A probe reads its held level
     // for fourteen polls and throws a rail on the fifteenth: the median of that
     // window is the held level, but the range is the rail's full height, and a
     // stillness test alone reads the whole touch as nobody there.
-    var detector: Detector = .init(steadyConfig());
-    settleAt(&detector, 0);
+    var detector: Detector = .init(learnedConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(0, poll));
+    // One clean touch, so the rig is known before the dropouts start.
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(0, poll));
 
     for (0..steady_warmup) |poll| {
         const raw: i16 = if (poll % 15 == 14) 0 else restingAt(25000, poll);
         _ = detector.update(raw);
     }
+    try std.testing.expect(detector.on);
+}
+
+test "the first hand of the evening is answered before any rig is known" {
+    // Nobody has touched it yet, so there is no second cluster and no line to
+    // draw. The plain question stands in until there is: the window sitting
+    // somewhere the probe does not live. A model that needed to see a touch
+    // before it could report one would owe the first visitor nothing.
+    var detector: Detector = .init(learnedConfig());
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(0, poll));
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
     try std.testing.expect(detector.on);
 }

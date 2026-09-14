@@ -265,6 +265,7 @@ fn parseBox(text: []const u8) ?boxes.Box {
 fn parseModel(name: []const u8) ?touch.Model {
     if (std.mem.eql(u8, name, "deviation")) return .deviation;
     if (std.mem.eql(u8, name, "steady")) return .steady;
+    if (std.mem.eql(u8, name, "learned")) return .learned;
     return null;
 }
 
@@ -358,6 +359,17 @@ pub const usage =
     \\--touch-model picks what the detector asks each probe:
     \\  deviation  how far the probe has moved from its own recent past
     \\  steady     how tightly the last second of readings clusters, at any level
+    \\  learned    which of the two levels the probe visits it is sitting at now
+    \\
+    \\`learned` is told nothing and measures nothing in advance. A plant lives at
+    \\one level and a hand takes it to another, so over minutes the probe's own
+    \\history holds two clusters; the model calls the one it keeps returning to
+    \\rest, and a touch is the window spending itself past the halfway line. That
+    \\covers a rig resting at nought and boosted to 25000, one resting at 25000
+    \\and pulled to ground, and one resting mid-range thrown either way, without
+    \\--plant-a-band or a trip to the room. It wants about six seconds of nobody
+    \\touching after start, and answers the first hand on a plainer question
+    \\while it waits to see what a touch on this rig looks like.
     \\Use `steady` on a rig whose probes clamp to a level you cannot predict.
     \\
     \\--still-range and --still-release are that model's two thresholds, in
@@ -765,4 +777,16 @@ test "a box that does not exist is refused rather than rounded" {
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=0"}));
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box="}));
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=two"}));
+}
+
+test "the model that learns the rig can be asked for by name" {
+    const opts = try parse(&.{"--touch-model=learned"});
+    try std.testing.expectEqual(touch.Model.learned, opts.model.?);
+}
+
+test "the usage names every model the parser takes" {
+    // The message that offers them has fallen behind the code once already.
+    inline for (@typeInfo(touch.Model).@"enum".fields) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, usage, field.name) != null);
+    }
 }

@@ -75,23 +75,6 @@ pub const Spread = struct {
     band_lo: ?i16,
     band_hi: ?i16,
     inside: f32,
-    /// Where the probe sits when nobody is on it, and the share of the window
-    /// that is anywhere else. Nought until rest has been learned.
-    ///
-    /// The band above is a room saying where a hand puts the probe. This is the
-    /// same question asked from the other end, and it needs nobody to say
-    /// anything: rest is learned, and a touch is the window being somewhere
-    /// other than there. Two-sided on purpose -- a hand takes the probe up on
-    /// one rig and down on the next, and a plant whose rest sits in the middle
-    /// can be thrown either way.
-    ///
-    /// Counted rather than measured as a distance, because counting is what
-    /// survives a probe that drops out: a hand held through fifteen good polls
-    /// and one rail is fifteen sixteenths outside, where a range over the same
-    /// window is the rail's full height and reads as nobody there.
-    rest_lo: ?i16,
-    rest_hi: ?i16,
-    outside: f32,
 
     pub fn init(window_ms: f32, sample_rate: u32, poll_frames: usize) Spread {
         const polls_per_s = @as(f32, @floatFromInt(sample_rate)) /
@@ -111,9 +94,6 @@ pub const Spread = struct {
             .band_lo = null,
             .band_hi = null,
             .inside = 0.0,
-            .rest_lo = null,
-            .rest_hi = null,
-            .outside = 0.0,
         };
     }
 
@@ -121,13 +101,6 @@ pub const Spread = struct {
     pub fn watch(self: *Spread, lo: ?i16, hi: ?i16) void {
         self.band_lo = lo;
         self.band_hi = hi;
-    }
-
-    /// Say where the probe sits at rest, so the share of the window that is
-    /// anywhere else can be counted. Learned rather than told.
-    pub fn watchRest(self: *Spread, lo: i16, hi: i16) void {
-        self.rest_lo = lo;
-        self.rest_hi = hi;
     }
 
     /// Whether the window has enough behind it to be worth asking.
@@ -165,16 +138,6 @@ pub const Spread = struct {
 
         // Counted in the same pass the sort was for, so asking costs nothing
         // extra on the audio thread.
-        if (self.rest_lo != null and self.rest_hi != null) {
-            var elsewhere: usize = 0;
-            for (scratch[0..n]) |sample| {
-                if (sample < self.rest_lo.? or sample > self.rest_hi.?) elsewhere += 1;
-            }
-            self.outside = @as(f32, @floatFromInt(elsewhere)) / @as(f32, @floatFromInt(n));
-        } else {
-            self.outside = 0.0;
-        }
-
         if (self.band_lo == null and self.band_hi == null) {
             self.inside = 0.0;
             return;
