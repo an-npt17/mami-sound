@@ -212,6 +212,86 @@ test "a plant asked for a tap is given the window" {
     try std.testing.expect(machine.bc.window != null);
 }
 
+test "both probes need the same excursion to count as touched" {
+    // Plant B asked for ten deviations against plant A's six, which made it the
+    // harder plant to sound for no reason the rig ever gave. Unset, plant B
+    // takes plant A's level.
+    try std.testing.expect(touch.level_bc == null);
+}
+
+test "a hand left resting on plant B latches under the shipped preset" {
+    // The whole of the bug in one test: the compiled preset, no flags, a hand
+    // that arrives and stays. This is what the service runs.
+    const cfg = touchWith(.{}, .{ .trigger, .trigger });
+    var machine: core.touch.Machine = .init(cfg);
+
+    var polls_on: usize = 0;
+    for (0..4000) |_| _ = machine.update(0, 0);
+    for (0..3000) |_| {
+        _ = machine.update(0, 3000);
+        if (machine.bc.on) polls_on += 1;
+    }
+    // Windowed, this managed under five hundred. A probe that reports the hand
+    // reports it for most of the time it is there.
+    try std.testing.expect(polls_on > 1500);
+}
+
+test "a rail-to-rail touch is answered the same in either direction" {
+    // The rig's actual gesture: a probe sitting at one rail and a hand throwing
+    // it to the other. Which rail is rest varies by plant and by day -- one
+    // install rests near 660 and is boosted to 25905, another rests at 25905
+    // and is pulled to 660 -- so the model is asked for the size of the move
+    // and never for its sign. Both directions must cost the same.
+    //
+    // The numbers are the room's, not an implementation detail: how long after
+    // the hand lands the clip starts. They are held here so a change to the
+    // averaging or the debounce cannot quietly make the piece late.
+    const cfg = touchWith(.{}, .{ .trigger, .trigger });
+    const polls_per_s =
+        @as(f32, @floatFromInt(core.sample_rate)) / @as(f32, @floatFromInt(core.sensor_frames));
+
+    var latch_ms: [2]f32 = undefined;
+    for ([_][2]i16{ .{ 660, 25905 }, .{ 25905, 660 } }, 0..) |rails, direction| {
+        var machine: core.touch.Machine = .init(cfg);
+        for (0..8000) |_| _ = machine.update(0, rails[0]);
+
+        var on: usize = 0;
+        while (!machine.bc.on and on < 4000) : (on += 1) _ = machine.update(0, rails[1]);
+        latch_ms[direction] = @as(f32, @floatFromInt(on)) / polls_per_s * 1000.0;
+
+        var off: usize = 0;
+        while (machine.bc.on and off < 4000) : (off += 1) _ = machine.update(0, rails[0]);
+        const release_ms = @as(f32, @floatFromInt(off)) / polls_per_s * 1000.0;
+
+        // Plant B debounces for twenty milliseconds and no more: the move is a
+        // thousand deviations wide, so nothing is gained by looking longer.
+        try std.testing.expect(latch_ms[direction] < 40.0);
+        // Letting go costs the averaging window, which is the price of a mean
+        // that a spike cannot drag. A quarter second is under the fade.
+        try std.testing.expect(release_ms < 300.0);
+
+        var a_machine: core.touch.Machine = .init(cfg);
+        for (0..8000) |_| _ = a_machine.update(rails[0], 0);
+        var a_on: usize = 0;
+        while (!a_machine.a.on and a_on < 4000) : (a_on += 1) _ = a_machine.update(rails[1], 0);
+        const a_ms = @as(f32, @floatFromInt(a_on)) / polls_per_s * 1000.0;
+        // Plant A holds for a hundred milliseconds before it believes a hand.
+        try std.testing.expect(a_ms < 120.0);
+    }
+
+    // The sign of the move buys nothing and costs nothing.
+    try std.testing.expectEqual(latch_ms[0], latch_ms[1]);
+}
+
+test "the preset carries a floor for each probe" {
+    // Unset, the score was the only threshold either probe had, and on this
+    // rig the score's denominator is noise about noise.
+    try std.testing.expect(touch.counts != null);
+    try std.testing.expect(touch.counts_bc != null);
+    try std.testing.expectEqual(default_counts_bc, touch.forBc().counts.?);
+    try std.testing.expectEqual(default_counts, touch.counts.?);
+}
+
 test "a room may take a tap plant's window away without a rebuild" {
     // A plant told to tap on a rig where a hand stays put still has to be
     // reachable, and `off` is the word for it.
