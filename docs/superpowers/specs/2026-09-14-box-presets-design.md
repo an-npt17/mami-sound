@@ -104,26 +104,43 @@ pub const Preset = struct {
 };
 ```
 
-A box file is one value and the measurements that justify it:
+A box file is one value and the measurements that justify it. Zig has no
+struct-update syntax, and a partial-struct mechanism would be a second thing to
+maintain for no gain, so a box file is a comptime block over a copy of the
+defaults:
 
 ```zig
-// box2.zig — probe A behaves as a switch: nought or one at rest, about
-// twenty-five thousand under a hand, so the floor sits far under the excursion
-// rather than near half of it.
-pub const preset: Preset = defaults.with(.{
-    .counts = 3000,
-    .counts_bc = 10000,
-    .drone = .{ .span = 25000, .touch_floor = 0.35, .burst_s = 0.4, .glide_s = 4.0, .release_s = 0.5 },
-    .plants = .{
-        .{ .source = .drone, .mode = .hold },
-        .{ .source = .voicebox3, .mode = .trigger },
-    },
-});
+//! Box 2. Probe A behaves as a switch rather than as a sensor.
+
+const defaults = @import("defaults.zig");
+
+/// Plant A's floor is deliberately far under its excursion rather than near
+/// half of it. The probe there is nought or one untouched and about twenty-five
+/// thousand under a hand, and the room's complaint was that a light touch did
+/// nothing and only a tight grip sounded. A floor at three thousand is twelve
+/// per cent of a full touch and still forty times the worst wander the journal
+/// shows at rest.
+const counts: i16 = 3000;
+const counts_bc: i16 = 10000;
+
+pub const preset: defaults.Preset = blk: {
+    var p = defaults.preset;
+    p.touch.counts = counts;
+    p.touch.counts_bc = counts_bc;
+    p.drone.span = 25000;
+    p.drone.touch_floor = 0.35;
+    break :blk p;
+};
 ```
 
-`box1.zig`, `box3.zig` and `box4.zig` ship as `defaults.with(.{})`, each with a
-comment saying the rig has not been measured yet. They exist so that adding a
-box is editing a file rather than cutting a branch.
+A drone plant records `.trigger`. The drone is held by nature and its gate is
+its own; writing `.hold` there would reach the detector through `touchWith` and
+make it a different rig, so the mode a drone carries has to be the one that
+says nothing.
+
+`box1.zig`, `box3.zig` and `box4.zig` are `pub const preset: defaults.Preset =
+defaults.preset;` and a comment saying the rig has not been measured yet. They
+exist so that adding a box is editing a file rather than cutting a branch.
 
 `src/core/` gains nothing from this. It keeps taking a `Config` and knows no
 box exists, which is what makes one algorithm provably one algorithm.
@@ -141,14 +158,28 @@ is read and matched against `box1`…`box5`; with no match, `defaults`. The
 resolved name is printed on the `loading:` line, so a room can see which preset
 actually ran rather than inferring it from how the piece sounds.
 
-`production_config.zig` keeps `touchWith(overrides, modes)` in the named-struct
-shape `box5` gave it. What changes is where its base comes from: the selected
-box's `touch` rather than a constant in that file. Its existing tests move with
-it and keep asserting the same thing — an override reaches the config and the
-rest of the preset stands.
+`production_config.zig` keeps `touchWith` in the named-struct shape `box5` gave
+it, with a base as its first argument: `touchWith(base, overrides, modes)`. What
+changes is where that base comes from — the selected box's `touch` rather than a
+constant in the file. Its existing tests keep asserting the same thing: an
+override reaches the config and the rest of the preset stands.
+
+There is no `resolve` that bundles all three layers. A run needs the box's
+`plants` before the plant loop and its `modes` only after, so a single call
+taking both would have to settle the box twice and throw half its answer away.
+`chosenBox` answers which box this is, `presetFor` hands over its numbers, and
+`touchWith` layers the room's overrides on at the end.
 
 One binary serves all five Pis. Deployment is identical everywhere, and another
-box's numbers can be tried on a bench with a flag instead of a cross-build.
+box's numbers can be tried on a bench with a flag instead of a cross-build:
+
+    zig build run -- --box=5 --test-random-probe
+
+Which box a Pi is comes from `--box=N`, or from the hostname when the flag is
+absent — `box3`, `box3.local` and `box3-pi` are all box 3. A machine that is
+none of the five prints `loading: no box named, and this machine is none of the
+five: running the unmeasured defaults` and runs them, so a wrong preset cannot
+be mistaken for a measured one.
 
 ## Testing
 
