@@ -60,8 +60,9 @@ pub const Voice = union(enum) {
     }
     /// A folder of clips, gated or not.
     ///
-    /// In `trigger` the gate is wide and the stream renders straight into the
-    /// block, which is what it has always done. In `hold` the audio is walked
+    /// In `trigger` and in `tap` the gate is wide and the stream renders
+    /// straight into the block, which is what it has always done: both hand the
+    /// clip its own length and stop asking about the hand. In `hold` the audio is walked
     /// through a gate that opens while somebody is holding the plant and closes
     /// when they let go -- and once it has closed the stream is not asked for
     /// anything at all. That last part is what pauses the clip rather than
@@ -70,7 +71,7 @@ pub const Voice = union(enum) {
     fn renderClips(clips: *Clips, piece: []f32, touched: bool) void {
         std.debug.assert(piece.len <= max_piece);
 
-        if (clips.mode == .trigger) {
+        if (clips.mode != .hold) {
             // Asked before rendering, so the answer is about the clip already
             // running rather than the one this poll might start.
             const sounding = clips.stream.sounding();
@@ -404,4 +405,26 @@ test "a clip that reaches its own end under a hold waits for a new touch" {
     for (0..release_polls) |_| voice.render(&piece, &probe, false);
     voice.render(&piece, &probe, true);
     try std.testing.expectEqual(@as(usize, 2), stream.requests);
+}
+
+test "a tap voice is not gated like a held one" {
+    // A tap reaches the voice as one poll of `touched` and nothing after it.
+    // Gated, that is a clip which opens for a poll and shuts again, which is
+    // silence; the clip has to run on its own the way a trigger's does.
+    var stream: FakeStream = .{};
+    var prng = std.Random.DefaultPrng.init(1);
+    var voice: Voice = .{ .clips = .{
+        .stream = stream.port(),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
+        .mode = .tap,
+    } };
+
+    const probe = testDetector();
+    var piece = [_]f32{0.0} ** 128;
+    voice.render(&piece, &probe, true);
+    for (0..64) |_| {
+        @memset(&piece, 0);
+        voice.render(&piece, &probe, false);
+    }
+    try std.testing.expectEqual(@as(f32, 0.5), piece[0]);
 }

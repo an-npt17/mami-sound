@@ -38,9 +38,7 @@ pub const touch: core.touch.Config = .{
     .sample_rate = core.sample_rate,
     .poll_frames = core.sensor_frames,
     .model = .deviation,
-    .level_bc = 10.0,
     .hold_bc_ms = 20.0,
-    .window_bc = .{ .ms = 1000.0 },
     .counts = default_counts,
     .counts_bc = default_counts_bc,
 };
@@ -72,62 +70,77 @@ pub const touch: core.touch.Config = .{
 pub const default_counts: i16 = 3000;
 pub const default_counts_bc: i16 = 10000;
 
-/// How big a move a touch must be on each probe, as the room asked. `null` is
-/// the room not having said, which keeps the measured preset.
-pub const Floors = struct {
+/// What the room asked for on the command line, or nothing where it did not.
+///
+/// Named rather than positional because four of these are `?i16` in a row: a
+/// caller that handed the range where the floor goes would compile, run, and
+/// be wrong in a way no test could see.
+pub const Overrides = struct {
+    model: ?core.touch.Model = null,
+    still_range: ?i16 = null,
+    still_release: ?i16 = null,
+    still_window_ms: ?f32 = null,
+    /// Where a held probe sits, per plant. The two probes do not sit at the
+    /// same place: on this rig a hand puts one near six hundred and sixty and
+    /// the other near twenty-five thousand.
+    plant_band: [2]?[2]i16 = .{ null, null },
+    /// The tap window each plant was given, where the room said. A plant whose
+    /// mode is `.tap` is given `tap_window_ms` without being asked; this is how
+    /// a room says a different length, or none.
+    plant_window: [2]?core.touch.Window = .{ null, null },
+    /// The move in counts a touch must clear, per probe. Zero is the room
+    /// saying "no floor at all", which is a different thing from leaving the
+    /// flag off: off keeps the measured number, zero asks the score alone.
     counts: ?i16 = null,
     counts_bc: ?i16 = null,
 };
 
+/// How long a tap may last and still be a tap, for whichever plant asks to be
+/// one. Measured on the deviation rig, where it was plant B's whether anybody
+/// wanted it or not.
+pub const tap_window_ms: f32 = 1000.0;
+
 /// The preset with the room's overrides applied. Anything left unset on the
 /// command line keeps the number above, which is the one that was measured.
 pub fn touchWith(
-    model: ?core.touch.Model,
-    still_range: ?i16,
-    still_release: ?i16,
-    still_window_ms: ?f32,
-    plant_band: [2]?[2]i16,
-    /// The tap window each plant was given, where the room said. Unset leaves
-    /// the preset's answer standing, which is a window on plant B and none on
-    /// plant A.
-    plant_window: [2]?core.touch.Window,
-    /// Which plants sound while they are held. A held probe drops its tap
-    /// window: the window asks whether a hand left in time, a hold asks whether
-    /// it is still there, and both cannot be answered at once.
-    held: [2]bool,
-    /// The counts floor each probe was given, where the room said. Named rather
-    /// than passed as two more `?i16` in a row: a caller that swapped them
-    /// would compile, run, and be wrong in a way no test could see.
-    floors: Floors,
+    overrides: Overrides,
+    /// How each plant answers a hand. The detector is told the same thing the
+    /// clips are: a hold wants a level, a tap wants a gesture, and a trigger
+    /// wants the edge. Only a plant asked to be a tap is given a tap window --
+    /// the window discards a hand that rests, which is the touch a room makes.
+    modes: [2]core.clips.Mode,
 ) core.touch.Config {
     var cfg = touch;
-    if (model) |chosen| cfg.model = chosen;
-    // Zero is the room asking for no floor at all, which is a different thing
-    // from leaving the flag off: off keeps the measured number, zero puts the
-    // probe back on the score alone.
-    if (floors.counts) |counts| cfg.counts = if (counts == 0) null else counts;
-    if (floors.counts_bc) |counts| cfg.counts_bc = if (counts == 0) null else counts;
-    cfg.hold = held[0];
-    cfg.hold_bc = held[1];
-    if (still_range) |counts| cfg.still_range = counts;
-    if (still_release) |counts| cfg.still_release = counts;
-    if (still_window_ms) |ms| cfg.still_window_ms = ms;
-    if (plant_band[0]) |band| {
+    if (overrides.model) |chosen| cfg.model = chosen;
+
+    cfg.hold = modes[0] == .hold;
+    cfg.hold_bc = modes[1] == .hold;
+    cfg.window_ms = if (modes[0] == .tap) tap_window_ms else null;
+    cfg.window_bc = if (modes[1] == .tap) .{ .ms = tap_window_ms } else null;
+
+    if (overrides.still_range) |counts| cfg.still_range = counts;
+    if (overrides.still_release) |counts| cfg.still_release = counts;
+    if (overrides.still_window_ms) |ms| cfg.still_window_ms = ms;
+    if (overrides.plant_band[0]) |band| {
         cfg.touch_band_lo = band[0];
         cfg.touch_band_hi = band[1];
     }
-    if (plant_band[1]) |band| {
+    if (overrides.plant_band[1]) |band| {
         cfg.touch_band_lo_bc = band[0];
         cfg.touch_band_hi_bc = band[1];
     }
-    // Plant A's window is a plain length, so `off` and "no window" are the
-    // same thing there. Plant B's is not: `null` on BC means A's, and the room
-    // saying `off` has to survive that.
-    if (plant_window[0]) |chosen| cfg.window_ms = switch (chosen) {
+    // Plant A's window is a plain length, so `off` and "no window" are the same
+    // thing there. Plant B's is not: `null` on BC means A's, and a room saying
+    // `off` has to survive that.
+    if (overrides.plant_window[0]) |chosen| cfg.window_ms = switch (chosen) {
         .off => null,
         .ms => |ms| ms,
     };
-    if (plant_window[1]) |chosen| cfg.window_bc = chosen;
+    if (overrides.plant_window[1]) |chosen| cfg.window_bc = chosen;
+
+    // Zero is the room asking for no floor, which the detector spells `null`.
+    if (overrides.counts) |floor| cfg.counts = if (floor == 0) null else floor;
+    if (overrides.counts_bc) |floor| cfg.counts_bc = if (floor == 0) null else floor;
     return cfg;
 }
 
@@ -158,57 +171,60 @@ pub const drone: core.noise.Shape = .{
 const std = @import("std");
 
 test "an override reaches the config and the rest of the preset stands" {
-    const cfg = touchWith(.steady, 64, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{});
+    const cfg = touchWith(.{ .model = .steady, .still_range = 64 }, .{ .trigger, .trigger });
     try std.testing.expectEqual(core.touch.Model.steady, cfg.model);
     try std.testing.expectEqual(@as(i16, 64), cfg.still_range);
     // Untouched by the override, so still the measured number.
     try std.testing.expectEqual(touch.still_release, cfg.still_release);
-    try std.testing.expectEqual(touch.level_bc, cfg.level_bc);
 }
 
-test "no overrides is the preset exactly" {
-    try std.testing.expectEqual(touch, touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{}));
+test "no overrides on two triggers is the preset exactly" {
+    try std.testing.expectEqual(touch, touchWith(.{}, .{ .trigger, .trigger }));
 }
 
 test "each plant is told to hold on its own" {
-    // Whichever plant is held, the other keeps whatever it was given. The two
-    // are configured separately and must stay that way through every layer.
-    const a_held = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ true, false }, .{});
+    const a_held = touchWith(.{}, .{ .hold, .trigger });
     try std.testing.expect(a_held.hold);
     try std.testing.expect(!a_held.hold_bc);
 
-    const both = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ true, true }, .{});
+    const both = touchWith(.{}, .{ .hold, .hold });
     try std.testing.expect(both.hold);
     try std.testing.expect(both.hold_bc);
 
-    const neither = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{});
+    const neither = touchWith(.{}, .{ .trigger, .trigger });
     try std.testing.expect(!neither.hold);
     try std.testing.expect(!neither.hold_bc);
 }
 
-test "a room may take plant B's tap window away without a rebuild" {
-    // The preset gives plant B a window for the rig it was measured on, where
-    // a hand left resting was drift rather than a request. On a rig where a
-    // hand stays put, that window is what makes the plant look deaf.
-    const off = touchWith(null, null, null, null, .{ null, null }, .{ null, .off }, .{ false, false }, .{});
+test "a plant left on trigger is given no tap window" {
+    // The fault as the room met it. The preset handed plant B a tap window
+    // nobody asked for, and a tap window discards a hand that rests -- which is
+    // every touch a room makes. Plant B crossed its threshold twenty-four times
+    // in one log of a thousand polls and sounded on none of them.
+    const machine: core.touch.Machine = .init(touchWith(.{}, .{ .trigger, .trigger }));
+    try std.testing.expect(machine.a.window == null);
+    try std.testing.expect(machine.bc.window == null);
+}
+
+test "a plant asked for a tap is given the window" {
+    const machine: core.touch.Machine = .init(touchWith(.{}, .{ .tap, .tap }));
+    try std.testing.expect(machine.a.window != null);
+    try std.testing.expect(machine.bc.window != null);
+}
+
+test "a room may take a tap plant's window away without a rebuild" {
+    // A plant told to tap on a rig where a hand stays put still has to be
+    // reachable, and `off` is the word for it.
+    const off = touchWith(.{ .plant_window = .{ null, .off } }, .{ .trigger, .tap });
     const machine: core.touch.Machine = .init(off);
     try std.testing.expect(machine.bc.window == null);
 
-    // And a length rather than the preset's, for a room that wants a slower
-    // tap counted.
-    const longer = touchWith(null, null, null, null, .{ null, null }, .{ null, .{ .ms = 3000.0 } }, .{ false, false }, .{});
+    const longer = touchWith(.{ .plant_window = .{ null, .{ .ms = 3000.0 } } }, .{ .trigger, .tap });
     try std.testing.expectEqual(@as(f32, 3000.0), longer.window_bc.?.ms);
-
-    // Plant A takes the same flag, where the preset gives it no window at all.
-    const a_window = touchWith(null, null, null, null, .{ null, null }, .{ .{ .ms = 500.0 }, null }, .{ false, false }, .{});
-    try std.testing.expectEqual(@as(f32, 500.0), a_window.window_ms.?);
 }
 
 test "a held plant drops its tap window, and only that plant's" {
-    // The preset gives plant B a tap window for the rig it was measured on. A
-    // plant told to sound while it is held cannot also be asked whether the
-    // hand left in time, and the other plant keeps whatever it was given.
-    const b_held = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, true }, .{});
+    const b_held = touchWith(.{}, .{ .trigger, .hold });
     try std.testing.expect(!b_held.hold);
     try std.testing.expect(b_held.hold_bc);
 
@@ -216,21 +232,20 @@ test "a held plant drops its tap window, and only that plant's" {
     try std.testing.expect(machine.bc.window == null);
 }
 
+test "each plant's band reaches its own probe" {
+    // The two probes do not sit at the same place, so one band cannot serve
+    // both: a hand puts one near 660 and the other near 25000.
+    const cfg = touchWith(.{ .plant_band = .{ .{ 600, 700 }, .{ 24000, 26000 } } }, .{ .trigger, .trigger });
+    try std.testing.expectEqual(@as(?i16, 600), cfg.touch_band_lo);
+    try std.testing.expectEqual(@as(?i16, 24000), cfg.touch_band_lo_bc);
+}
+
 test "a room may set each probe's counts floor, or neither" {
-    // Off keeps the measured number, which is the whole point of the preset.
-    const preset = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{});
+    const preset = touchWith(.{}, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, default_counts), preset.counts);
     try std.testing.expectEqual(@as(?i16, default_counts_bc), preset.counts_bc);
 
-    const asked = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{
-        .counts = 1500,
-        .counts_bc = 20000,
-    });
-    try std.testing.expectEqual(@as(?i16, 1500), asked.counts);
-    try std.testing.expectEqual(@as(?i16, 20000), asked.counts_bc);
-
-    // One without the other.
-    const only_a = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{ .counts = 1500 });
+    const only_a = touchWith(.{ .counts = 1500 }, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, 1500), only_a.counts);
     try std.testing.expectEqual(@as(?i16, default_counts_bc), only_a.counts_bc);
 }
@@ -238,10 +253,7 @@ test "a room may set each probe's counts floor, or neither" {
 test "a floor of zero puts a probe back on the score alone" {
     // Zero is a setting and not a typo: it says "no floor", which `null` cannot
     // say because there it already means "keep the preset".
-    const bare = touchWith(null, null, null, null, .{ null, null }, .{ null, null }, .{ false, false }, .{
-        .counts = 0,
-        .counts_bc = 0,
-    });
+    const bare = touchWith(.{ .counts = 0, .counts_bc = 0 }, .{ .trigger, .trigger });
     try std.testing.expect(bare.counts == null);
     try std.testing.expect(bare.counts_bc == null);
 }

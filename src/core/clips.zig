@@ -422,11 +422,33 @@ test "the guard length reaches the selector" {
 
 /// How a plant answers a hand.
 ///
-/// `trigger` is a doorbell: a touch starts a clip and the clip runs its own
-/// length whether the hand stays or not. `hold` is a tap: the clip sounds while
-/// somebody is holding the plant and falls silent when they let go, and the
-/// next hold picks it up where it stopped.
-pub const Mode = enum { trigger, hold };
+/// `trigger` starts a clip on the way in and lets it run its own length.
+/// `hold` sounds for as long as the hand is there, and the next hold picks the
+/// clip up where it stopped. `tap` is the third and was reachable only by being
+/// plant B: it wants a hand that arrives and leaves again, and discards one
+/// that rests. That is the right question for a probe whose excursions are
+/// mostly drift, and the wrong one for a room, so it is asked for by name now
+/// rather than carried in a preset.
+pub const Mode = enum { trigger, hold, tap };
+
+/// Every mode name, comma-separated, built from the enum.
+///
+/// So the message that offers them cannot fall behind the list. The source
+/// names are kept this way for the same reason, and for the same cause: a
+/// message that told a room to try something that was not there.
+pub const mode_names = blk: {
+    const fields = @typeInfo(Mode).@"enum".fields;
+    var line: []const u8 = "";
+    for (fields, 0..) |field, i| {
+        line = line ++ field.name;
+        if (i + 2 == fields.len) {
+            line = line ++ " or ";
+        } else if (i + 1 < fields.len) {
+            line = line ++ ", ";
+        }
+    }
+    break :blk line;
+};
 
 /// The largest pool a shuffle is kept for.
 ///
@@ -581,4 +603,13 @@ test "a hand that really left does count as a new visit" {
     for (0..5 * polls_per_s) |_| _ = selector.start(true, true, poll_frames);
     for (0..2 * polls_per_s) |_| _ = selector.start(false, true, poll_frames);
     try std.testing.expect(selector.start(true, true, poll_frames) != null);
+}
+
+test "a tap spends the same allowance a trigger does" {
+    // A tap is a shorter way of asking for the same clip, not a different clip.
+    // Only `hold` uncaps, because there the hand is the length.
+    const tapped: Limit = .forSource(.bell, null, .tap, 44100);
+    const triggered: Limit = .forSource(.bell, null, .trigger, 44100);
+    try std.testing.expectEqual(triggered.total, tapped.total);
+    try std.testing.expectEqual(@as(usize, 4 * 44100), tapped.total);
 }

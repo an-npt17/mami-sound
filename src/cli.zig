@@ -140,6 +140,12 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--plant-b-band=")) {
             opts.plant_band[1] = parseBand(arg["--plant-b-band=".len..]) orelse
                 return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts=")) {
+            opts.counts = parseFloor(arg["--counts=".len..]) orelse
+                return Error.InvalidStillThreshold;
+        } else if (std.mem.startsWith(u8, arg, "--counts-b=")) {
+            opts.counts_bc = parseFloor(arg["--counts-b=".len..]) orelse
+                return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--plant-a-mode=")) {
             opts.plant_mode[0] = parseMode(arg["--plant-a-mode=".len..]) orelse
                 return Error.InvalidMode;
@@ -303,6 +309,8 @@ pub const usage =
     \\  trigger  a touch sets a clip going and it runs its own length
     \\  hold     the clip sounds while the plant is held and fades when it is
     \\           let go, and the next hold picks it up where it stopped
+    \\  tap      a hand that arrives and leaves again sets a clip going; one
+    \\           left resting is drift or settling and starts nothing
     \\Left off, a plant triggers. The drone always holds and takes no mode.
     \\
     \\--plant-a-retrigger and --plant-b-retrigger are how long a clip is
@@ -363,6 +371,19 @@ pub const usage =
     \\Left off, steady learns rest and calls a touch stillness a hundred counts
     \\away from it, and deviation fires on any large move. Set it once you have
     \\watched the rig: the status line's l0 and l1 are the levels to read it off.
+    \\
+    \\--counts and --counts-b are how big a move a touch has to be on each
+    \\probe, in the counts the status line's l0 and l1 show. `deviation` only.
+    \\
+    \\The score on its own cannot answer this: it divides a move by how much
+    \\the probe normally wanders, and a probe that goes quiet scores enormous
+    \\deviations on a move that is, in counts, nothing. On this rig plant B
+    \\reads the supply rail to within seventy counts while about one poll in
+    \\fifteen drops toward ground, and the density of those dropouts alone
+    \\moves its average far enough to fire. Defaults are 4000 for plant A,
+    \\which a hand moves about 9000, and 10000 for plant B, which a hand moves
+    \\about 24000. Zero asks for no floor and puts a probe back on the score
+    \\alone; left off, the measured default stands.
     \\
     \\--still-window is how long a stretch of readings that range is measured
     \\over, in seconds, and how many readings a band is counted over. It buys the
@@ -627,6 +648,31 @@ test "a capture with no path or no time is refused" {
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture="}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=0"}));
     try std.testing.expectError(Error.InvalidCapture, parse(&.{"--capture-seconds=-5"}));
+}
+
+test "a plant can be asked for a tap" {
+    // The third gesture. It was in the detector all along and reachable only by
+    // being plant B, which is how a room got a plant that ignored a hand.
+    try std.testing.expectEqual(
+        clips.Mode.tap,
+        (try parse(&.{"--plant-b-mode=tap"})).plant_mode[1].?,
+    );
+    // On plant A too, which the drone refuses -- so it is asked of a folder.
+    try std.testing.expectEqual(
+        clips.Mode.tap,
+        (try parse(&.{ "--plant-a=bell", "--plant-a-mode=tap" })).plant_mode[0].?,
+    );
+}
+
+test "the usage names every mode a plant can be given" {
+    // A mode the usage does not mention is a mode nobody asks for, which is how
+    // plant B came to answer taps in a room that rested its hands.
+    inline for (@typeInfo(clips.Mode).@"enum".fields) |field| {
+        if (std.mem.indexOf(u8, usage, field.name) == null) {
+            std.debug.print("the usage omits the {s} mode\n", .{field.name});
+            return error.ModeMissingFromUsage;
+        }
+    }
 }
 
 test "each probe's counts floor can be set from the room" {

@@ -74,8 +74,8 @@ pub fn main(init: std.process.Init) !void {
                 .{},
             ),
             error.InvalidMode => std.debug.print(
-                "--plant-a-mode and --plant-b-mode take `trigger` or `hold`.\n\n",
-                .{},
+                "--plant-a-mode and --plant-b-mode take a mode: {s}.\n\n",
+                .{core.clips.mode_names},
             ),
             error.ModeOnDrone => std.debug.print(
                 "the drone already sounds while it is held; it takes no mode.\n\n",
@@ -134,7 +134,10 @@ fn runComposition(
     };
 
     var voices: [2]voice_mod.Voice = .{ droneVoice(), droneVoice() };
-    var held: [2]bool = .{ false, false };
+    // What each plant does with a hand, in the one place both the voice and
+    // the detector read it from. The drone is held by nature and takes no
+    // mode, so it is recorded as a trigger and the detector is told nothing.
+    var modes: [2]core.clips.Mode = .{ .trigger, .trigger };
 
     for (opts.plant_sources, 0..) |chosen, plant| {
         const name: []const u8 = if (plant == 0) "A" else "B";
@@ -164,6 +167,7 @@ fn runComposition(
         );
 
         const mode = opts.plant_mode[plant] orelse .trigger;
+        modes[plant] = mode;
         const limit: core.clips.Limit = .forSource(
             chosen,
             opts.plant_seconds[plant],
@@ -204,9 +208,13 @@ fn runComposition(
         try streams[plant].start();
 
         const retrigger = opts.plant_retrigger[plant] orelse chosen.defaultRetriggerSeconds();
-        if (mode == .hold) {
-            held[plant] = true;
-            std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
+        switch (mode) {
+            .hold => std.debug.print("loading: plant {s} sounds while it is held\n", .{name}),
+            .tap => std.debug.print(
+                "loading: plant {s} answers a tap, not a hand that rests\n",
+                .{name},
+            ),
+            .trigger => {},
         }
         voices[plant] = .{
             .clips = .{
@@ -245,16 +253,16 @@ fn runComposition(
     std.debug.print("loading: starting engine...\n", .{});
     var app = engine.Engine.init(
         opts.plants,
-        production_config.touchWith(
-            opts.model,
-            opts.still_range,
-            opts.still_release,
-            opts.still_window_ms,
-            opts.plant_band,
-            opts.plant_window,
-            held,
-            .{ .counts = opts.counts, .counts_bc = opts.counts_bc },
-        ),
+        production_config.touchWith(.{
+            .model = opts.model,
+            .still_range = opts.still_range,
+            .still_release = opts.still_release,
+            .still_window_ms = opts.still_window_ms,
+            .plant_band = opts.plant_band,
+            .plant_window = opts.plant_window,
+            .counts = opts.counts,
+            .counts_bc = opts.counts_bc,
+        }, modes),
         probe.source(),
         sink_port,
         status.port(),
