@@ -321,3 +321,50 @@ test "a box's numbers reach the config, and the room's beat the box's" {
     const room_said = touchWith(boxes.presetFor(.box5).touch, .{ .counts = 1500 }, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, 1500), room_said.counts);
 }
+
+test "a rail-to-rail touch is answered the same in either direction" {
+    // The rig's actual gesture: a probe sitting at one rail and a hand throwing
+    // it to the other. Which rail is rest varies by plant and by day -- one
+    // install rests near 660 and is boosted to 25905, another rests at 25905
+    // and is pulled to 660 -- so the model is asked for the size of the move
+    // and never for its sign. Both directions must cost the same.
+    //
+    // The numbers are the room's, not an implementation detail: how long after
+    // the hand lands the clip starts. They are held here so a change to the
+    // averaging or the debounce cannot quietly make the piece late.
+    const cfg = touchWith(boxes.presetFor(.box5).touch, .{}, .{ .trigger, .trigger });
+    const polls_per_s =
+        @as(f32, @floatFromInt(core.sample_rate)) / @as(f32, @floatFromInt(core.sensor_frames));
+
+    var latch_ms: [2]f32 = undefined;
+    for ([_][2]i16{ .{ 660, 25905 }, .{ 25905, 660 } }, 0..) |rails, direction| {
+        var machine: core.touch.Machine = .init(cfg);
+        for (0..8000) |_| _ = machine.update(0, rails[0]);
+
+        var on: usize = 0;
+        while (!machine.bc.on and on < 4000) : (on += 1) _ = machine.update(0, rails[1]);
+        latch_ms[direction] = @as(f32, @floatFromInt(on)) / polls_per_s * 1000.0;
+
+        var off: usize = 0;
+        while (machine.bc.on and off < 4000) : (off += 1) _ = machine.update(0, rails[0]);
+        const release_ms = @as(f32, @floatFromInt(off)) / polls_per_s * 1000.0;
+
+        // Plant B debounces for twenty milliseconds and no more: the move is a
+        // thousand deviations wide, so nothing is gained by looking longer.
+        try std.testing.expect(latch_ms[direction] < 40.0);
+        // Letting go costs the averaging window, which is the price of a mean
+        // that a spike cannot drag. A quarter second is under the fade.
+        try std.testing.expect(release_ms < 300.0);
+
+        var a_machine: core.touch.Machine = .init(cfg);
+        for (0..8000) |_| _ = a_machine.update(rails[0], 0);
+        var a_on: usize = 0;
+        while (!a_machine.a.on and a_on < 4000) : (a_on += 1) _ = a_machine.update(rails[1], 0);
+        const a_ms = @as(f32, @floatFromInt(a_on)) / polls_per_s * 1000.0;
+        // Plant A holds for a hundred milliseconds before it believes a hand.
+        try std.testing.expect(a_ms < 120.0);
+    }
+
+    // The sign of the move buys nothing and costs nothing.
+    try std.testing.expectEqual(latch_ms[0], latch_ms[1]);
+}

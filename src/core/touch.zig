@@ -506,6 +506,27 @@ pub const Config = struct {
 /// One probe, judged against itself.
 pub const Detector = struct {
     mean: Mean,
+    /// The same readings over a much shorter window, which is what the counts
+    /// floor is asked of.
+    ///
+    /// The two thresholds ask different questions and were sharing one average.
+    /// The score wants `mean`'s two hundred milliseconds: `z` divides by a MAD,
+    /// and a jumpy numerator over a small denominator is noise about noise. The
+    /// floor asks how far the probe actually moved, which is a level, and a long
+    /// average cannot answer it promptly -- it ramps. A rail-to-rail touch of
+    /// twenty-five thousand counts against a floor of ten thousand was not
+    /// believed until the mean had travelled forty per cent of its window,
+    /// which is eighty-one milliseconds before the hold had started counting at
+    /// all. Measured at 98.68 ms on the rig; the room hears that as the plant
+    /// being slow to answer a hand that arrived all at once.
+    ///
+    /// Averaged over the hold rather than over a window of its own, because the
+    /// hold already says how long a reading must persist to be believed and a
+    /// second number here would be one nobody measured. At twenty milliseconds
+    /// that is seven polls -- enough that probe B's one-poll-in-fifteen
+    /// dropouts cannot clear the floor between them, which is the whole reason
+    /// the floor is there.
+    step: Mean,
     baseline: Baseline,
     level: f32,
     /// Polls of agreement needed to change the answer, and where the counter
@@ -521,6 +542,11 @@ pub const Detector = struct {
     /// from. `deviation` only: the steady model reads neither off an average,
     /// and the crosstalk floor it feeds is a deviation-model idea too.
     last_mean: i16,
+    /// The last short mean, which is what the counts floor is measured from.
+    /// Kept beside `last_mean` rather than replacing it: the pitch the drone
+    /// plays is read off the long one, and moving it to this would make a
+    /// held note jump about with every dropout.
+    last_step: i16,
     /// Set while the other probe has this one pulled off its rest. The score is
     /// then measured from where the pull left it, so only a further move counts.
     base_override: ?i16,
@@ -574,6 +600,7 @@ pub const Detector = struct {
     pub fn init(cfg: Config) Detector {
         return .{
             .mean = .init(holdPolls(cfg.average_ms, cfg.sample_rate, cfg.poll_frames)),
+            .step = .init(@max(holdPolls(cfg.hold_ms, cfg.sample_rate, cfg.poll_frames), 1)),
             .baseline = .init(cfg.baseline_s, cfg.sample_rate, cfg.poll_frames),
             .level = cfg.level,
             .hold = @max(holdPolls(cfg.hold_ms, cfg.sample_rate, cfg.poll_frames), 1),
@@ -581,6 +608,7 @@ pub const Detector = struct {
             .on = false,
             .z = 0.0,
             .last_mean = 0,
+            .last_step = 0,
             .base_override = null,
             .held = 0,
             .stale_polls = @max(
@@ -832,6 +860,7 @@ pub const Detector = struct {
     /// one case where this model cannot answer at all.
     fn stepDeviation(self: *Detector, raw: i16) bool {
         self.last_mean = self.mean.push(raw);
+        self.last_step = self.step.push(raw);
 
         const denom = @max(self.baseline.mad, mad_floor);
         self.z = (@as(f32, @floatFromInt(self.last_mean)) -
@@ -848,20 +877,23 @@ pub const Detector = struct {
             return false;
         }
 
-        const dev = self.deviation();
+        // How far the probe moved, off the short mean. The score below keeps
+        // the long one: the two thresholds are asking different questions and
+        // an average that suits the score's stability makes the floor late.
+        const moved = clampedAbsDiff(self.last_step, self.base());
         // Where the probe went, as well as how far it moved. Without this a
         // rail scores as high as a hand, and on this rig the rails are the
         // commonest thing a probe does that nobody asked for.
         const in_band = self.inBand(self.last_mean);
         const over = @abs(self.z) >= self.level and
-            (self.counts == null or dev >= self.counts.?) and
+            (self.counts == null or moved >= self.counts.?) and
             in_band;
 
         // Back at rest is half of whatever it took to leave it, in both units.
         // Requiring the same number both ways would let a reading sitting on
         // the line arm and disarm on alternate polls.
         const back = @abs(self.z) < self.level / 2.0 and
-            (self.counts == null or dev < @divTrunc(self.counts.?, 2));
+            (self.counts == null or moved < @divTrunc(self.counts.?, 2));
         self.at_rest = back;
         self.learnRest(back);
 
