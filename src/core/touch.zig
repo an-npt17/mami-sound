@@ -27,6 +27,20 @@ fn clampedAbsDiff(a: i16, b: i16) i16 {
     return @intCast(@min(delta, std.math.maxInt(i16)));
 }
 
+/// One reading offset by another, saturating rather than wrapping.
+///
+/// Rest plus a margin runs off the end of the type on a rig whose probe rests
+/// at a rail, and a band edge that wrapped to the far rail would call the whole
+/// range a touch.
+fn saturatingAdd(value: i16, delta: i16) i16 {
+    const sum = @as(i32, value) + @as(i32, delta);
+    return @intCast(std.math.clamp(
+        sum,
+        std.math.minInt(i16),
+        std.math.maxInt(i16),
+    ));
+}
+
 /// The longest window worth averaging over, about three seconds of polls.
 pub const max_mean_polls = 1024;
 
@@ -760,24 +774,45 @@ pub const Detector = struct {
                 self.reset();
                 return false;
             }
+            // Rest is known now, so the band can be built from it rather than
+            // typed in. A touch is the window being further than `still_move`
+            // from where the probe lives, on either side: up on a rig whose
+            // hand boosts the probe, down on one whose hand pulls it to
+            // ground, and either way on a plant that rests in the middle.
+            self.spread.watchRest(
+                saturatingAdd(self.baseline.base, -self.still_move),
+                saturatingAdd(self.baseline.base, self.still_move),
+            );
         }
 
-        const level = self.spread.level;
-
-        // Told where a hand puts the probe, the question is how much of the
-        // last second was there. One count, which a rail thrown through a
-        // perfectly good touch cannot move much -- where a median and a spread
-        // survive that only up to the margin the percentiles leave.
+        // Either way the question is a count over the last window, and either
+        // way a rail thrown through a perfectly good touch costs one reading of
+        // it -- where a median and a spread survive that only as far as the
+        // percentiles' margin.
         //
-        // Told nothing, the probe has to be still and somewhere other than
-        // where it rests, because neither of those says anything on its own: a
-        // probe with nothing connected to it is stiller than any hand could
-        // hold one, and a probe wandering past the right level is not a hand.
+        // What differs is only who drew the band. Told one, it is where a hand
+        // puts the probe and the count is of the window inside it. Told
+        // nothing, rest is learned and the band is drawn around it, and the
+        // count is of the window anywhere else.
         const away = if (banded)
             self.spread.inside >= self.band_share
         else
-            clampedAbsDiff(level, self.baseline.base) >= self.still_move;
+            // The same counting question as a told band, asked of a learned
+            // rest: how much of the last window was the probe somewhere it does
+            // not live. A median of the window said only where the middle of it
+            // was, which a hand that drops out one poll in fifteen drags back
+            // to rest -- and a range over that window is the dropout's full
+            // height, which reads as nobody there. Neither survives this rig;
+            // a count does.
+            self.spread.outside >= self.band_share;
 
+        // Still, as well as somewhere it does not live. Dropping the stillness
+        // test looked tempting once the count replaced the median -- the count
+        // is what survives a dropout -- but the two are not the same question.
+        // A probe wandering the whole range is outside rest for most of the
+        // window and is not a hand; it is a probe with nothing connected to it.
+        // Told a band, where the room has said what a touch looks like, being
+        // in it is enough. Left to learn, being away from rest is not.
         const held = if (banded) away else range <= self.still_range and away;
         // And let go once it is wandering again, or once it is no longer where
         // a held probe sits.
@@ -1994,4 +2029,70 @@ test "each probe carries its own floor" {
     var shared = deviationConfig();
     shared.counts = 4000;
     try std.testing.expectEqual(@as(i16, 4000), shared.forBc().counts.?);
+}
+
+/// A probe sitting at a level with the couple of counts of wobble any real one
+/// has. Flat enough to be still, alive enough not to be a fixture nobody has
+/// wired up.
+fn restingAt(level: i16, poll: usize) i16 {
+    return level + @as(i16, if (poll % 3 == 0) 2 else -2);
+}
+
+/// Settle a detector at a level of the caller's choosing, so what it learns as
+/// rest is that level rather than the fixture's own.
+fn settleAt(detector: *Detector, level: i16) void {
+    for (0..rest_warmup) |poll| _ = detector.update(restingAt(level, poll));
+}
+
+test "a touch is answered wherever the probe rests and whichever way it goes" {
+    // The four shapes a rig in this piece actually takes, which used to be four
+    // different things to configure and are now one question. Rest is learned,
+    // the band is drawn around it, and a touch is the window spending itself
+    // somewhere the probe does not live -- so which side of rest the hand takes
+    // it, and whether rest is a rail or the middle of the range, is not
+    // something anybody has to tell the program.
+    //
+    //     rest ~0      ->  touch ~25000
+    //     rest ~25000  ->  touch ~0
+    //     rest ~12000  ->  touch ~0
+    //     rest ~12000  ->  touch ~25000
+    const rigs = [_][2]i16{
+        .{ 0, 25000 },
+        .{ 25000, 0 },
+        .{ 12000, 0 },
+        .{ 12000, 25000 },
+    };
+
+    for (rigs) |rig| {
+        const rest = rig[0];
+        const touch = rig[1];
+
+        var detector: Detector = .init(steadyConfig());
+        settleAt(&detector, rest);
+        // Nobody there yet, however long it has been sitting.
+        try std.testing.expect(!detector.on);
+
+        for (0..steady_warmup) |poll| _ = detector.update(restingAt(touch, poll));
+        try std.testing.expect(detector.on);
+
+        // And the hand comes off again. A rig that latches and never lets go is
+        // the fault this model was reached for in the first place.
+        for (0..steady_warmup) |poll| _ = detector.update(restingAt(rest, poll));
+        try std.testing.expect(!detector.on);
+    }
+}
+
+test "a hand that drops out is still a hand" {
+    // What a count buys over a median and a range. Probe B reads its held level
+    // for fourteen polls and throws a rail on the fifteenth: the median of that
+    // window is the held level, but the range is the rail's full height, and a
+    // stillness test alone reads the whole touch as nobody there.
+    var detector: Detector = .init(steadyConfig());
+    settleAt(&detector, 0);
+
+    for (0..steady_warmup) |poll| {
+        const raw: i16 = if (poll % 15 == 14) 0 else restingAt(25000, poll);
+        _ = detector.update(raw);
+    }
+    try std.testing.expect(detector.on);
 }
