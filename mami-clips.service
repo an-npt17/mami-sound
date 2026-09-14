@@ -1,0 +1,38 @@
+[Unit]
+Description=Mami clip management UI
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/mami-sound
+
+# This service has no authentication. Binding the box's own Tailscale
+# address and nothing else is what stands in for it: the port is then
+# unreachable from the museum wifi, the wired network, and the internet.
+# Widening this to 0.0.0.0, or to the museum wifi address, would expose
+# delete-any-clip to anyone on that network -- do not do it. If staff off
+# the tailnet ever need this page, that is a request for authentication,
+# not a bind change. Each of the five boxes sets its own address here so
+# deploying to another one means changing this one line, not the command.
+Environment=MAMI_CLIPS_BIND=100.83.113.99
+ExecStart=/usr/bin/python3 -m clips_ui --root /home/pi/mami-sound --bind ${MAMI_CLIPS_BIND} --port 8080
+
+# Ride out a transient failure, but give up after 3 tries in 2 min so the
+# box sits idle and sshable instead of looping.
+Restart=on-failure
+RestartSec=10
+
+# Hardening. The service still needs to write inside WorkingDirectory
+# (clip folders, reload.request/.result) and to spawn ffprobe to validate
+# uploads, so nothing here restricts either of those.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/pi/mami-sound
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

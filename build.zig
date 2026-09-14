@@ -84,6 +84,31 @@ pub fn build(b: *std.Build) void {
     const adapters_tests = b.addTest(.{ .root_module = adapters_mod });
     const run_adapters_tests = b.addRunArtifact(adapters_tests);
 
+    // Prints the seven source/folder pairs out of `clip_loader.directoriesFor`
+    // as JSON, so `clips_ui/src/clips_ui/sources.json` is generated from the
+    // one place those names live rather than hand-copied. See
+    // `tools/dump_sources.zig` for why, and its note on the file's current
+    // provenance.
+    const dump_sources_mod = b.createModule(.{
+        .root_source_file = b.path("tools/dump_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mami_sound_core", .module = core_mod },
+            .{ .name = "mami_sound_adapters", .module = adapters_mod },
+        },
+    });
+    const dump_sources_exe = b.addExecutable(.{
+        .name = "dump_sources",
+        .root_module = dump_sources_mod,
+    });
+    const dump_sources_cmd = b.addRunArtifact(dump_sources_exe);
+    const dump_sources_step = b.step(
+        "dump-sources",
+        "Print the source/folder pairs as JSON (pipe into clips_ui/src/clips_ui/sources.json)",
+    );
+    dump_sources_step.dependOn(&dump_sources_cmd.step);
+
     const cli_mod = b.addModule("mami_sound_cli", .{
         .root_source_file = b.path("src/cli_test_root.zig"),
         .target = target,
@@ -106,4 +131,11 @@ pub fn build(b: *std.Build) void {
         "Run adapter tests from the adapter root",
     );
     adapter_test_step.dependOn(&run_adapters_tests.step);
+
+    // The detector and the drone are pure and depend on nothing outside
+    // `src/core/`, so a change to either can be checked without compiling the
+    // six other test binaries. On a machine that cannot hold twelve parallel
+    // LLVM jobs in memory, that is the difference between a loop and a wait.
+    const core_test_step = b.step("test-core", "Run core tests only");
+    core_test_step.dependOn(&run_core_tests.step);
 }
