@@ -167,12 +167,6 @@ pub fn parse(args: []const []const u8) Error!Options {
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
             opts.still_release = parseCounts(arg["--still-release=".len..]) orelse
                 return Error.InvalidStillThreshold;
-        } else if (std.mem.startsWith(u8, arg, "--counts=")) {
-            opts.counts = parseFloor(arg["--counts=".len..]) orelse
-                return Error.InvalidStillThreshold;
-        } else if (std.mem.startsWith(u8, arg, "--counts-b=")) {
-            opts.counts_bc = parseFloor(arg["--counts-b=".len..]) orelse
-                return Error.InvalidStillThreshold;
         } else if (std.mem.startsWith(u8, arg, "--still-window=")) {
             const ms = parseSeconds(arg["--still-window=".len..]) orelse
                 return Error.InvalidStillThreshold;
@@ -706,4 +700,8 @@ test "one probe's floor may be set without the other's" {
     const only_a = try parse(&.{"--counts=3000"});
     try std.testing.expectEqual(@as(i16, 3000), only_a.counts.?);
     try std.testing.expect(only_a.counts_bc == null);
+
+    const only_b = try parse(&.{"--counts-b=12000"});
+    try std.testing.expect(only_b.counts == null);
+    try std.testing.expectEqual(@as(i16, 12000), only_b.counts_bc.?);
 }
