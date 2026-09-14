@@ -261,7 +261,7 @@ pub const Model = enum { deviation, steady };
 /// four hundred readings at three fifths is two hundred and forty of them where
 /// a hand puts the probe, and nothing else on this rig sits there that long.
 /// At 44100 over 128 frames a poll that is 1161 ms.
-pub const default_still_window_ms: f32 = 1000.0;
+pub const default_still_window_ms: f32 = 1161.0;
 
 /// The spread, in counts, at or below which a probe counts as held, and the one
 /// at or above which the touch is over.
@@ -746,7 +746,7 @@ pub const Detector = struct {
         // probe with nothing connected to it is stiller than any hand could
         // hold one, and a probe wandering past the right level is not a hand.
         const away = if (banded)
-            self.spread.inside >= 0.0
+            self.spread.inside >= self.band_share
         else
             clampedAbsDiff(level, self.baseline.base) >= self.still_move;
 
