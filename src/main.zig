@@ -5,6 +5,7 @@ const core = @import("core/root.zig");
 const engine = @import("application/engine.zig");
 const ports = @import("ports/root.zig");
 const production_config = @import("application/production_config.zig");
+const boxes = @import("application/boxes/root.zig");
 const ads1115 = @import("adapters/ads1115.zig");
 const ads1115_probe = @import("adapters/ads1115_probe.zig");
 const aplay_sink = @import("adapters/aplay_sink.zig");
@@ -133,18 +134,37 @@ fn runComposition(
         if (live) stream.deinit();
     };
 
-    var voices: [2]voice_mod.Voice = .{ droneVoice(), droneVoice() };
+    // Which box this is decides what the plants play and what the detector is
+    // given, so it is settled once, before anything is loaded off disk.
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const box = production_config.chosenBox(opts.box, hostname(&host_buf));
+    const preset = if (box) |which| boxes.presetFor(which) else boxes.default_preset;
+    if (box) |which| {
+        std.debug.print("loading: {t}\n", .{which});
+    } else {
+        std.debug.print(
+            "loading: no box named, and this machine is none of the five: " ++
+                "running the unmeasured defaults\n",
+            .{},
+        );
+    }
+
+    var voices: [2]voice_mod.Voice = .{ droneVoice(preset.drone), droneVoice(preset.drone) };
     // What each plant does with a hand, in the one place both the voice and
     // the detector read it from. The drone is held by nature and takes no
     // mode, so it is recorded as a trigger and the detector is told nothing.
     var modes: [2]core.clips.Mode = .{ .trigger, .trigger };
 
-    for (opts.plant_sources, 0..) |chosen, plant| {
+    for (0..2) |plant| {
         const name: []const u8 = if (plant == 0) "A" else "B";
         if (!opts.plants[plant]) {
             std.debug.print("loading: plant {s} skipped\n", .{name});
             continue;
         }
+        // The room's answer, or this box's. A room that says nothing is not a
+        // room asking for the drone, which is the distinction a plain default
+        // could not make and the reason the field is optional.
+        const chosen = opts.plant_sources[plant] orelse preset.plants[plant].source;
         if (chosen.isDrone()) {
             std.debug.print("loading: plant {s} is the drone\n", .{name});
             continue;
@@ -166,22 +186,18 @@ fn runComposition(
             .{ name, pools[plant].paths.len },
         );
 
-        const mode = opts.plant_mode[plant] orelse .trigger;
+        const mode = opts.plant_mode[plant] orelse preset.plants[plant].mode;
         modes[plant] = mode;
-        const limit: core.clips.Limit = .forSource(
-            chosen,
-            opts.plant_seconds[plant],
-            mode,
-            core.sample_rate,
-        );
+        const seconds = opts.plant_seconds[plant] orelse preset.plants[plant].seconds;
+        const limit: core.clips.Limit = .forSource(chosen, seconds, mode, core.sample_rate);
         if (limit.total == core.clips.Limit.unlimited.total) {
             std.debug.print("loading: plant {s} plays each clip to its end\n", .{name});
         } else {
-            const seconds =
+            const played =
                 @as(f32, @floatFromInt(limit.total)) / @as(f32, @floatFromInt(core.sample_rate));
             std.debug.print(
                 "loading: each touch on plant {s} plays {d:.1}s\n",
-                .{ name, seconds },
+                .{ name, played },
             );
         }
 
@@ -207,14 +223,12 @@ fn runComposition(
         }
         try streams[plant].start();
 
-        const retrigger = opts.plant_retrigger[plant] orelse chosen.defaultRetriggerSeconds();
-        switch (mode) {
-            .hold => std.debug.print("loading: plant {s} sounds while it is held\n", .{name}),
-            .tap => std.debug.print(
-                "loading: plant {s} answers a tap, not a hand that rests\n",
-                .{name},
-            ),
-            .trigger => {},
+        // Three answers in order: the room's, the box's, the source's own.
+        const retrigger = opts.plant_retrigger[plant] orelse
+            preset.plants[plant].retrigger orelse
+            chosen.defaultRetriggerSeconds();
+        if (mode == .hold) {
+            std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
         }
         voices[plant] = .{
             .clips = .{
@@ -253,7 +267,7 @@ fn runComposition(
     std.debug.print("loading: starting engine...\n", .{});
     var app = engine.Engine.init(
         opts.plants,
-        production_config.touchWith(.{
+        production_config.touchWith(preset.touch, .{
             .model = opts.model,
             .still_range = opts.still_range,
             .still_release = opts.still_release,
@@ -319,16 +333,21 @@ fn parseArgs(
     return cli.parse(list.items);
 }
 
-/// The generated voice, with the room's preset shape.
-fn droneVoice() voice_mod.Voice {
-    return .{ .drone = .init(
-        core.sample_rate,
-        production_config.seed,
-        production_config.drone,
-    ) };
+/// The generated voice, with this box's measured shape.
+fn droneVoice(shape: core.noise.Shape) voice_mod.Voice {
+    return .{ .drone = .init(core.sample_rate, production_config.seed, shape) };
 }
 
 fn shuffleSeed(io: std.Io) u64 {
     const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
     return @truncate(@as(u96, @bitCast(ns)));
+}
+
+/// What this machine calls itself, or nothing.
+///
+/// Nothing rather than an error: a machine that cannot say its own name is a
+/// bench or a container, and both should run the unmeasured defaults and be
+/// told so on the loading line rather than refusing to start.
+fn hostname(buf: *[std.posix.HOST_NAME_MAX]u8) []const u8 {
+    return std.posix.gethostname(buf) catch "";
 }

@@ -34,9 +34,11 @@ pub const Options = struct {
     plants: select.Selection = select.all,
     device_buf: [device_max]u8 = undefined,
     device_len: usize = 0,
-    /// What each plant plays, indexed as the selection is. The defaults are
-    /// what the installation did before either flag took a value.
-    plant_sources: [2]source.Source = .{ .drone, .voicebox3 },
+    /// What each plant plays, indexed as the selection is. `null` is the room
+    /// not having said, which leaves the box's own answer standing -- and is
+    /// not the same as a room asking for the drone, which is what a plain
+    /// default could not distinguish.
+    plant_sources: [2]?source.Source = .{ null, null },
     /// How long a touch plays, and how long before the next one is honoured.
     /// `null` leaves the source's own answer standing.
     plant_seconds: [2]?f32 = .{ null, null },
@@ -200,7 +202,8 @@ pub fn parse(args: []const []const u8) Error!Options {
 
     // Checked here rather than per-argument because the source and its length
     // can arrive in either order.
-    for (opts.plant_sources, 0..) |chosen, plant| {
+    for (opts.plant_sources, 0..) |maybe_chosen, plant| {
+        const chosen = maybe_chosen orelse continue;
         if (!chosen.isDrone()) continue;
         if (opts.plant_seconds[plant] != null or opts.plant_retrigger[plant] != null) {
             return Error.SecondsOnDrone;
@@ -434,14 +437,17 @@ pub const usage =
 
 test "each plant chooses its own source" {
     const opts = try parse(&.{ "--plant-a=insect", "--plant-b=tradvn" });
-    try std.testing.expectEqual(source.Source.insect, opts.plant_sources[0]);
-    try std.testing.expectEqual(source.Source.tradvn, opts.plant_sources[1]);
+    try std.testing.expectEqual(source.Source.insect, opts.plant_sources[0].?);
+    try std.testing.expectEqual(source.Source.tradvn, opts.plant_sources[1].?);
 }
 
-test "the defaults are what the installation already does" {
+test "left unsaid, a plant's source is the box's to answer" {
+    // Not `.drone` and `.voicebox3` any more: those were a plain default no
+    // room could tell apart from asking for them on purpose. `null` leaves
+    // the box's own preset standing.
     const opts = try parse(&.{});
-    try std.testing.expectEqual(source.Source.drone, opts.plant_sources[0]);
-    try std.testing.expectEqual(source.Source.voicebox3, opts.plant_sources[1]);
+    try std.testing.expect(opts.plant_sources[0] == null);
+    try std.testing.expect(opts.plant_sources[1] == null);
     try std.testing.expect(opts.plant_seconds[0] == null);
     try std.testing.expect(opts.plant_retrigger[1] == null);
 }
@@ -449,18 +455,18 @@ test "the defaults are what the installation already does" {
 test "either plant accepts any source, including the drone" {
     try std.testing.expectEqual(
         source.Source.drone,
-        (try parse(&.{"--plant-b=drone"})).plant_sources[1],
+        (try parse(&.{"--plant-b=drone"})).plant_sources[1].?,
     );
     try std.testing.expectEqual(
         source.Source.bell,
-        (try parse(&.{"--plant-a=bell"})).plant_sources[0],
+        (try parse(&.{"--plant-a=bell"})).plant_sources[0].?,
     );
 }
 
 test "bare --plant-a still means the bird calls" {
     // A unit file already passing the flag keeps starting.
     const opts = try parse(&.{"--plant-a"});
-    try std.testing.expectEqual(source.Source.daybird, opts.plant_sources[0]);
+    try std.testing.expectEqual(source.Source.daybird, opts.plant_sources[0].?);
 }
 
 test "a source no folder answers to is refused" {
@@ -556,7 +562,12 @@ test "a mode no plant has is refused" {
 test "a mode given to the drone is refused" {
     // The drone already holds: its gate opens under a hand and falls to an idle
     // floor when the hand goes. A flag that changed nothing would only mislead.
-    try std.testing.expectError(Error.ModeOnDrone, parse(&.{"--plant-a-mode=hold"}));
+    // Checked only when the room named the drone outright -- a bare mode flag
+    // says nothing about the source, which unsaid is now the box's to answer.
+    try std.testing.expectError(
+        Error.ModeOnDrone,
+        parse(&.{ "--plant-a=drone", "--plant-a-mode=hold" }),
+    );
 }
 
 test "the stillness window can be shortened from the command line" {
