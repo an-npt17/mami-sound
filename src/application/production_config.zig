@@ -1,4 +1,5 @@
 const core = @import("../core/root.zig");
+const boxes = @import("boxes/root.zig");
 
 /// The rig in the room decides which of the two models this is.
 ///
@@ -100,9 +101,16 @@ pub const Overrides = struct {
 /// wanted it or not.
 pub const tap_window_ms: f32 = 1000.0;
 
+/// Which box a run is: what the room said, or failing that what the machine is
+/// called, or failing that nobody.
+pub fn chosenBox(asked: ?boxes.Box, hostname: []const u8) ?boxes.Box {
+    return asked orelse boxes.fromHostname(hostname);
+}
+
 /// The preset with the room's overrides applied. Anything left unset on the
-/// command line keeps the number above, which is the one that was measured.
+/// command line keeps the number the box was measured at.
 pub fn touchWith(
+    base: core.touch.Config,
     overrides: Overrides,
     /// How each plant answers a hand. The detector is told the same thing the
     /// clips are: a hold wants a level, a tap wants a gesture, and a trigger
@@ -110,7 +118,7 @@ pub fn touchWith(
     /// the window discards a hand that rests, which is the touch a room makes.
     modes: [2]core.clips.Mode,
 ) core.touch.Config {
-    var cfg = touch;
+    var cfg = base;
     if (overrides.model) |chosen| cfg.model = chosen;
 
     cfg.hold = modes[0] == .hold;
@@ -171,7 +179,7 @@ pub const drone: core.noise.Shape = .{
 const std = @import("std");
 
 test "an override reaches the config and the rest of the preset stands" {
-    const cfg = touchWith(.{ .model = .steady, .still_range = 64 }, .{ .trigger, .trigger });
+    const cfg = touchWith(touch, .{ .model = .steady, .still_range = 64 }, .{ .trigger, .trigger });
     try std.testing.expectEqual(core.touch.Model.steady, cfg.model);
     try std.testing.expectEqual(@as(i16, 64), cfg.still_range);
     // Untouched by the override, so still the measured number.
@@ -179,19 +187,19 @@ test "an override reaches the config and the rest of the preset stands" {
 }
 
 test "no overrides on two triggers is the preset exactly" {
-    try std.testing.expectEqual(touch, touchWith(.{}, .{ .trigger, .trigger }));
+    try std.testing.expectEqual(touch, touchWith(touch, .{}, .{ .trigger, .trigger }));
 }
 
 test "each plant is told to hold on its own" {
-    const a_held = touchWith(.{}, .{ .hold, .trigger });
+    const a_held = touchWith(touch, .{}, .{ .hold, .trigger });
     try std.testing.expect(a_held.hold);
     try std.testing.expect(!a_held.hold_bc);
 
-    const both = touchWith(.{}, .{ .hold, .hold });
+    const both = touchWith(touch, .{}, .{ .hold, .hold });
     try std.testing.expect(both.hold);
     try std.testing.expect(both.hold_bc);
 
-    const neither = touchWith(.{}, .{ .trigger, .trigger });
+    const neither = touchWith(touch, .{}, .{ .trigger, .trigger });
     try std.testing.expect(!neither.hold);
     try std.testing.expect(!neither.hold_bc);
 }
@@ -201,13 +209,13 @@ test "a plant left on trigger is given no tap window" {
     // nobody asked for, and a tap window discards a hand that rests -- which is
     // every touch a room makes. Plant B crossed its threshold twenty-four times
     // in one log of a thousand polls and sounded on none of them.
-    const machine: core.touch.Machine = .init(touchWith(.{}, .{ .trigger, .trigger }));
+    const machine: core.touch.Machine = .init(touchWith(touch, .{}, .{ .trigger, .trigger }));
     try std.testing.expect(machine.a.window == null);
     try std.testing.expect(machine.bc.window == null);
 }
 
 test "a plant asked for a tap is given the window" {
-    const machine: core.touch.Machine = .init(touchWith(.{}, .{ .tap, .tap }));
+    const machine: core.touch.Machine = .init(touchWith(touch, .{}, .{ .tap, .tap }));
     try std.testing.expect(machine.a.window != null);
     try std.testing.expect(machine.bc.window != null);
 }
@@ -231,20 +239,20 @@ test "the preset carries a floor for each probe" {
 test "a room may take a tap plant's window away without a rebuild" {
     // A plant told to tap on a rig where a hand stays put still has to be
     // reachable, and `off` is the word for it.
-    const off = touchWith(.{ .plant_window = .{ null, .off } }, .{ .trigger, .tap });
+    const off = touchWith(touch, .{ .plant_window = .{ null, .off } }, .{ .trigger, .tap });
     const machine: core.touch.Machine = .init(off);
     try std.testing.expect(machine.bc.window == null);
 
-    const longer = touchWith(.{ .plant_window = .{ null, .{ .ms = 3000.0 } } }, .{ .trigger, .tap });
+    const longer = touchWith(touch, .{ .plant_window = .{ null, .{ .ms = 3000.0 } } }, .{ .trigger, .tap });
     try std.testing.expectEqual(@as(f32, 3000.0), longer.window_bc.?.ms);
 
     // Plant A takes the same flag, where the preset gives it no window at all.
-    const a_window = touchWith(.{ .plant_window = .{ .{ .ms = 500.0 }, null } }, .{ .trigger, .trigger });
+    const a_window = touchWith(touch, .{ .plant_window = .{ .{ .ms = 500.0 }, null } }, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(f32, 500.0), a_window.window_ms.?);
 }
 
 test "a held plant drops its tap window, and only that plant's" {
-    const b_held = touchWith(.{}, .{ .trigger, .hold });
+    const b_held = touchWith(touch, .{}, .{ .trigger, .hold });
     try std.testing.expect(!b_held.hold);
     try std.testing.expect(b_held.hold_bc);
 
@@ -255,17 +263,17 @@ test "a held plant drops its tap window, and only that plant's" {
 test "each plant's band reaches its own probe" {
     // The two probes do not sit at the same place, so one band cannot serve
     // both: a hand puts one near 660 and the other near 25000.
-    const cfg = touchWith(.{ .plant_band = .{ .{ 600, 700 }, .{ 24000, 26000 } } }, .{ .trigger, .trigger });
+    const cfg = touchWith(touch, .{ .plant_band = .{ .{ 600, 700 }, .{ 24000, 26000 } } }, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, 600), cfg.touch_band_lo);
     try std.testing.expectEqual(@as(?i16, 24000), cfg.touch_band_lo_bc);
 }
 
 test "a room may set each probe's counts floor, or neither" {
-    const preset = touchWith(.{}, .{ .trigger, .trigger });
+    const preset = touchWith(touch, .{}, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, default_counts), preset.counts);
     try std.testing.expectEqual(@as(?i16, default_counts_bc), preset.counts_bc);
 
-    const only_a = touchWith(.{ .counts = 1500 }, .{ .trigger, .trigger });
+    const only_a = touchWith(touch, .{ .counts = 1500 }, .{ .trigger, .trigger });
     try std.testing.expectEqual(@as(?i16, 1500), only_a.counts);
     try std.testing.expectEqual(@as(?i16, default_counts_bc), only_a.counts_bc);
 }
@@ -273,7 +281,7 @@ test "a room may set each probe's counts floor, or neither" {
 test "a floor of zero puts a probe back on the score alone" {
     // Zero is a setting and not a typo: it says "no floor", which `null` cannot
     // say because there it already means "keep the preset".
-    const bare = touchWith(.{ .counts = 0, .counts_bc = 0 }, .{ .trigger, .trigger });
+    const bare = touchWith(touch, .{ .counts = 0, .counts_bc = 0 }, .{ .trigger, .trigger });
     try std.testing.expect(bare.counts == null);
     try std.testing.expect(bare.counts_bc == null);
 }
@@ -282,7 +290,7 @@ test "one probe's floor can be cleared without clearing the other's" {
     // They are separate thresholds about separate probes, and `forBc` falls
     // back to A's when BC has none -- so clearing A alone must not take BC's
     // floor with it.
-    const cfg = touchWith(.{ .counts = 0 }, .{ .trigger, .trigger });
+    const cfg = touchWith(touch, .{ .counts = 0 }, .{ .trigger, .trigger });
     try std.testing.expect(cfg.counts == null);
     try std.testing.expectEqual(default_counts_bc, cfg.forBc().counts.?);
 }
@@ -298,4 +306,18 @@ test "the span is the move the probe actually makes" {
     const just_over = core.noise.freqFromDeviation(default_counts, drone.span, drone.touch_floor);
     try std.testing.expect(just_over > 3.0 * core.noise.freq_min);
     try std.testing.expect(just_over < 0.5 * core.noise.freq_max);
+}
+
+test "the flag wins over the hostname, and the hostname over nothing" {
+    try std.testing.expectEqual(boxes.Box.box5, chosenBox(.box5, "box2").?);
+    try std.testing.expectEqual(boxes.Box.box2, chosenBox(null, "box2.local").?);
+    try std.testing.expect(chosenBox(null, "somebodys-laptop") == null);
+}
+
+test "a box's numbers reach the config, and the room's beat the box's" {
+    const box_only = touchWith(boxes.presetFor(.box5).touch, .{}, .{ .trigger, .trigger });
+    try std.testing.expectEqual(boxes.presetFor(.box5).touch.counts, box_only.counts);
+
+    const room_said = touchWith(boxes.presetFor(.box5).touch, .{ .counts = 1500 }, .{ .trigger, .trigger });
+    try std.testing.expectEqual(@as(?i16, 1500), room_said.counts);
 }
