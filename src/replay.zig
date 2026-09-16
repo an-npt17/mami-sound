@@ -201,8 +201,16 @@ const Args = struct {
     /// asks.
     counts: ?i16 = null,
     counts_bc: ?i16 = null,
+    /// The share of the window the `learned` model wants past the line. Null
+    /// leaves the preset's, which is the number a capture is swept to settle.
+    band_share: ?f32 = null,
     sweep: bool = false,
     list: bool = false,
+    /// A model name that is not one of the three. Refused rather than ignored:
+    /// the arm for `learned` was missing here for as long as the model existed,
+    /// so `--model=learned` silently replayed `steady` and every answer it gave
+    /// was about a different model.
+    bad_model: bool = false,
 };
 
 fn parseArgs(argv: []const []const u8) Args {
@@ -210,8 +218,17 @@ fn parseArgs(argv: []const []const u8) Args {
     for (argv) |arg| {
         if (std.mem.startsWith(u8, arg, "--model=")) {
             const name = arg["--model=".len..];
-            if (std.mem.eql(u8, name, "deviation")) out.model = .deviation;
-            if (std.mem.eql(u8, name, "steady")) out.model = .steady;
+            if (std.mem.eql(u8, name, "deviation")) {
+                out.model = .deviation;
+            } else if (std.mem.eql(u8, name, "steady")) {
+                out.model = .steady;
+            } else if (std.mem.eql(u8, name, "learned")) {
+                out.model = .learned;
+            } else {
+                out.bad_model = true;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--band-share=")) {
+            out.band_share = std.fmt.parseFloat(f32, arg["--band-share=".len..]) catch null;
         } else if (std.mem.startsWith(u8, arg, "--still-range=")) {
             out.latch = std.fmt.parseInt(i16, arg["--still-range=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
@@ -236,6 +253,15 @@ fn parseArgs(argv: []const []const u8) Args {
 /// it spends every step in the part that was never in question.
 const sweep_ranges = [_]i16{ 4, 8, 16, 32, 64, 128, 256, 512, 1024 };
 
+/// The shares a `learned` sweep tries.
+///
+/// Spaced evenly, because unlike the ranges this one lives in a single decade
+/// and the question is where inside it the rig's own hands fall. The preset's
+/// 0.6 is the top of this, not the middle: on the room's logs a held probe is
+/// past the line a quarter to half the time and an untouched one a fiftieth to
+/// a fifth, so the answer the sweep is looking for is somewhere below it.
+const sweep_shares = [_]f32{ 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.75 };
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -251,6 +277,10 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg| try argv.append(gpa, try gpa.dupe(u8, arg));
 
     const args = parseArgs(argv.items);
+    if (args.bad_model) {
+        std.debug.print("--model= takes deviation, steady or learned\n", .{});
+        std.process.exit(1);
+    }
 
     const text = std.Io.Dir.cwd().readFileAlloc(io, args.path, gpa, .limited(1 << 30)) catch |err| {
         std.debug.print("could not read {s}: {s}\n", .{ args.path, @errorName(err) });
@@ -296,6 +326,24 @@ pub fn main(init: std.process.Init) !void {
     if (args.release) |v| base.still_release = v;
     if (args.counts) |v| base.counts = v;
     if (args.counts_bc) |v| base.counts_bc = v;
+    if (args.band_share) |v| base.band_share = v;
+
+    // The `learned` model is judged by a share, not by a range, so sweeping
+    // ranges past it answers nothing. Sweep what it actually reads.
+    if (args.sweep and base.model == .learned) {
+        std.debug.print("sweeping the share the window must be past the line:\n", .{});
+        for (sweep_shares) |share| {
+            var cfg = base;
+            cfg.band_share = share;
+            const result = try replay(gpa, readings.items, cfg);
+            defer gpa.free(result.a_episodes);
+            defer gpa.free(result.bc_episodes);
+            std.debug.print("share {d:.2}\n", .{share});
+            report("A", result.a, polls);
+            report("BC", result.bc, polls);
+        }
+        return;
+    }
 
     if (args.sweep) {
         std.debug.print("sweeping the range, release held at {d}:\n", .{@as(u16, @intCast(base.still_release))});
@@ -319,7 +367,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("model {t}", .{base.model});
-    if (base.model == .steady) {
+    if (base.model == .learned) {
+        std.debug.print("  share {d:.2}", .{base.band_share});
+    } else if (base.model == .steady) {
         std.debug.print("  range {d}  release {d}", .{
             @as(u16, @intCast(base.still_range)),
             @as(u16, @intCast(base.still_release)),
@@ -403,4 +453,38 @@ test "episodes are counted at the edges, and one still open at the end is closed
 
     try std.testing.expectEqual(@as(usize, 2), result.a.episodes);
     try std.testing.expect(result.a.latched_polls > 0);
+}
+
+test "every model the detector has can be replayed" {
+    // The arm for `learned` was missing here for as long as the model existed.
+    // A name that matched neither of the other two fell through to the default,
+    // so `--model=learned` replayed `steady`, printed `model steady`, and
+    // answered every question about a model nobody asked for.
+    try std.testing.expectEqual(
+        core.touch.Model.learned,
+        parseArgs(&.{"--model=learned"}).model,
+    );
+    try std.testing.expectEqual(
+        core.touch.Model.deviation,
+        parseArgs(&.{"--model=deviation"}).model,
+    );
+    try std.testing.expectEqual(
+        core.touch.Model.steady,
+        parseArgs(&.{"--model=steady"}).model,
+    );
+}
+
+test "a model this does not have is refused rather than ignored" {
+    try std.testing.expect(parseArgs(&.{"--model=stillness"}).bad_model);
+    try std.testing.expect(!parseArgs(&.{"--model=learned"}).bad_model);
+}
+
+test "the share the learned model is judged by can be set and swept" {
+    // The number a capture is taken to settle, so a replay that could not move
+    // it could not answer the one question the capture is for.
+    try std.testing.expectEqual(
+        @as(?f32, 0.25),
+        parseArgs(&.{"--band-share=0.25"}).band_share,
+    );
+    try std.testing.expectEqual(@as(?f32, null), parseArgs(&.{"--model=learned"}).band_share);
 }

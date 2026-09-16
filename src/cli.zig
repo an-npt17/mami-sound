@@ -15,6 +15,8 @@ pub const Error = error{
     SecondsOnDrone,
     InvalidTouchModel,
     InvalidStillThreshold,
+    InvalidTouchFloor,
+    InvalidTouchRise,
     InvalidCapture,
     InvalidBox,
     TooManyArguments,
@@ -67,6 +69,13 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// How far up the pitch range a touch starts, as a fraction of it.
+    touch_floor: ?f32 = null,
+    /// How long a held touch takes to climb from that start to the top. Set,
+    /// the drone reads its pitch off the hold rather than off the reading --
+    /// which is the only thing that works on the `learned` rig, where the
+    /// reading offers two pitches and no more.
+    touch_rise_s: ?f32 = null,
     /// How big a move a touch must be, in the counts the probe reads, per
     /// probe. Unset keeps the measured preset; zero asks for no floor at all.
     ///
@@ -183,6 +192,16 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidStillThreshold;
             if (ms <= 0.0) return Error.InvalidStillThreshold;
             opts.still_window_ms = ms * 1000.0;
+        } else if (std.mem.startsWith(u8, arg, "--touch-floor=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--touch-floor=".len..]) catch
+                return Error.InvalidTouchFloor;
+            if (!(fraction >= 0.0) or fraction > 1.0) return Error.InvalidTouchFloor;
+            opts.touch_floor = fraction;
+        } else if (std.mem.startsWith(u8, arg, "--touch-rise=")) {
+            const seconds = parseSeconds(arg["--touch-rise=".len..]) orelse
+                return Error.InvalidTouchRise;
+            if (seconds <= 0.0) return Error.InvalidTouchRise;
+            opts.touch_rise_s = seconds;
         } else if (std.mem.eql(u8, arg, "--plant-a")) {
             // The shorthand the flag had when it was a switch, kept so a unit
             // file already passing it keeps starting.
@@ -292,6 +311,7 @@ pub const usage =
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--still-window=SECONDS] [--counts=N] [--counts-b=N]
+    \\                  [--touch-floor=FRACTION] [--touch-rise=SECONDS]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--box=N]
     \\                  [--test-random-probe]
@@ -371,6 +391,17 @@ pub const usage =
     \\touching after start, and answers the first hand on a plainer question
     \\while it waits to see what a touch on this rig looks like.
     \\Use `steady` on a rig whose probes clamp to a level you cannot predict.
+    \\
+    \\--touch-floor is how far up the pitch range a touch starts, as a fraction
+    \\of it, and --touch-rise is how long a held touch takes to climb from there
+    \\to the top. A rise turns the drone's pitch into the length of the hold
+    \\rather than the size of the reading.
+    \\
+    \\The learned model takes both without being asked, because it cannot hand a
+    \\pitch to the reading: its deviation is the gap between the window's middle
+    \\and rest, and a middle is a median, so on a probe living at two levels the
+    \\reading offers two pitches and no more. These flags are how to say other
+    \\numbers, or to ask for the ramp on a model that did not choose it.
     \\
     \\--still-range and --still-release are that model's two thresholds, in
     \\counts: at or below the range the probe is being held, at or above the
@@ -588,6 +619,33 @@ test "the stillness window can be shortened from the command line" {
     try std.testing.expect((try parse(&.{})).still_window_ms == null);
 }
 
+test "the drone's start and climb can be set from the command line" {
+    // The two numbers that decide what a touch sounds like on the learned rig,
+    // where the reading cannot carry a pitch and the hold has to.
+    const opts = try parse(&.{ "--touch-floor=0.6", "--touch-rise=4" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), opts.touch_floor.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), opts.touch_rise_s.?, 0.0001);
+
+    const bare = try parse(&.{});
+    try std.testing.expect(bare.touch_floor == null);
+    try std.testing.expect(bare.touch_rise_s == null);
+}
+
+test "a floor outside the range is refused rather than clamped" {
+    // A floor is a fraction of the pitch range. Silently clamping 6 to 1 would
+    // hand back a drone pinned at the top and no way to tell why.
+    try std.testing.expectError(Error.InvalidTouchFloor, parse(&.{"--touch-floor=1.5"}));
+    try std.testing.expectError(Error.InvalidTouchFloor, parse(&.{"--touch-floor=-0.1"}));
+    try std.testing.expectError(Error.InvalidTouchFloor, parse(&.{"--touch-floor=up"}));
+}
+
+test "a rise of no time at all is refused" {
+    // Zero would be a touch that is at the top the instant it is called, which
+    // is the switch this was added to stop being.
+    try std.testing.expectError(Error.InvalidTouchRise, parse(&.{"--touch-rise=0"}));
+    try std.testing.expectError(Error.InvalidTouchRise, parse(&.{"--touch-rise=-2"}));
+}
+
 test "a window of no time at all is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=0"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
@@ -613,6 +671,8 @@ test "the usage banner names every flag the parser takes" {
         "--still-window=",
         "--counts=",
         "--counts-b=",
+        "--touch-floor=",
+        "--touch-rise=",
         "--test-random-probe",
     };
     const banner_end = std.mem.indexOf(u8, usage, "\nPLANTS").?;

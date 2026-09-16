@@ -94,6 +94,10 @@ pub const Overrides = struct {
     /// flag off: off keeps the measured number, zero asks the score alone.
     counts: ?i16 = null,
     counts_bc: ?i16 = null,
+    /// How far up the pitch range a touch starts, and how long it takes to
+    /// climb to the top from there. Unset leaves the box's own numbers.
+    touch_floor: ?f32 = null,
+    touch_rise_s: ?f32 = null,
 };
 
 /// How long a tap may last and still be a tap, for whichever plant asks to be
@@ -176,7 +180,65 @@ pub const drone: core.noise.Shape = .{
     .release_s = 0.5,
 };
 
+/// The drone shape with the room's overrides applied, and the pairing the
+/// `learned` model needs.
+///
+/// `learned` cannot hand a pitch to the reading. Its `deviation` is the gap
+/// between the window's middle and rest, and a middle is a median: on a probe
+/// that lives at two levels the median is one of them and never between, so the
+/// reading offers the bottom of the range and the top and nothing else --
+/// measured over an eight-second hold it took exactly two values. A room that
+/// asks for `learned` and gets the reading mapping gets a switch, and no `span`
+/// mends that because the input has two values in it.
+///
+/// So choosing that model chooses the ramp with it, unless the room says
+/// otherwise. The other two models are left exactly as they were: there the
+/// reading does carry a pitch, and every box measured so far was tuned on it.
+pub fn droneWith(
+    base: core.noise.Shape,
+    overrides: Overrides,
+    model: core.touch.Model,
+) core.noise.Shape {
+    var shape = base;
+    if (model == .learned) {
+        shape.touch_rise_s = core.noise.default_touch_rise_s;
+        // Starting a ramp at the bottom of the range spends its first second
+        // inaudible, which on a four-second climb is a quarter of the gesture.
+        if (shape.touch_floor == 0.0) shape.touch_floor = core.noise.default_touch_floor_ramped;
+    }
+    if (overrides.touch_floor) |fraction| shape.touch_floor = fraction;
+    if (overrides.touch_rise_s) |seconds| shape.touch_rise_s = seconds;
+    return shape;
+}
+
 const std = @import("std");
+
+test "the learned model is given a pitch it can actually carry" {
+    // Without this, asking for `learned` on the command line gets a drone with
+    // two pitches in it: the bottom of the range and the top.
+    const ramped = droneWith(drone, .{}, .learned);
+    try std.testing.expect(ramped.touch_rise_s != null);
+    try std.testing.expect(ramped.touch_floor > 0.0);
+}
+
+test "the models that can carry a pitch keep the mapping they were tuned on" {
+    for ([_]core.touch.Model{ .deviation, .steady }) |model| {
+        const shape = droneWith(drone, .{}, model);
+        try std.testing.expect(shape.touch_rise_s == null);
+        try std.testing.expectEqual(drone.touch_floor, shape.touch_floor);
+        try std.testing.expectEqual(drone.span, shape.span);
+    }
+}
+
+test "the room outranks the pairing, in both directions" {
+    const said = droneWith(drone, .{ .touch_floor = 0.2, .touch_rise_s = 9.0 }, .learned);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), said.touch_floor, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.0), said.touch_rise_s.?, 0.0001);
+
+    // And a room may ask for the ramp on a model that did not choose it.
+    const asked = droneWith(drone, .{ .touch_rise_s = 2.0 }, .deviation);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), asked.touch_rise_s.?, 0.0001);
+}
 
 test "an override reaches the config and the rest of the preset stands" {
     const cfg = touchWith(touch, .{ .model = .steady, .still_range = 64 }, .{ .trigger, .trigger });

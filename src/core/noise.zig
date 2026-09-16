@@ -62,6 +62,36 @@ pub const default_burst_s: f32 = 0.4;
 /// inside the band to spend the rest of the range on top of that.
 pub const default_touch_floor: f32 = 0.0;
 
+/// How long a held touch takes to climb from `touch_floor` to the top of the
+/// range, in seconds. Null asks the reading for the pitch, as this always has.
+///
+/// For the rig the `learned` model was reached for, where the reading cannot
+/// carry a pitch at all. There `deviation` is the distance from the window's
+/// middle to rest, and a middle is a median: on a probe that lives at two
+/// levels a median is one of those two and never between them, so the reading
+/// offers the bottom of the range and the top and nothing else. Measured over
+/// an eight-second hold it took exactly two values, 0 and 25678, which is a
+/// switch rather than an instrument -- and no `span` adds a third, because the
+/// input has only two.
+///
+/// So the pitch is given the one thing about a touch on this rig that does vary
+/// smoothly: how long it has lasted. A hand arrives partway up the range and
+/// climbs while it stays.
+///
+/// Four seconds, which is the rise the design was written around and about the
+/// length of the glide it replaces.
+pub const default_touch_rise_s: f32 = 4.0;
+
+/// Where a ramped touch starts, as a fraction of the range.
+///
+/// The bottom of the range is `freq_min`, which is where the drone already sits
+/// with nobody in the room -- so a climb that started there would spend its
+/// first second saying nothing, and on a four-second rise that is a quarter of
+/// the gesture spent inaudible. At 0.6 a touch is answered at about 215 Hz the
+/// moment it is called, and the climb is heard as a climb rather than as a
+/// fade-in.
+pub const default_touch_floor_ramped: f32 = 0.6;
+
 /// How plant A's pitch answers a touch: how far up the range a touch reaches
 /// before the reading is consulted at all, how far up a deviation reaches from
 /// there, how long the sweep up to it takes, how long the tracking behind it
@@ -69,6 +99,9 @@ pub const default_touch_floor: f32 = 0.0;
 pub const Shape = struct {
     span: i16 = default_span,
     touch_floor: f32 = default_touch_floor,
+    /// Set to climb on the hold rather than on the reading. Null keeps the
+    /// mapping every existing rig was tuned against.
+    touch_rise_s: ?f32 = null,
     burst_s: f32 = default_burst_s,
     glide_s: f32 = default_glide_s,
     release_s: ?f32 = default_release_s,
@@ -127,6 +160,12 @@ pub const Noise = struct {
     span: i16,
     /// Where a touch starts the deviation counting from.
     touch_floor: f32,
+    /// How long a held touch takes to reach the top, or null to ask the
+    /// reading instead.
+    touch_rise_s: ?f32,
+    /// How many samples the touch under way has lasted, which is what a ramped
+    /// pitch is read off. Nought whenever nobody is touching.
+    touch_samples: u64,
     /// How far the burst travels each sample, as a fraction of the sweep.
     burst_step: f32,
 
@@ -155,6 +194,8 @@ pub const Noise = struct {
             .gate_step = 1.0 / (gate_ms / 1000.0 * sr),
             .span = shape.span,
             .touch_floor = shape.touch_floor,
+            .touch_rise_s = shape.touch_rise_s,
+            .touch_samples = 0,
             .burst_step = 1.0 / @max(shape.burst_s * sr, 1.0),
             .fc = freq_min,
             .low = 0.0,
@@ -171,7 +212,11 @@ pub const Noise = struct {
         // The floor belongs to the touch, so an untouched voice still maps to
         // the bottom of the range and the release still carries the pitch all
         // the way home rather than parking it on the floor.
-        const target_fc = freqFromDeviation(dev, self.span, if (touched) self.touch_floor else 0.0);
+        const reading_fc = freqFromDeviation(dev, self.span, if (touched) self.touch_floor else 0.0);
+        // A ramped voice reads its pitch off the clock instead, but only while
+        // somebody is there: released, it falls home on the same mapping as
+        // every other voice, which is what keeps the release one behaviour.
+        const ramping = touched and self.touch_rise_s != null;
         const sr = @as(f32, @floatFromInt(self.sample_rate));
         const rand = self.prng.random();
         const gate_target: f32 = if (touched) 1.0 else idle_gain;
@@ -182,9 +227,14 @@ pub const Noise = struct {
         // pitch is then the smoother's to carry home.
         if (touched and !self.prev_touch) {
             self.burst = 0.0;
-            self.fc = freq_min;
+            self.touch_samples = 0;
+            // A ramped touch starts partway up and climbs, so it has no sweep
+            // to make and dropping the pitch to the bottom first would put a
+            // swoop in front of every hand. The glide carries it to the floor.
+            if (!ramping) self.fc = freq_min;
         } else if (!touched) {
             self.burst = 0.0;
+            self.touch_samples = 0;
         }
         self.prev_touch = touched;
 
@@ -194,7 +244,23 @@ pub const Noise = struct {
         const alpha = if (touched) self.alpha else self.alpha_release;
 
         for (out) |*sample| {
-            if (touched and self.burst < 1.0) {
+            var target_fc = reading_fc;
+            if (ramping) {
+                const rise = self.touch_rise_s.?;
+                const age = @as(f32, @floatFromInt(self.touch_samples)) / sr;
+                // Read per sample rather than per block, so a four-second climb
+                // is a climb and not a staircase of block-sized steps.
+                const t = if (rise > 0.0)
+                    std.math.clamp(age / rise, 0.0, 1.0)
+                else
+                    1.0;
+                const reach = std.math.clamp(self.touch_floor, 0.0, 1.0);
+                target_fc = freq_min *
+                    std.math.pow(f32, freq_max / freq_min, reach + (1.0 - reach) * t);
+                self.touch_samples += 1;
+            }
+
+            if (touched and !ramping and self.burst < 1.0) {
                 self.burst = @min(1.0, self.burst + self.burst_step);
                 // Swept in the log domain, for the same reason the reading is
                 // mapped there: a sweep that is linear in hertz spends most of
@@ -373,4 +439,78 @@ fn rootMeanSquare(samples: []const f32) f32 {
     var sum: f64 = 0.0;
     for (samples) |sample| sum += @as(f64, sample) * @as(f64, sample);
     return @floatCast(@sqrt(sum / @as(f64, @floatFromInt(samples.len))));
+}
+
+/// A voice shaped the way the faulty rig needs: the pitch is the length of the
+/// hold rather than the size of the reading.
+fn rampVoice() Noise {
+    return .init(44100, 1, .{
+        .span = 3000,
+        .touch_floor = 0.6,
+        .touch_rise_s = 4.0,
+        .glide_s = 0.05,
+    });
+}
+
+test "a ramped touch starts partway up the range and does not wait for a reading" {
+    // On the learned model the reading is no help to a pitch. `deviation` there
+    // is the distance from the window's middle to rest, and on a rig whose
+    // probe lives at two levels a median is one of the two -- so the reading
+    // offers exactly two pitches, the bottom of the range and the top, and
+    // tuning `span` cannot add a third. The hold is what has a size here.
+    var voice = rampVoice();
+
+    // A tenth of a second in: already well clear of the untouched pitch,
+    // because the floor is where a ramped touch starts rather than where it
+    // ends up. The reading is nought, which under the old mapping was silence.
+    renderBlocks(&voice, 1, 0, true);
+    try std.testing.expect(voice.fc > 3.0 * freq_min);
+    try std.testing.expect(voice.fc < freq_max);
+}
+
+test "a ramped touch climbs to the top of the range on the hold alone" {
+    var voice = rampVoice();
+
+    renderBlocks(&voice, 5, 0, true);
+    const early = voice.fc;
+    renderBlocks(&voice, 15, 0, true);
+    const later = voice.fc;
+
+    // Half a second against two: the same reading throughout, and the pitch has
+    // moved. That movement is the whole point.
+    try std.testing.expect(later > early);
+
+    // Past the rise it is at the top and stays there.
+    renderBlocks(&voice, 40, 0, true);
+    try std.testing.expectApproxEqAbs(freq_max, voice.fc, 1.0);
+}
+
+test "a ramped touch ignores the reading entirely" {
+    // Two voices, the same hold, readings a rail apart. A pitch that answered
+    // the reading would separate them; this one must not, because on this rig
+    // the reading is the rail chatter and not the hand.
+    var quiet = rampVoice();
+    var loud = rampVoice();
+    renderBlocks(&quiet, 10, 0, true);
+    renderBlocks(&loud, 10, 25000, true);
+    try std.testing.expectApproxEqAbs(quiet.fc, loud.fc, 0.01);
+}
+
+test "a released ramp falls home and the next touch starts over" {
+    var voice = rampVoice();
+    renderBlocks(&voice, 60, 0, true);
+    try std.testing.expectApproxEqAbs(freq_max, voice.fc, 1.0);
+
+    renderBlocks(&voice, 10, 0, false);
+    try std.testing.expect(voice.fc < 1.1 * freq_min);
+
+    // The next hand gets its own rise, not the top of the last one.
+    renderBlocks(&voice, 1, 0, true);
+    try std.testing.expect(voice.fc < 0.5 * freq_max);
+}
+
+test "no rise asked for leaves the deviation mapping exactly as it was" {
+    var voice = steadyVoice();
+    renderBlocks(&voice, 20, 60, true);
+    try std.testing.expectApproxEqAbs(freqFromDeviation(60, 200, 0.6), voice.fc, 1.0);
 }

@@ -149,7 +149,13 @@ fn runComposition(
         );
     }
 
-    var voices: [2]voice_mod.Voice = .{ droneVoice(preset.drone), droneVoice(preset.drone) };
+    // What a touch sounds like depends on which model is answering, so the
+    // drone's shape is settled together with the model rather than before it.
+    const drone_shape = production_config.droneWith(preset.drone, .{
+        .touch_floor = opts.touch_floor,
+        .touch_rise_s = opts.touch_rise_s,
+    }, opts.model orelse preset.touch.model);
+    var voices: [2]voice_mod.Voice = .{ droneVoice(drone_shape), droneVoice(drone_shape) };
     // What each plant does with a hand, in the one place both the voice and
     // the detector read it from. The drone is held by nature and takes no
     // mode, so it is recorded as a trigger and the detector is told nothing.

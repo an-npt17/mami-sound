@@ -121,7 +121,21 @@ const warmup_samples: u32 = 30;
 /// there. The window is the knob, and it wants to be about four times the
 /// longest touch expected.
 pub const Baseline = struct {
+    /// What the probe's window sat at, which is what `base` is the median of.
     samples: [max_baseline_samples]i16,
+    /// The readings themselves, on the same schedule, which is what the two
+    /// levels are the percentiles of.
+    ///
+    /// Two feeds because the window is asked two questions and one feed cannot
+    /// answer both. Where the probe LIVES has to survive a hand that lasts:
+    /// window middles give that for free, because a hand on this rig flips the
+    /// probe home and back rather than holding it, and a window that is at the
+    /// far rail four polls in ten still has its middle at home -- so no amount
+    /// of such a hand moves rest. WHICH TWO LEVELS the probe visits cannot be
+    /// asked of window middles at all, for the same reason: fed middles the
+    /// window holds one level however long the hand stays, `reach` never leaves
+    /// nought, and no line is ever drawn.
+    raws: [max_baseline_samples]i16,
     scratch: [max_baseline_samples]i16,
     /// The window, in samples.
     len: u32,
@@ -144,6 +158,9 @@ pub const Baseline = struct {
     high: i16,
     /// The median absolute deviation, on the same schedule.
     mad: f32,
+    /// How much of the window sits BETWEEN the two levels, on the same
+    /// schedule. What says whether there are two levels at all: see `max_dead`.
+    dead: f32,
     /// While set, readings are dropped rather than learned. Crosstalk must not
     /// teach a probe that being pulled by the other plant is its resting state.
     frozen: bool,
@@ -155,6 +172,7 @@ pub const Baseline = struct {
         const len = @round(window_s * baseline_hz);
         return .{
             .samples = undefined,
+            .raws = undefined,
             .scratch = undefined,
             .len = std.math.clamp(@as(u32, @intFromFloat(@max(len, 1.0))), 1, max_baseline_samples),
             .count = 0,
@@ -165,12 +183,22 @@ pub const Baseline = struct {
             .low = 0,
             .high = 0,
             .mad = 0.0,
+            .dead = 0.0,
             .frozen = false,
         };
     }
 
     /// Feed one poll's mean. Most polls only advance the decimation counter.
+    ///
+    /// The two models that learn only rest have no second feed to give and pass
+    /// the same value twice, which leaves the levels reading off rest -- and
+    /// neither of them asks for the levels.
     pub fn push(self: *Baseline, mean_value: i16) void {
+        self.pushBoth(mean_value, mean_value);
+    }
+
+    /// Feed one poll's window middle and the reading it came from.
+    pub fn pushBoth(self: *Baseline, mean_value: i16, raw: i16) void {
         if (self.frozen) return;
         self.since += 1;
         if (self.since < self.decim) return;
@@ -178,6 +206,7 @@ pub const Baseline = struct {
 
         if (self.count < self.len) self.count += 1;
         self.samples[self.head] = mean_value;
+        self.raws[self.head] = raw;
         self.head = (self.head + 1) % self.len;
 
         self.recompute();
@@ -199,6 +228,7 @@ pub const Baseline = struct {
         self.low = 0;
         self.high = 0;
         self.mad = 0.0;
+        self.dead = 0.0;
     }
 
     /// Whether enough has arrived for the numbers to mean anything.
@@ -211,10 +241,13 @@ pub const Baseline = struct {
         @memcpy(self.scratch[0..n], self.samples[0..n]);
         std.mem.sort(i16, self.scratch[0..n], {}, std.sort.asc(i16));
         self.base = self.scratch[n / 2];
-        // The two levels the probe actually visits, off the sort the median
-        // needed anyway. Taken inside the ends rather than at them, because the
-        // extremes of a long window are a dropout and a rail rather than a
-        // level the probe ever sits at.
+
+        // The two levels the probe actually visits, off its own feed. Taken
+        // inside the ends rather than at them, because the extremes of a long
+        // window are a dropout and a rail rather than a level the probe ever
+        // sits at.
+        @memcpy(self.scratch[0..n], self.raws[0..n]);
+        std.mem.sort(i16, self.scratch[0..n], {}, std.sort.asc(i16));
         self.low = self.scratch[n * level_percentile / 100];
         self.high = self.scratch[@min(n * (100 - level_percentile) / 100, n - 1)];
 
@@ -223,6 +256,24 @@ pub const Baseline = struct {
         }
         std.mem.sort(i16, self.scratch[0..n], {}, std.sort.asc(i16));
         self.mad = @floatFromInt(self.scratch[n / 2]);
+
+        // How much of the window falls in the middle third of the gap. Two
+        // levels leave it empty; a probe that merely wanders fills it. One pass
+        // and no sort, and only the readings are asked -- the middles cannot be
+        // asked, since a window whose middle sits between the levels is exactly
+        // what a probe flipping between them gives when nobody is on it.
+        const reach = @max(
+            clampedAbsDiff(self.high, self.base),
+            clampedAbsDiff(self.low, self.base),
+        );
+        const near = @divTrunc(@as(i32, reach) * 33, 100);
+        const far = @divTrunc(@as(i32, reach) * 67, 100);
+        var between: usize = 0;
+        for (self.raws[0..n]) |sample| {
+            const distance = clampedAbsDiff(sample, self.base);
+            if (distance >= near and distance <= far) between += 1;
+        }
+        self.dead = @as(f32, @floatFromInt(between)) / @as(f32, @floatFromInt(n));
     }
 };
 
@@ -274,6 +325,26 @@ const mad_floor: f32 = 25.0;
 /// rail to be a level the probe genuinely sits at, near enough the end that a
 /// touch occupying a tenth of an evening is still found.
 const level_percentile: u32 = 5;
+
+/// How full the gap between the two levels may be before the probe is taken to
+/// have no two levels at all.
+///
+/// A share low enough to answer this rig's own hands is also low enough for a
+/// probe that is merely wandering to clear by accident, so `reach` alone cannot
+/// be what licenses a line. `reach` only says the ends of the window are far
+/// apart, which is as true of a probe drifting over six thousand counts as of
+/// one flipping between two rails -- and on the second the line is the whole
+/// method, while on the first it lands inside the wander and the probe reads
+/// about as touched as untouched forever after. On `service-log4` that is 0.400
+/// against 0.399, which is not a strict answer but no answer.
+///
+/// What tells them apart is the middle of the gap. Measured over the room's
+/// logs, the middle third holds 0.031 to 0.067 of the readings on every probe
+/// that visits two levels, and 0.577 on the one that only wanders; a probe
+/// reading uniformly across its range would give 0.33. The gap between 0.07 and
+/// 0.31 is wide enough that anything inside it works, which is the same kind of
+/// number, measured the same way, as `still_range`.
+const max_dead: f32 = 0.15;
 
 pub const Model = enum { deviation, steady, learned };
 
@@ -893,20 +964,31 @@ pub const Detector = struct {
 
         const level = self.spread.level;
 
-        // The window's own middle, fed to the long median. Not the raw reading:
-        // a rail thrown through a good touch would otherwise be a sample of
-        // where this probe lives.
+        // Both feeds, because the window is asked two questions. The middle
+        // says where the probe LIVES and survives a hand that lasts: a hand on
+        // this rig flips the probe home and back rather than holding it, so a
+        // window at the far rail four polls in ten still has its middle at
+        // home, and no amount of such a hand moves rest. The reading says WHICH
+        // TWO LEVELS the probe visits, which the middle cannot answer for
+        // exactly the same reason -- fed middles alone this window holds one
+        // level however long the hand stays, `reach` never leaves nought, no
+        // line is ever drawn, and the model meant to read the rig off the probe
+        // reads nothing off it at all. What answered the room then was the
+        // stand-in meant for the first hand of the evening, which asks whether
+        // the middle has left home: a fixed half-the-window vote nobody chose
+        // and no room could move.
+        //
+        // The worry that kept the reading out -- a rail thrown through a good
+        // touch becoming a sample of where the probe lives -- is a worry about
+        // a mean. Nothing here is one: `base` is a median and the two levels
+        // are percentiles, and a stray reading moves none of the three.
+        //
         // Never frozen, unlike the other two models. They freeze because they
         // learn only rest, and a window that kept taking samples through a
         // hand would learn the hand. This one has to see BOTH levels -- a
         // frozen window holds one cluster and can never find the other, and
         // the line between them is the whole method.
-        //
-        // Safe because the median is the thing being protected, and a median
-        // survives anything that takes up less than half the window. Five
-        // minutes of window against the longest hand a room has ever given a
-        // plant is not close.
-        self.baseline.push(level);
+        self.baseline.pushBoth(level, raw);
         if (self.baseline.count < self.rest_samples) {
             self.reset();
             return false;
@@ -921,7 +1003,14 @@ pub const Detector = struct {
         const down = clampedAbsDiff(self.baseline.low, rest);
         const reach = @max(up, down);
 
-        const away = if (reach >= self.still_move) blk: {
+        // Whether the probe has been anywhere but home. Short of this nothing
+        // has ever taken it anywhere, so there is no second level and no line.
+        const second_level = reach >= self.still_move;
+        // Whether the two ends are two levels rather than the ends of one
+        // wander, which is what says a line may be drawn between them at all.
+        const readable = self.baseline.dead <= max_dead;
+
+        const away = if (second_level and readable) blk: {
             // A touch has been seen, so the rig is known and the question is a
             // count: how much of the last window was past the halfway line.
             // Counted rather than measured, because a hand that drops out one
@@ -934,7 +1023,21 @@ pub const Detector = struct {
                 self.spread.watch(null, saturatingAdd(rest, -half));
             }
             break :blk self.spread.inside >= self.band_share;
-        } else
+        } else if (second_level)
+            // The ends are a long way apart and the gap between them is full,
+            // so this is one wander rather than two levels. Which means the
+            // probe cannot be read just now -- and a probe that cannot be read
+            // is quiet, not held.
+            //
+            // The stand-in below is emphatically not the answer here. It asks
+            // whether the window sits far from rest, and a probe whose home has
+            // moved sits far from rest by definition and for as long as the
+            // long window takes to catch up: a hand that arrives without anyone
+            // and never lets go. On the room's own capture, a probe that drifted
+            // from nought to twelve thousand was held for ninety-six seconds at
+            // an empty plant, looping a clip the whole way.
+            false
+        else
             // Nobody has touched it yet, so there is no second cluster to find
             // and no line to draw. Until there is, a touch is the plain thing:
             // the window sitting somewhere the probe does not live. The first
@@ -2270,4 +2373,151 @@ test "a hand on a probe that drops out half the time is still a hand" {
     // And it goes quiet again when the hand comes off.
     for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
     try std.testing.expect(!detector.on);
+}
+
+/// Polls enough to put a few hundred samples behind the long window.
+///
+/// `rest_warmup` fills the spread window and satisfies the calibration, which
+/// is all the older fixtures need. Finding two clusters is a question about the
+/// long window, and a long window with ninety samples in it answers it by
+/// accident: one sample in twenty is the fifth percentile, so ninety samples
+/// put `high` four readings from the end and a single stray reading moves it.
+const cluster_warmup: usize = 10 * rest_warmup;
+
+/// A probe that wanders rather than visiting two levels.
+///
+/// Probe A on `service-log4`, with nobody on it: it reads anywhere from 9776 to
+/// 15976 and everywhere in between. The ends of that are thousands of counts
+/// from the middle, so there is a `reach` to find and a line to draw -- and the
+/// line falls inside the wander, where the probe spends about as much of every
+/// window past it as not. On that log the share reads 0.399 untouched against
+/// 0.400 touched, which is not a strict answer but no answer at all.
+fn wandering(rng: std.Random) i16 {
+    return rng.intRangeAtMost(i16, 9776, 15976);
+}
+
+test "the rig is learned from a hand that keeps flipping home" {
+    // The journal's plant A, held: it reads the far rail about half the polls
+    // and home the rest, over and over, and never once holds still. The
+    // window's own median does not leave home on a touch shaped like that, so a
+    // long window fed window medians is fed nothing but home -- it has no
+    // second cluster to find, draws no line, and the model meant to read the
+    // rig off the probe reads nothing off it at all.
+    var detector: Detector = .init(learnedConfig());
+    for (0..cluster_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 5));
+
+    // Home is what it keeps coming back to and the far rail is the other level,
+    // both found off a probe that was never still for a single poll.
+    try std.testing.expect(clampedAbsDiff(detector.baseline.base, 5) < 100);
+    try std.testing.expect(detector.baseline.high > 20000);
+}
+
+test "a hand under half the window is counted, not written off" {
+    // Four polls in ten at the far rail is four tenths of the window past the
+    // line: a number a room can read, compare against the share, and argue
+    // with. Fed window medians this is not a small number but no number at
+    // all -- `reach` stays nought, no line is ever drawn, and the count the
+    // whole model rests on never runs. The plant is then judged by the
+    // stand-in meant for the first hand of the evening, which asks whether the
+    // window's median has left home: a fixed half-the-window vote that nobody
+    // chose and no room can move.
+    var detector: Detector = .init(learnedConfig());
+    for (0..cluster_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 4));
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), detector.spread.inside, 0.06);
+}
+
+test "a probe that only wanders has no two levels to find" {
+    // A share low enough to answer this rig's own hands -- on the room's logs a
+    // held probe is past the line a quarter to half the time -- is also low
+    // enough for a wandering probe to clear by accident. So the line may only
+    // be drawn where there are genuinely two clusters to draw it between, and
+    // what says so is the gap: two levels leave the middle of it empty, and a
+    // probe merely wandering fills it. Measured on the room's own logs, the
+    // middle third of the gap holds 0.031 to 0.067 of the readings where there
+    // are two levels, and 0.577 on the probe that only wanders.
+    var cfg = learnedConfig();
+    cfg.band_share = 0.2;
+
+    var detector: Detector = .init(cfg);
+    var prng: std.Random.DefaultPrng = .init(20260915);
+    for (0..cluster_warmup) |_| _ = detector.update(wandering(prng.random()));
+    try std.testing.expect(!detector.on);
+
+    // And the refusal is the gap being full, not the reach being small: there
+    // is plenty of reach here, which is exactly why a line gets drawn on this
+    // probe in the first place.
+    try std.testing.expect(detector.baseline.high - detector.baseline.low > 1000);
+}
+
+test "a long hand does not become where the probe lives" {
+    // What the reading feed would cost if it also decided rest. A hand is in
+    // that feed in its own right, so one lasting long enough to fill half the
+    // window would make the far rail the median and turn the model inside out:
+    // the plant sounds with an empty room and goes quiet under a hand. Hand
+    // after hand, that is what a room sees as the effect reversing.
+    //
+    // It does not, because rest is read off the middles, where a hand of this
+    // shape leaves no mark at all -- and that immunity has an edge worth being
+    // plain about. A middle is a median, so it stays home while the hand is at
+    // the far rail for under half the window, and becomes a coin toss at
+    // exactly half. Past that the middles are the hand too, and a hand long
+    // enough takes rest with it. The room's logs put a held probe at the far
+    // rail a quarter to half the time, so the margin is real but it is not
+    // wide, and a rig that clamped harder than this one would want the window
+    // lengthened rather than this test loosened.
+    //
+    // Shares with room either side: untouched two polls in ten, held four,
+    // against a share of three. The preset's own 0.6 has nowhere to sit in
+    // that at all.
+    var cfg = learnedConfig();
+    cfg.band_share = 0.3;
+
+    var detector: Detector = .init(cfg);
+    for (0..cluster_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 2));
+    for (0..cluster_warmup * 3 / 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 4));
+    try std.testing.expect(detector.on);
+
+    // Home is still home, measured through all of it.
+    try std.testing.expect(clampedAbsDiff(detector.baseline.base, 5) < 100);
+
+    for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 2));
+    try std.testing.expect(!detector.on);
+}
+
+/// A probe whose home has moved, wandering in a band a long way from where the
+/// long window still says it lives.
+///
+/// Probe BC in `probes.csv`, which the room found sitting between 11275 and
+/// 13353 after an evening that began with it at nought and the rail.
+fn wanderedHome(rng: std.Random) i16 {
+    return rng.intRangeAtMost(i16, 11275, 13353);
+}
+
+test "a probe whose home moves is quiet on the way, not touched for the journey" {
+    // What an electrode that has been moved, or warmed, or simply let go does:
+    // it stops visiting the two levels the window learned and settles somewhere
+    // between them. The window still says home is nought, so every reading is a
+    // long way from home and the crude stand-in calls that a hand -- one that
+    // never lets go, because the probe never moves back. On the room's own
+    // capture that was ninety-six seconds of a clip looping at an empty plant.
+    //
+    // The stand-in is for the first hand of the evening, when no second level
+    // has been seen and there is nothing else to ask. It is not an answer for a
+    // probe whose two levels have gone muddled: there the honest answer is that
+    // this probe cannot be read just now, and a probe that cannot be read is
+    // quiet.
+    var detector: Detector = .init(learnedConfig());
+    var prng: std.Random.DefaultPrng = .init(20260915);
+
+    for (0..cluster_warmup) |poll| _ = detector.update(flipping(poll, 5, 25685, 2));
+    try std.testing.expect(!detector.on);
+
+    var latched: usize = 0;
+    for (0..cluster_warmup * 3) |_| {
+        if (detector.update(wanderedHome(prng.random()))) latched += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), latched);
 }
