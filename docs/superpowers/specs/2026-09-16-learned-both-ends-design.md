@@ -6,7 +6,7 @@
 
 Probe A on the current rig rests nowhere. Untouched it wanders across the
 middle of the range, thousands of counts at a time, and a touch takes it to a
-rail and holds it there — sometimes the top, sometimes the bottom, on the same
+rail and parks it there — sometimes the top, sometimes the bottom, on the same
 probe in the same evening.
 
 Sixteen seconds of the room's journal, one poll a second:
@@ -18,188 +18,205 @@ touch       1      1      2      1      0      0  1200     1
 
 The touch is the tight one. Rest is the smear.
 
+This is the inverse of every rig the model was measured on. There a probe rests
+flat and a hand makes it flail: `flipping(poll, 5, 25700, 8)` in the fixtures,
+a held probe that throws home constantly and never holds still for a poll. Here
+rest is the flailing and the hand is the stillness. Both rigs are real and both
+have to keep working.
+
 ## Why the model refuses
 
-`stepLearned` asks two questions of the long window and both give the wrong
-answer here.
+`stepLearned` asks two questions of the long window.
 
-**The gap is full.** `readable` (`touch.zig:1011`) requires `dead <= 0.15` —
-at most a seventh of the readings may sit in the middle third between rest and
-the far level. Against `r0 = 5151`, `high ≈ 21330`, `low ≈ 0`: `reach = 16179`,
+**The gap is full.** `readable` (`touch.zig:1011`) requires `dead <= 0.15` — at
+most a seventh of the readings may sit in the middle third between rest and the
+far level. Against `r0 = 5151`, `high ≈ 21330`, `low ≈ 0`: `reach = 16179`,
 middle third is raw ∈ [10490, 15990], and four of the sixteen readings above
 land in it. That is 0.25 on a thin sample, and the idle median of ~11300 sits
 dead centre of the band, so over the real three-thousand-sample window it is
-higher still. `readable` is false, `away` is false on every poll, and the branch
-at `touch.zig:1026` returns quiet forever.
+higher. `readable` is false, `away` is false on every poll, and the branch at
+`touch.zig:1026` returns quiet forever.
 
-The test is not wrong. It asks whether the window holds two levels or one
-wander, and it was measured on probes where rest is a level: 0.031 to 0.067 on
-every probe that visits two, 0.577 on the one that only wanders. This probe
-wanders. The model's own assumption — tight rest cluster, tight touch cluster,
-empty gap — is inverted here, because rest *is* the gap.
+The repo already holds this probe as a fixture and asserts it must stay quiet:
+
+```zig
+fn wandering(rng: std.Random) i16 { return rng.intRangeAtMost(i16, 9776, 15976); }
+
+test "a probe that only wanders has no two levels to find"
+```
+
+That is `service-log4`'s probe A, the same shape as the journal above. So the
+model is not malfunctioning. It is doing what it was told: a probe whose gap is
+full cannot be read by a share, because a share low enough to answer a real hand
+is also low enough for a wanderer to clear by accident — 0.399 untouched against
+0.400 touched on that log.
 
 **Only one end is watched.** Past the gate, `touch.zig:1020-1024` takes
-`if (up >= down)` and arms a half-line on that side alone. A rig whose touches
-go both ways loses every touch in the other direction, silently.
+`if (up >= down)` and arms a half-line on that side alone. A probe whose touches
+go both ways in one run loses every touch in the other direction, silently. No
+existing fixture covers that — each rig in
+`"a touch is answered wherever the probe rests and whichever way it goes"` uses
+a fresh detector and visits one end.
 
-## What replaces them
+## What changes
 
-Three changes, all inside `stepLearned` and `Spread`. Nothing outside the
-detector sees a difference.
-
-### Both ends, each on its own line
-
-Each end gets a half-line at the midpoint between rest and that end's own
-level, and a side is armed only if its own reach clears `still_move`:
+`dead` stops being a refusal and becomes the choice of which question to ask.
+A probe with two clean levels is read by the share, exactly as now. A probe
+whose gap is full is no longer written off — it is asked the one question that
+still separates a hand from the wander on such a rig: **did the window park,
+and did it park away from home.**
 
 ```zig
 const rest = self.baseline.base;
-const up   = clampedAbsDiff(self.baseline.high, rest);
+const up = clampedAbsDiff(self.baseline.high, rest);
 const down = clampedAbsDiff(self.baseline.low, rest);
+const reach = @max(up, down);
 
-const hi_line = if (up >= self.still_move)
+// Each end gets a line at the midpoint between rest and that end's own
+// level, and a side is armed only where its own reach is worth arming.
+const hi_line: ?i16 = if (up >= self.still_move)
     saturatingAdd(rest, @divTrunc(up, 2)) else null;
-const lo_line = if (down >= self.still_move)
+const lo_line: ?i16 = if (down >= self.still_move)
     saturatingAdd(rest, -@divTrunc(down, 2)) else null;
+
+const second_level = hi_line != null or lo_line != null;
+const readable = self.baseline.dead <= max_dead;
+
+self.spread.watchEdges(lo_line, hi_line);
+
+var past = false;
+if (lo_line) |lo| { if (level <= lo) past = true; }
+if (hi_line) |hi| { if (level >= hi) past = true; }
+
+const away = if (second_level and readable)
+    @max(self.spread.above, self.spread.below) >= self.band_share
+else if (second_level)
+    self.spread.range <= self.learned_park and past
+else
+    clampedAbsDiff(level, rest) >= self.still_move;
 ```
 
+### Both ends, each on its own line
+
 Asymmetric on purpose: a probe reaching 15000 up and 5000 down gets its lines at
-`rest + 7500` and `rest - 2500`, which is where those two ends actually are.
+`rest + 7500` and `rest - 2500`, which is where those two ends actually are. A
+single `reach/2` would put the near end's line past the end itself — on the
+journal above, `reach/2` is 8089 while the whole downward excursion is 5151, so
+a real touch at the bottom would never cross it.
 
 ### The share is a maximum, never a sum
 
-```zig
-self.spread.watchEnds(lo_line, hi_line);
-const share = @max(self.spread.above, self.spread.below);
-const away = share >= self.band_share;
-```
-
-Maximum rather than sum, and this is the load-bearing choice. A probe wandering
-across its whole range spends about a quarter of the window past each line;
-summed that is 0.5, which sits close enough to `band_share` of 0.6 that the
-separation the test exists for is gone. Taken separately the wanderer scores
-0.25 and a probe parked at one rail scores near 1.0.
+A probe wandering across its range spends about a quarter of the window past
+each line. Summed that is 0.5, close enough to `band_share` of 0.6 that the
+separation is gone. Taken separately the wanderer scores 0.25 and a probe parked
+at one rail scores near 1.0.
 
 The count also survives the dropouts this rig throws through a good touch. The
 journal's `25886, 735, 10, 12, 25886, 25886, 9, 25886` is five of eight past the
 upper line — 0.625, still a touch.
 
-### Stillness is the drift guard
+### Parking is only ever asked of the unreadable branch
 
-`readable` was not only a two-levels test. It was what stopped a probe whose
-home had moved from latching at an empty plant: after a drift the whole window
-sits on one side of a rest that has not caught up, `share` reads 1.0, and the
-model reports a hand that never arrived and never leaves. The room's own capture
-has ninety-six seconds of that, looping a clip throughout.
+This is the part that must not leak. Stillness cannot be a general gate for
+`learned`: on the flipping rig a held probe is never still for a single poll,
+and a stillness gate there rejects every real hand. It is asked only where the
+gap is full, which is the one case where the share has already been shown to
+mean nothing.
 
-Two guards were considered and rejected:
+The same restriction is what keeps the drift protection. A probe whose home has
+moved — `wanderedHome`, 11275 to 13353 — sits a long way from a stale rest and
+would score a share of 1.0, which is the ninety-six seconds of a clip looping at
+an empty plant the fixture exists for. But a drifted probe is *still wandering*:
+its window range is about 1250. A hand parks: range about 2. That is the whole
+separation, and it is worth stating plainly — **drift wanders, a hand parks.**
 
-- **Requiring the long window to still hold readings near rest.** It reads
-  healthy exactly when it must fire. During the dangerous stretch of a drift the
-  window is split between the old home and the new one, so the old home is still
-  there in quantity, and the guard passes.
-- **`baseline_stale_s` alone.** Twenty minutes is the right backstop for a probe
-  wedged permanently, and no use at all against a false hold of ninety-six
-  seconds.
+`still_range` at 32 cannot serve. It was measured for the steady model on the
+flipping rig. The parked branch gets its own constant, `default_learned_park`,
+at **512**: two and a half times under the drifted probe's 1250 and two hundred
+times over a parked touch's 2. No release threshold — `settle`'s existing hold
+and drop counters carry the hysteresis, and a second number here would be one
+nobody measured.
 
-What separates a hand from drift on this rig is in the data already: a drifted
-probe is still wandering, and a held one is parked. So the share says *which*
-end and the spread says *parked*:
+## Spread gains two edges
 
-```zig
-const held = away and self.spread.range <= self.learned_range;
-const loose = !away or self.spread.range >= self.learned_release;
-```
-
-This contradicts the comment at `touch.zig:1057-1062`, which says stillness is
-the one thing this rig will not give. That was written about the other rig —
-flat nought at rest, 25886 under a hand, rails through the touch — where the
-untouched reading has no spread either and a stillness gate separates nothing.
-Here the untouched reading has thousands of counts of spread and the touch has
-single digits. The comment is retired with the model it described, and the
-change note says why.
-
-`still_range` at 32 is too tight for it. A parked touch with a dropout every
-eighth poll has a 20th-to-80th-percentile range in the single digits, and the
-idle wander has thousands; anything from a few hundred to a couple of thousand
-separates them with enormous margin. The model gets its own pair —
-`default_learned_range` and `default_learned_release` — rather than borrowing
-the steady model's, whose numbers were measured on the other rig and mean
-something different there.
-
-**The numbers in those two constants are provisional and must not ship
-unmeasured.** There is no capture of this rig: `probes.csv` opens at
-`raw_a=1` and `touch.csv` at `raw_a=653`, both the old one. The provisional
-pair is 256 and 1024, chosen to sit in the middle of the gap the journal
-implies, and the capture replaces them.
-
-## Spread gains two lines
-
-`Spread` already counts the share inside a band for the steady model. It gains
-the same thing pointing outward, computed in the sort pass `recompute` already
-does:
+`Spread.watch`/`inside` already counts one side, which is how the current share
+branch works (`watch(lo, null)` means "share at or above lo"). Two sides at once
+needs two counters, computed in the sort pass `recompute` already does:
 
 ```zig
 edge_lo: ?i16,
 edge_hi: ?i16,
-below: f32,   // share of window strictly below edge_lo, 0 when unset
-above: f32,   // share of window strictly above edge_hi, 0 when unset
+below: f32,   // share of the window at or below edge_lo, 0 when unset
+above: f32,   // share of the window at or above edge_hi, 0 when unset
 
-pub fn watchEnds(self: *Spread, lo: ?i16, hi: ?i16) void
+pub fn watchEdges(self: *Spread, lo: ?i16, hi: ?i16) void
 ```
 
-`watch`/`inside` are untouched, so the steady model and any room-given band
-behave exactly as before.
+`watch`/`inside` stay exactly as they are, so the steady model and any
+room-given band are untouched. `stepLearned` stops calling `watch`.
+
+One existing test reads the old field:
+
+```zig
+test "a hand under half the window is counted, not written off"
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), detector.spread.inside, 0.06);
+```
+
+It moves to `detector.spread.above`. Same quantity, same number, new name — the
+test's claim is unchanged.
 
 ## The log says why
 
 `z0`/`z1` are written only on the deviation path (`touch.zig:1119`), so under
 `learned` the status line prints `z0=0.0` on every poll — a field that has told
-the room nothing since the model was added. It carries the share instead:
-`max(above, below)`, the number the decision is actually made on. `l0` and `r0`
+the room nothing since the model was added. It carries
+`@max(above, below)` instead, the number the decision is made on. `l0` and `r0`
 keep their meanings.
 
-With that, a quiet plant is readable off one line: `r0` says where the model
-thinks home is, `l0` where the probe is now, `z0` how much of the last window
-was past the line.
+A quiet plant is then readable off one line: `r0` where the model thinks home
+is, `l0` where the probe is now, `z0` how much of the last window was past the
+line.
 
 ## Untouched
 
-- The pitch. `deviation()` for `learned` already returns
-  `|spread.level - baseline.base|`, which is unsigned and so answers a touch at
-  either rail the same way. The `learned`/ramp pairing in
-  `production_config.zig:196` stands.
-- `deviation` and `steady`. Neither shares a code path with this.
-- `Machine` arbitration, the tap window, `Baseline.dead`. `dead` stops being
-  read by `stepLearned` but is left computed and tested — it is the one measured
-  description of the old rigs in the tree.
-- The preset. It stays on `.deviation`; moving the rig to `learned` is a
-  separate decision with the capture in hand.
+- **The pitch.** `deviation()` for `learned` already returns
+  `|spread.level - baseline.base|`, unsigned, so it answers a touch at either
+  rail the same way. The `learned`/ramp pairing in `production_config.zig:196`
+  stands.
+- **`deviation` and `steady`.** Neither shares a code path with this.
+- **`Machine` arbitration, the tap window, `Baseline`.** `dead` keeps being
+  computed and keeps deciding; it only stops being final.
+- **The preset.** It stays on `.deviation`. Moving the rig to `learned` is a
+  separate decision, with the capture in hand.
 
 ## Testing
 
-Fixtures go beside the existing ones in `src/core/touch.zig`, built from the
-journal's shape rather than invented:
+Every existing `learned` fixture must still pass unchanged, except the one
+rename above. Four of them are the guard rails for this change:
 
-1. **A touch at the bottom latches.** Idle wander 6000–21000, then a parked run
-   at 0–2 with a 1200 every eighth poll. Must latch, and must have latched on
-   `below`.
-2. **A touch at the top latches, same detector, same run.** The same wander,
-   then a parked run at 25900. Both directions in one test, which is the defect
-   at `touch.zig:1020-1024` stated as a test.
-3. **The wander alone never latches.** Fifteen minutes of 6000–21000 and
-   nothing else. This is the test the current model passes by refusing to judge
-   and the new one must pass by judging.
-4. **A drifted probe never latches.** Home steps from 11000 to 24000 and keeps
-   wandering with the same spread. Covers the ninety-six seconds.
-5. **A dead probe never latches.** Flat at one value forever: parked, so the
-   stillness gate says yes and `still_move` must say no.
-6. **Sum versus maximum.** A uniform wander scores under `band_share` on the
-   maximum. Pins the choice so a later simplification to a sum fails loudly.
-7. **`watchEnds` counts both sides and neither when unset**, and `watch`/
-   `inside` still behave as they did.
+| Fixture | Holds |
+|---|---|
+| `a probe that only wanders has no two levels to find` | wanderer's range ~3700 > 512, and its level sits between the lines |
+| `a probe whose home moves is quiet on the way` | drift's range ~1250 > 512 |
+| `a hand on a probe that drops out half the time is still a hand` | `readable` true there, so it never reaches the parked branch |
+| `a long hand does not become where the probe lives` | same |
 
-Then the capture, which is what settles the two constants:
+New fixtures, built from the journal rather than invented:
+
+1. **A parked touch at the bottom latches on a wandering probe.** Idle uniform
+   6638–21330, then a parked run at 0–2 with a 1200 every eighth poll.
+2. **A parked touch at the top latches on the same detector in the same run.**
+   The same wander, then a parked run at 25900. Both directions in one
+   detector — the defect at `touch.zig:1020-1024` stated as a test.
+3. **The wander alone never latches**, at the preset's own `band_share`.
+4. **A dead probe never latches.** Flat at one value forever: parked, so the
+   range gate says yes and `past` must say no.
+5. **Maximum, not sum.** A uniform wander scores under `band_share` on the
+   maximum. Pins the choice so a later simplification fails loudly.
+6. **`watchEdges` counts both sides, and neither when unset**, and
+   `watch`/`inside` still behave as they did.
+
+Then the capture, which is what confirms `default_learned_park`:
 
 ```
 mami_sound --capture=rig.csv --capture-seconds=900
@@ -210,10 +227,11 @@ Touching plant A both directions several times during it.
 
 ## Order
 
-1. `Spread.watchEnds` with its tests.
-2. `stepLearned` on both ends with the share as a maximum; fixtures 1, 2, 3, 6.
-3. The stillness gate and its constants; fixtures 4, 5.
+1. `Spread.watchEdges` with its tests.
+2. `stepLearned` on both ends, share as a maximum, `watch` → `watchEdges`;
+   fixtures 2, 5, and the renamed assertion.
+3. The parked branch and `default_learned_park`; fixtures 1, 3, 4.
 4. The share into `z0`.
-5. Capture, sweep, replace the provisional constants with measured ones.
+5. Capture, sweep, confirm or replace 512.
 
 Steps 1–4 are verifiable in the tree. Step 5 needs the room.
