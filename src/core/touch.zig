@@ -454,6 +454,26 @@ pub const default_touch_band_hi: ?i16 = null;
 /// somewhere else ever manages.
 pub const default_band_share: f32 = 0.6;
 
+/// The share at or below which the touch is over.
+///
+/// Two numbers rather than one, for the reason the steady model has two: a
+/// single line chatters, and a probe sitting on it latches and releases on
+/// alternate windows. Between the two the state is whatever it already was.
+///
+/// The gap has to be wide enough to hold a real hand's wobble and narrow
+/// enough that a probe left alone still clears it, and the width is the whole
+/// value of the thing. Replayed against `probes-box1.csv` at a share of 0.6,
+/// the same five touches on probe BC come out as five episodes whatever the
+/// release is -- the gap finds no extra hands -- but their mean length runs
+/// 1.13s at a release of 0.5, 5.88s at 0.4, and 5.94s at 0.3. A narrow gap
+/// does not miss a touch, it breaks one into pieces, and a held voice plays
+/// the pieces as a clip stuttering in and out.
+///
+/// Four tenths rather than a half for that reason, and not lower: at 0.2 the
+/// five become two episodes of about forty-three seconds, which is a hand let
+/// go minutes ago that the model is still holding.
+pub const default_band_release: f32 = 0.4;
+
 /// How long the readings must stop being still before a touch is called off,
 /// in milliseconds. Longer than the attack on purpose: contact drops out for a
 /// few polls in the middle of a real touch, and releasing on that would end a
@@ -517,6 +537,7 @@ pub const Config = struct {
     touch_band_lo_bc: ?i16 = null,
     touch_band_hi_bc: ?i16 = null,
     band_share: f32 = default_band_share,
+    band_release: f32 = default_band_release,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -703,6 +724,8 @@ pub const Detector = struct {
     band_lo: ?i16,
     band_hi: ?i16,
     band_share: f32,
+    /// The share at or below which the touch is over. `learned` only.
+    band_release: f32,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -756,6 +779,7 @@ pub const Detector = struct {
             .band_lo = cfg.touch_band_lo,
             .band_hi = cfg.touch_band_hi,
             .band_share = cfg.band_share,
+            .band_release = cfg.band_release,
             .rest_samples = @max(
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
@@ -994,36 +1018,52 @@ pub const Detector = struct {
             return false;
         }
 
-        // Which end a hand takes this probe to, and the line between there and
-        // home. Whichever of the two levels sits further from where the probe
-        // keeps returning is the touched one -- that is the whole of the
-        // detection, and it needs nobody to say which way the rig goes.
+        // Which ends a hand takes this probe to, and the lines between there
+        // and home. Both ends, because a hand on this rig goes to the top some
+        // touches and the bottom others and nothing says which in advance --
+        // and each line is drawn from its own end's reach rather than from the
+        // larger of the two, or the nearer end's line would sit past the end
+        // itself and a real touch there could never cross it. On the room's own
+        // journal the larger half is 8089 counts while the whole downward
+        // excursion is 5151, so one shared line is a plant that cannot be
+        // touched downwards at all.
         const rest = self.baseline.base;
         const up = clampedAbsDiff(self.baseline.high, rest);
         const down = clampedAbsDiff(self.baseline.low, rest);
-        const reach = @max(up, down);
+
+        const hi_line: ?i16 = if (up >= self.still_move)
+            saturatingAdd(rest, @divTrunc(up, 2))
+        else
+            null;
+        const lo_line: ?i16 = if (down >= self.still_move)
+            saturatingAdd(rest, -@divTrunc(down, 2))
+        else
+            null;
 
         // Whether the probe has been anywhere but home. Short of this nothing
         // has ever taken it anywhere, so there is no second level and no line.
-        const second_level = reach >= self.still_move;
+        const second_level = hi_line != null or lo_line != null;
         // Whether the two ends are two levels rather than the ends of one
         // wander, which is what says a line may be drawn between them at all.
         const readable = self.baseline.dead <= max_dead;
 
-        const away = if (second_level and readable) blk: {
+        self.spread.watchEdges(lo_line, hi_line);
+
+        const away = if (second_level and readable)
             // A touch has been seen, so the rig is known and the question is a
-            // count: how much of the last window was past the halfway line.
-            // Counted rather than measured, because a hand that drops out one
-            // poll in fifteen has a median dragged home and a range the height
-            // of the dropout, and neither reads as the hand that is there.
-            const half = @divTrunc(reach, 2);
-            if (up >= down) {
-                self.spread.watch(saturatingAdd(rest, half), null);
-            } else {
-                self.spread.watch(null, saturatingAdd(rest, -half));
-            }
-            break :blk self.spread.inside >= self.band_share;
-        } else if (second_level)
+            // count: how much of the last window was past a line. Counted
+            // rather than measured, because a hand that drops out one poll in
+            // fifteen has a median dragged home and a range the height of the
+            // dropout, and neither reads as the hand that is there.
+            //
+            // The maximum of the two and never their sum. A probe wandering
+            // across its range is past each line about a quarter of the time,
+            // and summing those says only that it left the middle -- which is
+            // the one thing a wander and a hand have in common. On box1's
+            // capture the sum puts a wanderer at about a half against a share
+            // of 0.6, which is no margin at all.
+            @max(self.spread.above, self.spread.below) >= self.band_share
+        else if (second_level)
             // The ends are a long way apart and the gap between them is full,
             // so this is one wander rather than two levels. Which means the
             // probe cannot be read just now -- and a probe that cannot be read
@@ -1060,8 +1100,21 @@ pub const Detector = struct {
         // through a single touch. Between percentiles that is a range of the
         // full scale, so a stillness gate is not merely strict on this rig --
         // it can never open, and the plant is deaf for the evening.
+
+        // Two lines where the share is what is being asked, and one everywhere
+        // else. Between them nothing moves, which is the whole reason there
+        // are two: on this rig a hand's share lands on the threshold rather
+        // than far past it -- 0.628 held against a line at 0.600 -- and a
+        // single line turns that into a latch and a release on alternate
+        // windows, which a held voice plays as the clip wobbling in and out.
+        //
+        // The other two branches keep one line each. Neither is a share, and
+        // neither has been seen to sit on its own threshold.
         const held = away;
-        const loose = !away;
+        const loose = if (second_level and readable)
+            @max(self.spread.above, self.spread.below) <= self.band_release
+        else
+            !away;
         self.at_rest = loose;
 
         return self.settle(held, loose);
@@ -2426,7 +2479,7 @@ test "a hand under half the window is counted, not written off" {
     for (0..cluster_warmup) |poll| _ = detector.update(flipping(poll, 5, 25700, 3));
     for (0..steady_warmup * 2) |poll| _ = detector.update(flipping(poll, 5, 25700, 4));
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), detector.spread.inside, 0.06);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), detector.spread.above, 0.06);
 }
 
 test "a probe that only wanders has no two levels to find" {
@@ -2520,4 +2573,66 @@ test "a probe whose home moves is quiet on the way, not touched for the journey"
         if (detector.update(wanderedHome(prng.random()))) latched += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), latched);
+}
+
+test "one probe answers a hand at either rail in the same run" {
+    // The rig the room actually has: a hand takes probe A to the top some
+    // touches and the bottom others, and nothing says in advance which. A
+    // model that picked the further of the two ends and watched only that
+    // answered half the evening's hands and was silent through the rest.
+    var detector: Detector = .init(learnedConfig());
+    for (0..cluster_warmup) |poll| _ = detector.update(restingAt(12000, poll));
+
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
+    try std.testing.expect(detector.on);
+
+    for (0..cluster_warmup) |poll| _ = detector.update(restingAt(12000, poll));
+    try std.testing.expect(!detector.on);
+
+    // The other way, same detector, nothing reconfigured in between.
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(300, poll));
+    try std.testing.expect(detector.on);
+}
+
+test "the share is a maximum of the two ends and never a sum" {
+    // A probe wandering across its whole range spends about a quarter of the
+    // window past each line. Summed that is a half, which sits close enough to
+    // the share that the separation the count exists for is gone. Held apart,
+    // a wanderer scores a quarter and a hand scores nearly all of it.
+    var cfg = learnedConfig();
+    cfg.band_share = 0.45;
+
+    var detector: Detector = .init(cfg);
+    var prng: std.Random.DefaultPrng = .init(20260916);
+    for (0..cluster_warmup) |_| _ = detector.update(wandering(prng.random()));
+    for (0..steady_warmup * 2) |_| _ = detector.update(wandering(prng.random()));
+
+    try std.testing.expect(@max(detector.spread.above, detector.spread.below) < 0.45);
+}
+
+test "a hand sitting on the line holds rather than chattering" {
+    // The share a probe scores on this rig lands on the threshold, not far
+    // past it: 0.512 untouched at worst and 0.628 held at the median, against
+    // a line at 0.600. One threshold answering both directions makes that a
+    // latch and a release on alternate windows, which a held voice plays as
+    // the clip wobbling in and out.
+    var cfg = learnedConfig();
+    cfg.band_share = 0.6;
+    cfg.band_release = 0.4;
+
+    var detector: Detector = .init(cfg);
+    for (0..cluster_warmup) |poll| _ = detector.update(restingAt(0, poll));
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
+    try std.testing.expect(detector.on);
+
+    // Half the window at the rail: under the latch share, over the release
+    // share. Nothing may move.
+    for (0..steady_warmup * 2) |poll| {
+        _ = detector.update(if (poll % 2 == 0) restingAt(25000, poll) else restingAt(0, poll));
+    }
+    try std.testing.expect(detector.on);
+
+    // And a hand genuinely off clears the release share and lets go.
+    for (0..steady_warmup * 2) |poll| _ = detector.update(restingAt(0, poll));
+    try std.testing.expect(!detector.on);
 }

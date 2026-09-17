@@ -204,6 +204,11 @@ const Args = struct {
     /// The share of the window the `learned` model wants past the line. Null
     /// leaves the preset's, which is the number a capture is swept to settle.
     band_share: ?f32 = null,
+    /// The share at or below which the `learned` model calls the touch over.
+    /// Null leaves the preset's. Swept beside the share rather than instead of
+    /// it: the gap between the two is what a hand sitting on the line falls
+    /// into, and a sweep that cannot move it cannot find the gap.
+    band_release: ?f32 = null,
     sweep: bool = false,
     list: bool = false,
     /// A model name that is not one of the three. Refused rather than ignored:
@@ -229,6 +234,8 @@ fn parseArgs(argv: []const []const u8) Args {
             }
         } else if (std.mem.startsWith(u8, arg, "--band-share=")) {
             out.band_share = std.fmt.parseFloat(f32, arg["--band-share=".len..]) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--band-release=")) {
+            out.band_release = std.fmt.parseFloat(f32, arg["--band-release=".len..]) catch null;
         } else if (std.mem.startsWith(u8, arg, "--still-range=")) {
             out.latch = std.fmt.parseInt(i16, arg["--still-range=".len..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--still-release=")) {
@@ -327,6 +334,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.counts) |v| base.counts = v;
     if (args.counts_bc) |v| base.counts_bc = v;
     if (args.band_share) |v| base.band_share = v;
+    if (args.band_release) |v| base.band_release = v;
 
     // The `learned` model is judged by a share, not by a range, so sweeping
     // ranges past it answers nothing. Sweep what it actually reads.
@@ -368,7 +376,10 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("model {t}", .{base.model});
     if (base.model == .learned) {
-        std.debug.print("  share {d:.2}", .{base.band_share});
+        std.debug.print(
+            "  share {d:.2} release {d:.2}",
+            .{ base.band_share, base.band_release },
+        );
     } else if (base.model == .steady) {
         std.debug.print("  range {d}  release {d}", .{
             @as(u16, @intCast(base.still_range)),

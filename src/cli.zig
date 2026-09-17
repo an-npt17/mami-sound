@@ -17,6 +17,7 @@ pub const Error = error{
     InvalidStillThreshold,
     InvalidTouchFloor,
     InvalidTouchRise,
+    InvalidBandShare,
     InvalidCapture,
     InvalidBox,
     TooManyArguments,
@@ -69,6 +70,20 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// How much of the window must be past the line before a touch counts,
+    /// under the `learned` model.
+    ///
+    /// On the command line for the same reason the still thresholds are: it is
+    /// a property of the rig on the day. On box1's capture a hand scores as
+    /// little as 0.556 against a preset of 0.600, so the number that decides
+    /// whether the plant answers at all was the one number nobody could change
+    /// without rebuilding on the Pi.
+    band_share: ?f32 = null,
+    /// How little of the window past the line ends a touch, under `learned`.
+    ///
+    /// Below the share it latches at, so a hand sitting on the line holds
+    /// rather than latching and releasing on alternate windows.
+    band_release: ?f32 = null,
     /// How far up the pitch range a touch starts, as a fraction of it.
     touch_floor: ?f32 = null,
     /// How long a held touch takes to climb from that start to the top. Set,
@@ -192,6 +207,16 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidStillThreshold;
             if (ms <= 0.0) return Error.InvalidStillThreshold;
             opts.still_window_ms = ms * 1000.0;
+        } else if (std.mem.startsWith(u8, arg, "--band-share=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-share=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction > 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_share = fraction;
+        } else if (std.mem.startsWith(u8, arg, "--band-release=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-release=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction >= 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_release = fraction;
         } else if (std.mem.startsWith(u8, arg, "--touch-floor=")) {
             const fraction = std.fmt.parseFloat(f32, arg["--touch-floor=".len..]) catch
                 return Error.InvalidTouchFloor;
@@ -310,7 +335,9 @@ pub const usage =
     \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE] [--plant-b-band=LO:HI]
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS] [--counts=N] [--counts-b=N]
+    \\                  [--still-window=SECONDS] [--band-share=FRACTION]
+    \\                  [--band-release=FRACTION]
+    \\                  [--counts=N] [--counts-b=N]
     \\                  [--touch-floor=FRACTION] [--touch-rise=SECONDS]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--box=N]
@@ -409,6 +436,19 @@ pub const usage =
     \\32 and 512. A hand actually holds a probe to about three counts; 32 is
     \\room for the dropouts this rig throws, and --still-range=10 is the number
     \\to use once the conversion reads come back clean.
+    \\
+    \\--band-share is how much of the window has to be past the line before the
+    \\learned model calls it a hand. Larger is harder to reach and harder to
+    \\latch by accident; the number wants to sit between what the rig scores
+    \\untouched and what it scores held, and `zig build replay -- PATH --sweep`
+    \\is what prints both. The default is 0.6, which is above what one rig's
+    \\hands actually reach -- a probe scoring 0.556 held answers nobody until
+    \\this is lowered.
+    \\
+    \\--band-release is the share at or below which the touch is over. It sits
+    \\under --band-share, and between the two nothing changes: a hand whose
+    \\share lands on the line then holds rather than latching and releasing on
+    \\alternate windows. The default is 0.5.
     \\
     \\--counts and --counts-b are how big a move a touch has to be on each probe,
     \\in the counts the status line's l0 and l1 show. `deviation` only.
@@ -849,4 +889,35 @@ test "the usage names every model the parser takes" {
     inline for (@typeInfo(touch.Model).@"enum".fields) |field| {
         try std.testing.expect(std.mem.indexOf(u8, usage, field.name) != null);
     }
+}
+
+test "the share a touch must reach can be set on the command line" {
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.52),
+        (try parse(&.{"--band-share=0.52"})).band_share.?,
+        0.0001,
+    );
+
+    // Unset leaves the preset alone, which is what every other threshold does.
+    try std.testing.expect((try parse(&.{})).band_share == null);
+}
+
+test "a share outside nought to one is a typo, not a setting" {
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=1.4"}));
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=-0.1"}));
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=most"}));
+    // Nought is not a setting here: no window can be less than nothing past
+    // the line, so a share of nought latches on an empty room forever.
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=0"}));
+}
+
+test "the share that ends a touch is its own flag" {
+    const opts = try parse(&.{ "--band-share=0.55", "--band-release=0.40" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), opts.band_share.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.40), opts.band_release.?, 0.0001);
+
+    // Nought is a setting here, unlike the share: it says the touch ends only
+    // when nothing at all is left past the line.
+    try std.testing.expect((try parse(&.{"--band-release=0"})).band_release.? == 0.0);
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-release=1.2"}));
 }

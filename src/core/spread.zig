@@ -75,6 +75,18 @@ pub const Spread = struct {
     band_lo: ?i16,
     band_hi: ?i16,
     inside: f32,
+    /// Two lines, and the share of the window beyond each.
+    ///
+    /// The band above asks how much of the window is in one place. This asks
+    /// how much of it is past a line, at each end separately -- which is a
+    /// different question and cannot be answered by the band, because a model
+    /// watching both ends of a probe needs to know which end the window went
+    /// to. Summed, the two counts say only that the probe left the middle, and
+    /// a probe merely wandering leaves the middle as much as a hand does.
+    edge_lo: ?i16,
+    edge_hi: ?i16,
+    below: f32,
+    above: f32,
 
     pub fn init(window_ms: f32, sample_rate: u32, poll_frames: usize) Spread {
         const polls_per_s = @as(f32, @floatFromInt(sample_rate)) /
@@ -94,6 +106,10 @@ pub const Spread = struct {
             .band_lo = null,
             .band_hi = null,
             .inside = 0.0,
+            .edge_lo = null,
+            .edge_hi = null,
+            .below = 0.0,
+            .above = 0.0,
         };
     }
 
@@ -101,6 +117,15 @@ pub const Spread = struct {
     pub fn watch(self: *Spread, lo: ?i16, hi: ?i16) void {
         self.band_lo = lo;
         self.band_hi = hi;
+    }
+
+    /// Say where the two lines are, so the share past each can be counted.
+    ///
+    /// Either may be `null`, which is that end not being watched at all and
+    /// its count staying at nought.
+    pub fn watchEdges(self: *Spread, lo: ?i16, hi: ?i16) void {
+        self.edge_lo = lo;
+        self.edge_hi = hi;
     }
 
     /// Whether the window has enough behind it to be worth asking.
@@ -138,17 +163,32 @@ pub const Spread = struct {
 
         // Counted in the same pass the sort was for, so asking costs nothing
         // extra on the audio thread.
+        const total = @as(f32, @floatFromInt(n));
+
         if (self.band_lo == null and self.band_hi == null) {
             self.inside = 0.0;
-            return;
+        } else {
+            var within: usize = 0;
+            for (scratch[0..n]) |sample| {
+                if (self.band_lo) |band_lo| if (sample < band_lo) continue;
+                if (self.band_hi) |band_hi| if (sample > band_hi) continue;
+                within += 1;
+            }
+            self.inside = @as(f32, @floatFromInt(within)) / total;
         }
-        var within: usize = 0;
+
+        var under: usize = 0;
+        var over: usize = 0;
         for (scratch[0..n]) |sample| {
-            if (self.band_lo) |band_lo| if (sample < band_lo) continue;
-            if (self.band_hi) |band_hi| if (sample > band_hi) continue;
-            within += 1;
+            if (self.edge_lo) |edge| {
+                if (sample <= edge) under += 1;
+            }
+            if (self.edge_hi) |edge| {
+                if (sample >= edge) over += 1;
+            }
         }
-        self.inside = @as(f32, @floatFromInt(within)) / @as(f32, @floatFromInt(n));
+        self.below = if (self.edge_lo == null) 0.0 else @as(f32, @floatFromInt(under)) / total;
+        self.above = if (self.edge_hi == null) 0.0 else @as(f32, @floatFromInt(over)) / total;
     }
 };
 
@@ -247,3 +287,48 @@ test "with no band nothing is inside one" {
     try std.testing.expectEqual(@as(f32, 0.0), spread.inside);
 }
 
+
+test "the share past each edge is counted on its own" {
+    // Two lines rather than one, because the model that asks this has to know
+    // WHICH end a probe went to. Summed they would say only that it left the
+    // middle, which a probe merely wandering does as often as a hand does.
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watchEdges(200, 800);
+
+    // Three readings in ten below the low edge, five in ten above the high one.
+    for (0..spread.len) |i| spread.push(switch (i % 10) {
+        0, 1, 2 => 100,
+        3, 4 => 500,
+        else => 900,
+    });
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), spread.below, 0.02);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), spread.above, 0.02);
+}
+
+test "an edge nobody set counts nothing" {
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watchEdges(null, 800);
+    for (0..spread.len) |_| spread.push(900);
+
+    try std.testing.expectEqual(@as(f32, 0.0), spread.below);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), spread.above, 0.001);
+
+    // And neither edge set is neither count.
+    var bare: Spread = .init(1000.0, 44100, 128);
+    for (0..bare.len) |_| bare.push(900);
+    try std.testing.expectEqual(@as(f32, 0.0), bare.below);
+    try std.testing.expectEqual(@as(f32, 0.0), bare.above);
+}
+
+test "the edges leave the band alone" {
+    // `watch` and `inside` are the steady model's, and a room that set a band
+    // must go on getting exactly the answer it got before.
+    var spread: Spread = .init(1000.0, 44100, 128);
+    spread.watch(650, 660);
+    spread.watchEdges(200, 800);
+    for (0..spread.len) |i| spread.push(if (i % 5 == 0) 900 else 655);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), spread.inside, 0.02);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), spread.above, 0.02);
+}

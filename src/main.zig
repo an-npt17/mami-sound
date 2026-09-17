@@ -74,6 +74,11 @@ pub fn main(init: std.process.Init) !void {
                     "first, both ends given.\n\n",
                 .{},
             ),
+            error.InvalidBandShare => std.debug.print(
+                "--band-share takes a fraction above zero and at most one, and " ++
+                    "--band-release one from zero to one.\n\n",
+                .{},
+            ),
             error.InvalidMode => std.debug.print(
                 "--plant-a-mode and --plant-b-mode take a mode: {s}.\n\n",
                 .{core.clips.mode_names},
@@ -278,6 +283,8 @@ fn runComposition(
             .still_range = opts.still_range,
             .still_release = opts.still_release,
             .still_window_ms = opts.still_window_ms,
+            .band_share = opts.band_share,
+            .band_release = opts.band_release,
             .plant_band = opts.plant_band,
             .plant_window = opts.plant_window,
             .counts = opts.counts,

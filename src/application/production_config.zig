@@ -81,6 +81,12 @@ pub const Overrides = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// How much of the window must be past the line before a touch counts,
+    /// under `learned`. The number the model's answer turns on, and until now
+    /// the one threshold that could not be tried without a rebuild.
+    band_share: ?f32 = null,
+    /// The share at or below which the touch is over, under `learned`.
+    band_release: ?f32 = null,
     /// Where a held probe sits, per plant. The two probes do not sit at the
     /// same place: on this rig a hand puts one near six hundred and sixty and
     /// the other near twenty-five thousand.
@@ -133,6 +139,8 @@ pub fn touchWith(
     if (overrides.still_range) |counts| cfg.still_range = counts;
     if (overrides.still_release) |counts| cfg.still_release = counts;
     if (overrides.still_window_ms) |ms| cfg.still_window_ms = ms;
+    if (overrides.band_share) |fraction| cfg.band_share = fraction;
+    if (overrides.band_release) |fraction| cfg.band_release = fraction;
     if (overrides.plant_band[0]) |band| {
         cfg.touch_band_lo = band[0];
         cfg.touch_band_hi = band[1];
@@ -429,4 +437,12 @@ test "a rail-to-rail touch is answered the same in either direction" {
 
     // The sign of the move buys nothing and costs nothing.
     try std.testing.expectEqual(latch_ms[0], latch_ms[1]);
+}
+
+test "the room's share beats the box's" {
+    const said = touchWith(touch, .{ .band_share = 0.52 }, .{ .trigger, .trigger });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.52), said.band_share, 0.0001);
+
+    const unset = touchWith(touch, .{}, .{ .trigger, .trigger });
+    try std.testing.expectApproxEqAbs(core.touch.default_band_share, unset.band_share, 0.0001);
 }

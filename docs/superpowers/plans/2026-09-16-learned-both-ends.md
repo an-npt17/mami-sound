@@ -22,6 +22,148 @@
 
 ---
 
+### Task 0: `--band-share` reaches the detector
+
+The share is the number this model's answer turns on, and it is the one number a room cannot change without a rebuild. On box1's capture probe A's touches score a minimum of 0.556 against a compiled-in 0.600, so real hands fail to cross it and the only fix today is recompiling on the Pi.
+
+**Files:**
+- Modify: `src/cli.zig` — `Error` (`:8-23`), `Options` (`:61-78` area), the parse chain (beside `--still-window=` at `:190`), the usage text (`:312` area)
+- Modify: `src/application/production_config.zig` — `Overrides` (`:76-100`), `touchWith` (`:113-157`)
+- Modify: `src/main.zig:276-285` — the `Overrides` literal
+- Test: `src/cli.zig`, `src/application/production_config.zig`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `Options.band_share: ?f32`, `Overrides.band_share: ?f32`, and `touchWith` applying it to `Config.band_share`. Task 2b adds a second flag beside this one in the same places.
+
+- [ ] **Step 1: Write the failing tests**
+
+At the end of `src/cli.zig`:
+
+```zig
+test "the share a touch must reach can be set on the command line" {
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.52),
+        (try parse(&.{"--band-share=0.52"})).band_share.?,
+        0.0001,
+    );
+
+    // Unset leaves the preset alone, which is what every other threshold does.
+    try std.testing.expect((try parse(&.{})).band_share == null);
+}
+
+test "a share outside nought to one is a typo, not a setting" {
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=1.4"}));
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=-0.1"}));
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share=most"}));
+}
+```
+
+At the end of `src/application/production_config.zig`:
+
+```zig
+test "the room's share beats the box's" {
+    const said = touchWith(touch, .{ .band_share = 0.52 }, .{ .trigger, .trigger });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.52), said.band_share, 0.0001);
+
+    const unset = touchWith(touch, .{}, .{ .trigger, .trigger });
+    try std.testing.expectApproxEqAbs(core.touch.default_band_share, unset.band_share, 0.0001);
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `zig build test`
+
+Expected: compile error — `Error.InvalidBandShare` does not exist and `Options` has no `band_share`. Note that this task needs the full `test` step, not `test-core`: it touches `cli.zig` and `production_config.zig`, which `test-core` does not build.
+
+- [ ] **Step 3: Add the error and the option**
+
+In `src/cli.zig`, add to `Error` after `InvalidTouchRise`:
+
+```zig
+    InvalidBandShare,
+```
+
+In `Options`, directly after `still_window_ms`:
+
+```zig
+    /// How much of the window must be past the line before a touch counts,
+    /// under the `learned` model.
+    ///
+    /// On the command line for the same reason the still thresholds are: it is
+    /// a property of the rig on the day. On box1's capture a hand scores as
+    /// little as 0.556 against a preset of 0.600, so the number that decides
+    /// whether the plant answers at all was the one number nobody could change
+    /// without rebuilding on the Pi.
+    band_share: ?f32 = null,
+```
+
+- [ ] **Step 4: Parse it**
+
+In the parse chain, immediately after the `--still-window=` branch:
+
+```zig
+        } else if (std.mem.startsWith(u8, arg, "--band-share=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-share=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction > 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_share = fraction;
+```
+
+- [ ] **Step 5: Say so in the usage text**
+
+In the usage block, on the line listing the still flags (`src/cli.zig:312`), add `[--band-share=FRACTION]`. Then in the prose below, after the paragraph describing `--still-range` and `--still-release`:
+
+```
+    \\--band-share is how much of the window has to be past the line before the
+    \\learned model calls it a hand. Larger is harder to reach and harder to
+    \\latch by accident; the number wants to sit between what the rig scores
+    \\untouched and what it scores held, and `zig build replay -- PATH --sweep`
+    \\is what prints both.
+```
+
+- [ ] **Step 6: Thread it through the overrides**
+
+In `src/application/production_config.zig`, add to `Overrides` after `still_window_ms`:
+
+```zig
+    /// How much of the window must be past the line, under `learned`.
+    band_share: ?f32 = null,
+```
+
+In `touchWith`, beside the other `still_*` overrides:
+
+```zig
+    if (overrides.band_share) |fraction| cfg.band_share = fraction;
+```
+
+In `src/main.zig`, add to the `Overrides` literal after `.still_window_ms = opts.still_window_ms,`:
+
+```zig
+            .band_share = opts.band_share,
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `zig build test`
+
+Expected: PASS, all of it.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/cli.zig src/application/production_config.zig src/main.zig
+git commit -m "feat(cli): the share a touch must reach is a flag now
+
+Every other threshold this model has can be tried from the command
+line. The one the answer actually turns on could not: a rig whose hands
+score 0.556 against a compiled-in 0.600 answers nobody, and the only
+way to find that out was to rebuild on the Pi with a room waiting."
+```
+
+---
+
 ### Task 1: `Spread` counts both edges
 
 **Files:**
@@ -357,6 +499,220 @@ hand have in common."
 
 ---
 
+### Task 2b: A release share, so a hand on the line does not chatter
+
+`stepLearned` ends `const held = away; const loose = !away;` — one line answering both directions. `touch.zig:400-406` says why that is wrong, about the steady model: *"a single line chatters: a probe sitting on it latches and releases on alternate windows, which on plant B is clip after clip."* That model was given two thresholds. This one never was.
+
+It is not theoretical here. Probe A's measured share on box1 is 0.512 untouched at worst and 0.628 held at the median, against a line at 0.600 — hands land on it.
+
+**Files:**
+- Modify: `src/core/touch.zig` — constants beside `default_band_share` (`:453`), `Config`, `Detector` fields and `init`, and the end of `stepLearned`
+- Modify: `src/cli.zig`, `src/application/production_config.zig`, `src/main.zig` — a `--band-release` flag beside Task 0's
+- Test: `src/core/touch.zig`, `src/cli.zig`
+
+**Interfaces:**
+- Consumes: `spread.above`, `spread.below` from Task 1; the `held`/`loose` structure from Task 2.
+- Produces: `pub const default_band_release: f32 = 0.5;`, `Config.band_release: f32`, `Detector.band_release: f32`, `Options.band_release: ?f32`, `Overrides.band_release: ?f32`. Task 3 adds a branch to the same `held` chain and must leave `loose` alone.
+
+- [ ] **Step 1: Write the failing test**
+
+At the end of `src/core/touch.zig`:
+
+```zig
+test "a hand sitting on the line holds rather than chattering" {
+    // The share a probe scores on this rig lands on the threshold, not far
+    // past it: 0.512 untouched at worst and 0.628 held at the median, against
+    // a line at 0.600. One threshold answering both directions makes that a
+    // latch and a release on alternate windows, which a held voice plays as
+    // the clip wobbling in and out.
+    var cfg = learnedConfig();
+    cfg.band_share = 0.6;
+    cfg.band_release = 0.4;
+
+    var detector: Detector = .init(cfg);
+    for (0..cluster_warmup) |poll| _ = detector.update(restingAt(0, poll));
+    for (0..steady_warmup) |poll| _ = detector.update(restingAt(25000, poll));
+    try std.testing.expect(detector.on);
+
+    // Half the window at the rail: under the latch share, over the release
+    // share. Nothing may move.
+    for (0..steady_warmup * 2) |poll| {
+        _ = detector.update(if (poll % 2 == 0) restingAt(25000, poll) else restingAt(0, poll));
+    }
+    try std.testing.expect(detector.on);
+
+    // And a hand genuinely off clears the release share and lets go.
+    for (0..steady_warmup * 2) |poll| _ = detector.update(restingAt(0, poll));
+    try std.testing.expect(!detector.on);
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `zig build test-core`
+
+Expected: compile error — `Config` has no `band_release`.
+
+- [ ] **Step 3: Add the constant**
+
+In `src/core/touch.zig`, directly after `default_band_share` (`:453`):
+
+```zig
+/// The share at or below which the touch is over.
+///
+/// Two numbers rather than one, for the reason the steady model has two: a
+/// single line chatters, and a probe sitting on it latches and releases on
+/// alternate windows. Between the two the state is whatever it already was.
+///
+/// The gap has to be wide enough to hold a real hand's wobble and narrow
+/// enough that a probe left alone still clears it. On box1's capture probe A
+/// scores 0.386 untouched at the median and 0.512 at the worst single window,
+/// against 0.628 held: a release at a half sits above the median wander and
+/// below every held window measured, so a hand that is genuinely off lets go
+/// on the next window and one that dips does not.
+pub const default_band_release: f32 = 0.5;
+```
+
+- [ ] **Step 4: Thread it through `Config` and `Detector`**
+
+In `Config`, directly after `band_share`:
+
+```zig
+    band_release: f32 = default_band_release,
+```
+
+In the `Detector` struct, beside `band_share`:
+
+```zig
+    /// The share at or below which the touch is over. `learned` only.
+    band_release: f32,
+```
+
+In `Detector.init`, beside `.band_share = cfg.band_share,`:
+
+```zig
+            .band_release = cfg.band_release,
+```
+
+`Config.forBc` needs no entry — it copies by value and there is no per-probe override.
+
+- [ ] **Step 5: Split the two directions in `stepLearned`**
+
+Rename the `const away = ...` chain to `const held = ...`, leaving every branch of it exactly as it stands, and replace the three lines that followed it. Task 3 then edits one branch of this same chain; the two tasks do not collide, but run them in the order given.
+
+```zig
+        const held = if (second_level and readable)
+            // ... Task 2's branch, unchanged
+```
+
+Then, where `const held = away; const loose = !away; self.at_rest = loose;` stood:
+
+```zig
+        // Two lines where the share is what is being asked, and one everywhere
+        // else. Between them nothing moves, which is the whole reason there
+        // are two: on this rig a hand's share lands on the threshold rather
+        // than far past it, and a single line turns that into a latch and a
+        // release on alternate windows.
+        //
+        // The other two branches keep one line each. Neither is a share, and
+        // neither has ever been seen to sit on its threshold.
+        const loose = if (second_level and readable)
+            @max(self.spread.above, self.spread.below) <= self.band_release
+        else
+            !held;
+
+        self.at_rest = loose;
+
+        return self.settle(held, loose);
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `zig build test-core`
+
+Expected: PASS, all of it. The four guard-rail fixtures from Task 2 Step 6 must still pass — with `band_release` at 0.5 and `band_share` at 0.6, a fixture that scored under 0.6 before still never latches, and one that scored over it still does.
+
+- [ ] **Step 7: Add the flag beside Task 0's**
+
+Same five places as Task 0. `src/cli.zig` `Options`:
+
+```zig
+    /// How little of the window past the line ends a touch, under `learned`.
+    band_release: ?f32 = null,
+```
+
+Parse, directly after the `--band-share=` branch:
+
+```zig
+        } else if (std.mem.startsWith(u8, arg, "--band-release=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-release=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction >= 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_release = fraction;
+```
+
+`Overrides` in `src/application/production_config.zig`:
+
+```zig
+    band_release: ?f32 = null,
+```
+
+`touchWith`, beside the `band_share` line:
+
+```zig
+    if (overrides.band_release) |fraction| cfg.band_release = fraction;
+```
+
+`src/main.zig`, in the `Overrides` literal:
+
+```zig
+            .band_release = opts.band_release,
+```
+
+Usage text: add `[--band-release=FRACTION]` to the same line as `--band-share`, and extend that paragraph with one sentence — that a touch ends when the share falls to this, and that between the two the state is whatever it already was.
+
+- [ ] **Step 8: Test the flag**
+
+At the end of `src/cli.zig`:
+
+```zig
+test "the share that ends a touch is its own flag" {
+    const opts = try parse(&.{ "--band-share=0.55", "--band-release=0.40" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.55), opts.band_share.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.40), opts.band_release.?, 0.0001);
+
+    // Nought is a setting: it says the touch ends only when nothing at all is
+    // past the line. One-point-something is a typo.
+    try std.testing.expect((try parse(&.{"--band-release=0"})).band_release.? == 0.0);
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-release=1.2"}));
+}
+```
+
+- [ ] **Step 9: Run the full tests**
+
+Run: `zig build test`
+
+Expected: PASS, all of it.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/core/touch.zig src/cli.zig src/application/production_config.zig src/main.zig
+git commit -m "feat(core): the share that ends a touch is its own number
+
+One line answered both directions, which is the fault the steady model
+was given two thresholds for: a probe sitting on it latches and
+releases on alternate windows. On this rig a hand's share lands on the
+threshold rather than far past it -- 0.628 held against a line at 0.600
+-- so the alternate windows are what a room actually gets, and a held
+voice plays them as the clip wobbling in and out.
+
+Between the two nothing moves. The branches that are not asking about a
+share keep one line each: neither has been seen to sit on its own."
+```
+
+---
+
 ### Task 3: A full gap asks a second question
 
 **Files:**
@@ -687,6 +1043,14 @@ fifteen-minute capture of the rig actually gives."
 ```
 
 ---
+
+## Task order
+
+`0 → 1 → 2 → 2b → 3 → 4 → 5`
+
+Task 0 stands alone and is the one worth having in the room first — it makes the threshold tunable without a rebuild, which is what lets the capture in Task 5 be argued with rather than guessed at. Tasks 1, 2 and 2b are the share; Task 3 is the branch beside it; Task 4 is the log; Task 5 needs the Pi.
+
+Tasks 0 and 2b touch `cli.zig` and `production_config.zig`, so both need `zig build test` rather than `test-core`.
 
 ## Not in this plan
 
