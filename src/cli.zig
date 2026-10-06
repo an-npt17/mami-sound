@@ -367,7 +367,7 @@ pub const usage =
     \\  daybird     ./Day bird/
     \\  insect      ./Insect/
     \\  tradvn      ./Trad Vn Jam/
-    \\  tradvn2     ./Trad Vn Jam 2/
+    \\  tradvn2     ./Trad VN Jam 2/
     \\  bell        ./Bell Stems/
     \\  piano       ./EPiano Stems/
     \\Unasked, plant A is the drone and plant B is voicebox3. Bare --plant-a
