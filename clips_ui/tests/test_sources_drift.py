@@ -1,7 +1,7 @@
 """Guards against ``sources.json`` drifting from the Zig source of truth.
 
 ``sources.json`` should be produced by ``zig build dump-sources``, which
-reads the seven name/folder pairs straight out of
+reads every name/folder pair straight out of
 ``clip_loader.directoriesFor``. The zig toolchain could not be run on the
 machine this file was written on, so ``sources.json`` was hand-written to
 match ``directoriesFor`` instead (see the note in ``folders.py`` and in
@@ -43,8 +43,8 @@ def _pairs_from_directories_for() -> dict[str, str]:
 def test_sources_json_matches_directories_for() -> None:
     pairs = _pairs_from_directories_for()
 
-    assert len(pairs) == 7, (
-        f"expected 7 source/folder pairs in directoriesFor, found {len(pairs)}: {pairs}. "
+    assert len(pairs) == 8, (
+        f"expected 8 source/folder pairs in directoriesFor, found {len(pairs)}: {pairs}. "
         "run zig build dump-sources"
     )
     assert "drone" not in pairs, "drone has no folder and must stay out of sources.json"

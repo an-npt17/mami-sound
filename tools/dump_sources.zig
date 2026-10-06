@@ -1,5 +1,5 @@
-//! Prints the seven source/folder pairs out of `clip_loader.directoriesFor`
-//! as JSON.
+//! Prints every source/folder pair out of `clip_loader.directoriesFor` as
+//! JSON.
 //!
 //! `directoriesFor` is the one place those folder names live (see its own
 //! doc comment in `src/adapters/clip_loader.zig`). This program exists so
@@ -30,7 +30,7 @@ const clip_loader = adapters.adapters.clip_loader;
 /// generated audio with no folder at all, and `directoriesFor(.drone)` is
 /// `unreachable`.
 const sources = [_]core.source.Source{
-    .voicebox3, .voicebox5, .insect, .tradvn, .bell, .daybird, .piano,
+    .voicebox3, .voicebox5, .insect, .tradvn, .tradvn2, .bell, .daybird, .piano,
 };
 
 pub fn main(init: std.process.Init) !void {

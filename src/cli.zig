@@ -367,17 +367,26 @@ pub const usage =
     \\  daybird     ./Day bird/
     \\  insect      ./Insect/
     \\  tradvn      ./Trad Vn Jam/
+    \\  tradvn2     ./Trad Vn Jam 2/
     \\  bell        ./Bell Stems/
     \\  piano       ./EPiano Stems/
     \\Unasked, plant A is the drone and plant B is voicebox3. Bare --plant-a
     \\means --plant-a=daybird. Every source is one folder: a plant that wants
     \\two of them is two plants.
     \\
+    \\Every source but one is shuffled: a touch answers with a clip the folder
+    \\has not played this pass round, so a room cannot predict the next one.
+    \\tradvn2 is the exception. Its folder holds one piece in numbered parts,
+    \\so it is played in order -- song1, then song2, on to the last part and
+    \\round to the first again -- and the numbering is read as numbers, so
+    \\song10 follows song9 rather than song1. There is no flag for this: the
+    \\order is a fact about what is in the folder.
+    \\
     \\--plant-a-seconds and --plant-b-seconds are how long one touch plays.
     \\Zero plays the clip to its own end, which is how a source that is normally
     \\cut is uncapped, or one that normally runs long is cut. Left off, the
     \\source's own length stands: 4s for the stems, 5s for daybird and insect,
-    \\and to the end for the voice boxes and tradvn.
+    \\and to the end for the voice boxes and both jams.
     \\
     \\--plant-a-mode and --plant-b-mode are how a plant answers a hand:
     \\  trigger  a touch sets a clip going and it runs its own length

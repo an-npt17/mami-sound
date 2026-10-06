@@ -87,6 +87,9 @@ pub const ClipSelector = struct {
     /// How many clips the source has. Every source is one folder, so this is
     /// the whole of what a selector needs to know about it.
     clip_count: usize,
+    /// Shuffled or in folder order. A sequential selector never reads `random`
+    /// or `dealt`: the folder's own order is the whole of its answer.
+    order: source_mod.Order,
     random: std.Random,
     previous_touch: bool,
     /// Which clip is playing, so the next touch answers with a different one.
@@ -113,12 +116,14 @@ pub const ClipSelector = struct {
         retrigger_s: f32,
         sample_rate: u32,
         random: std.Random,
+        order: source_mod.Order,
     ) ClipSelector {
         const settled: u64 = @intFromFloat(
             hold_release_s * @as(f32, @floatFromInt(sample_rate)),
         );
         return .{
             .clip_count = clip_count,
+            .order = order,
             .random = random,
             .previous_touch = false,
             .last_index = null,
@@ -199,6 +204,15 @@ pub const ClipSelector = struct {
     /// the last pass cannot start the next -- the seam is the one place a
     /// shuffle can still repeat itself, and the one place a room would notice.
     fn pick(self: *ClipSelector) usize {
+        // A folder played in order answers with the next part of it, and wraps
+        // at the end rather than stopping: the piece starts again, which is
+        // what an installation running all day has to do. Nothing before the
+        // first touch has played, so that touch gets part one.
+        if (self.order == .sequential) {
+            const last = self.last_index orelse return 0;
+            return (last + 1) % self.clip_count;
+        }
+
         if (self.countEligible() == 0) self.reshuffle();
 
         const choices = self.countEligible();
@@ -319,7 +333,7 @@ fn testSelectorGuard(clip_count: usize, retrigger_s: f32, seed: u64) ClipSelecto
         var prng: std.Random.DefaultPrng = undefined;
     };
     State.prng = .init(seed);
-    return ClipSelector.init(clip_count, retrigger_s, 44100, State.prng.random());
+    return ClipSelector.init(clip_count, retrigger_s, 44100, State.prng.random(), .shuffled);
 }
 
 fn testSelector(clip_count: usize, seed: u64) ClipSelector {
@@ -327,7 +341,16 @@ fn testSelector(clip_count: usize, seed: u64) ClipSelector {
         var prng: std.Random.DefaultPrng = undefined;
     };
     State.prng = .init(seed);
-    return ClipSelector.init(clip_count, 10.0, 44100, State.prng.random());
+    return ClipSelector.init(clip_count, 10.0, 44100, State.prng.random(), .shuffled);
+}
+
+/// A selector that walks its folder in order rather than dealing it.
+fn testSelectorSequential(clip_count: usize) ClipSelector {
+    const State = struct {
+        var prng: std.Random.DefaultPrng = undefined;
+    };
+    State.prng = .init(1);
+    return ClipSelector.init(clip_count, 10.0, 44100, State.prng.random(), .sequential);
 }
 
 test "a touch starts a clip when plant B is silent" {
@@ -416,8 +439,48 @@ test "an override replaces the source's length" {
 
 test "the guard length reaches the selector" {
     var prng = std.Random.DefaultPrng.init(1);
-    const selector = ClipSelector.init(2, 5.0, 44100, prng.random());
+    const selector = ClipSelector.init(2, 5.0, 44100, prng.random(), .shuffled);
     try std.testing.expectEqual(@as(u64, 5 * 44100), selector.open_frames);
+}
+
+test "a folder played in order starts at its first clip" {
+    var selector = testSelectorSequential(six_clips);
+    try std.testing.expectEqual(@as(usize, 0), selector.start(true, false, poll_frames).?);
+}
+
+test "a folder played in order walks it and wraps" {
+    // Part one, then two, and so on to the end, then part one again. An
+    // installation that stops after the last part has stopped working.
+    var selector = testSelectorSequential(six_clips);
+    for (0..3 * six_clips) |touch| {
+        const index = selector.start(true, false, poll_frames).?;
+        try std.testing.expectEqual(touch % six_clips, index);
+        _ = selector.start(false, false, poll_frames);
+    }
+}
+
+test "a folder played in order ignores the shuffle" {
+    // The deal and the no-repeat rule are the shuffled selector's. A sequential
+    // one that consulted them would skip a part, which in a piece in parts is
+    // the one thing a room would hear.
+    var selector = testSelectorSequential(2);
+    try std.testing.expectEqual(@as(usize, 0), selector.next().?);
+    try std.testing.expectEqual(@as(usize, 1), selector.next().?);
+    try std.testing.expectEqual(@as(usize, 0), selector.next().?);
+    for (selector.dealt) |marked| try std.testing.expect(!marked);
+}
+
+test "a folder played in order with one clip in it keeps playing that clip" {
+    var selector = testSelectorSequential(1);
+    for (0..4) |_| {
+        try std.testing.expectEqual(@as(usize, 0), selector.next().?);
+    }
+}
+
+test "an empty folder played in order starts nothing" {
+    var selector = testSelectorSequential(0);
+    try std.testing.expect(selector.next() == null);
+    try std.testing.expect(selector.start(true, false, poll_frames) == null);
 }
 
 /// How a plant answers a hand.

@@ -41,7 +41,11 @@ pub const Engine = struct {
             .probe = probe,
             .sink = sink,
             .status = status,
-            .machine = core.touch.Machine.init(touch_config),
+            // The selection is what the machine is told, not just what the
+            // voices are: a plant out of the run is an electrode off the rig,
+            // and an open input must not reach the other probe through the
+            // shadow rule.
+            .machine = core.touch.Machine.initLive(touch_config, selection),
             .voices = voices,
             .capture = capture,
             .block = undefined,
@@ -281,7 +285,7 @@ fn clipVoice(stream: *FakeClips, slot: usize) voice_mod.Voice {
     State.prng[slot] = .init(slot + 1);
     return .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, core.sample_rate, State.prng[slot].random()),
+        .selector = .init(folder_clips, 5.0, core.sample_rate, State.prng[slot].random(), .shuffled),
     } };
 }
 

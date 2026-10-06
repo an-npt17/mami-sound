@@ -369,11 +369,11 @@ test "the span is the move the probe actually makes" {
     // The rig reads plant A at 0 or 1 untouched and about 25000 under a hand.
     // A span under that saturates on every touch and pins the pitch at the top
     // of the range, which is the one thing the drone must not do.
-    try std.testing.expect(drone.span >= 20000);
+    try std.testing.expect(drone.span.? >= 20000);
 
     // And the quiet end has to be audible, or a light touch is a latch nobody
     // can hear.
-    const just_over = core.noise.freqFromDeviation(default_counts, drone.span, drone.touch_floor);
+    const just_over = core.noise.freqFromDeviation(default_counts, drone.span.?, drone.touch_floor);
     try std.testing.expect(just_over > 3.0 * core.noise.freq_min);
     try std.testing.expect(just_over < 0.5 * core.noise.freq_max);
 }

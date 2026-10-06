@@ -75,6 +75,7 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
         .voicebox5 => &.{"Voice Box 5"},
         .insect => &.{"Insect"},
         .tradvn => &.{"Trad Vn Jam"},
+        .tradvn2 => &.{"Trad Vn Jam 2"},
         .bell => &.{"Bell Stems"},
         .daybird => &.{"Day bird"},
         .piano => &.{"EPiano Stems"},
@@ -88,6 +89,12 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
 /// than an empty list. Silence out of plant B is the one failure nobody in the
 /// room can tell from the piece working, and a `--plant-b` that quietly did
 /// nothing would be found out at the opening.
+///
+/// A source played in order is listed by its numbering rather than in whatever
+/// order the disk hands back. The selector walks the pool by index and knows
+/// nothing about filenames, so this is where "part one" is decided -- and a
+/// folder listed by the filesystem would start the piece somewhere in its
+/// middle and play it in a different wrong order on the next machine.
 pub fn loadPool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -96,8 +103,12 @@ pub fn loadPool(
     var pool: LoadedPool = .empty;
     errdefer pool.deinit(gpa);
 
+    const sequential = which.defaultOrder() == .sequential;
     for (directoriesFor(which)) |directory| {
-        const paths = try library.list(gpa, io, directory);
+        const paths = if (sequential)
+            try library.listNatural(gpa, io, directory)
+        else
+            try library.list(gpa, io, directory);
         defer library.freeList(gpa, paths);
 
         for (paths) |path| try appendPath(gpa, &pool, path);
@@ -110,7 +121,7 @@ test "every source names the one folder it is made of" {
     // One each. The pool that read two folders as one went when the interviews
     // became two boxes; a plant that wants both is two plants.
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .bell, .piano,
+        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .tradvn2, .bell, .piano,
     };
     for (sources) |which| {
         try std.testing.expectEqual(@as(usize, 1), directoriesFor(which).len);
@@ -121,14 +132,49 @@ test "every source names the one folder it is made of" {
     try std.testing.expectEqualStrings("Day bird", directoriesFor(.daybird)[0]);
     try std.testing.expectEqualStrings("Insect", directoriesFor(.insect)[0]);
     try std.testing.expectEqualStrings("Trad Vn Jam", directoriesFor(.tradvn)[0]);
+    try std.testing.expectEqualStrings("Trad Vn Jam 2", directoriesFor(.tradvn2)[0]);
     try std.testing.expectEqualStrings("Bell Stems", directoriesFor(.bell)[0]);
     try std.testing.expectEqualStrings("EPiano Stems", directoriesFor(.piano)[0]);
+}
+
+test "the second jam loads in the order it is numbered" {
+    // The selector walks this pool by index, so index 0 has to be part one and
+    // index 9 part ten -- not part ten second, which is where byte order puts
+    // it. This is the whole of what makes the piece play in order.
+    const gpa = std.testing.allocator;
+    var pool = try loadPool(gpa, std.testing.io, .tradvn2);
+    defer pool.deinit(gpa);
+
+    var previous: ?usize = null;
+    for (pool.paths) |path| {
+        const number = partNumber(path) orelse continue;
+        if (previous) |last| {
+            if (number <= last) {
+                std.debug.print("part {d} came after part {d}\n", .{ number, last });
+                return error.PartsOutOfOrder;
+            }
+        }
+        previous = number;
+    }
+    try std.testing.expect(previous != null);
+}
+
+/// The last run of digits in a path, which is the part number for a folder
+/// named the way this one is. `null` when there is none to read.
+fn partNumber(path: []const u8) ?usize {
+    var end = path.len;
+    while (end > 0 and !std.ascii.isDigit(path[end - 1])) end -= 1;
+    if (end == 0) return null;
+
+    var start = end;
+    while (start > 0 and std.ascii.isDigit(path[start - 1])) start -= 1;
+    return std.fmt.parseInt(usize, path[start..end], 10) catch null;
 }
 
 test "every source loads into a pool with clips in it" {
     const gpa = std.testing.allocator;
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .bell, .piano,
+        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .tradvn2, .bell, .piano,
     };
     for (sources) |which| {
         var pool = try loadPool(gpa, std.testing.io, which);

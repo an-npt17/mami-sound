@@ -18,7 +18,9 @@ pub const preset: Preset = .{
         .model = .deviation,
         .hold_bc_ms = 20.0,
     },
-    .drone = .{},
+    // No span: a box that has never been to a room has no capture to take one
+    // off, and the probe's own two ends are a better range than a guess.
+    .drone = .{ .span = null },
     .plants = .{
         .{ .source = .drone, .mode = .trigger },
         .{ .source = .voicebox3, .mode = .trigger },
@@ -37,4 +39,14 @@ test "the defaults are a rig nobody has measured, and say so in their numbers" {
     // And the two plants the installation has always had.
     try std.testing.expectEqual(core.source.Source.drone, preset.plants[0].source);
     try std.testing.expectEqual(core.source.Source.voicebox3, preset.plants[1].source);
+}
+
+test "a box nobody has measured reads its pitch off the probe, not off a span" {
+    // A span is a number somebody took off a capture, and a box that has never
+    // been to a room has no capture to take it off. Worse, the span that used
+    // to stand in was rectified: it maps how FAR the probe is from rest, so on
+    // a rig whose rest sits mid-range the pitch folds at rest and a hand going
+    // down sounds like a hand going up. Left out, the probe's own two ends are
+    // the range and the mapping rises with the reading.
+    try std.testing.expect(preset.drone.span == null);
 }

@@ -54,7 +54,7 @@ pub const Voice = union(enum) {
         touched: bool,
     ) void {
         switch (self.*) {
-            .drone => |*voice| voice.render(piece, probe.deviation(), touched),
+            .drone => |*voice| voice.render(piece, probe.deviation(), probe.pitch(), touched),
             .clips => |*clips| renderClips(clips, piece, touched),
         }
     }
@@ -170,7 +170,7 @@ fn holdVoice(stream: *FakeStream) Voice {
     State.prng = .init(1);
     return .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, 44100, State.prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, State.prng.random(), .shuffled),
         .mode = .hold,
         .gate = 0.0,
     } };
@@ -185,7 +185,7 @@ test "a clip voice asks for a clip on a touch and plays it" {
     var prng = std.Random.DefaultPrng.init(1);
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random(), .shuffled),
     } };
 
     const probe = testDetector();
@@ -201,7 +201,7 @@ test "a clip voice does not ask again inside the guard" {
     var prng = std.Random.DefaultPrng.init(1);
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random(), .shuffled),
     } };
 
     const probe = testDetector();
@@ -310,7 +310,7 @@ test "a trigger voice ignores the hand once the clip is away" {
     var prng = std.Random.DefaultPrng.init(1);
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random(), .shuffled),
         .mode = .trigger,
     } };
 
@@ -415,7 +415,7 @@ test "a tap voice is not gated like a held one" {
     var prng = std.Random.DefaultPrng.init(1);
     var voice: Voice = .{ .clips = .{
         .stream = stream.port(),
-        .selector = .init(folder_clips, 5.0, 44100, prng.random()),
+        .selector = .init(folder_clips, 5.0, 44100, prng.random(), .shuffled),
         .mode = .tap,
     } };
 
@@ -427,4 +427,71 @@ test "a tap voice is not gated like a held one" {
         voice.render(&piece, &probe, false);
     }
     try std.testing.expectEqual(@as(f32, 0.5), piece[0]);
+}
+
+/// Probe A as the room's own journal shows it, over an evening of hands.
+///
+/// Untouched it wanders between 9776 and 15976 -- rest on this rig is a band,
+/// not a level. A hand takes it clean out of that: to ground at one end or
+/// past 25000 at the other, and nothing says in advance which.
+///
+/// The episodes last seconds because real ones do, and because the ends are
+/// sampled at ten hertz: a touch written as one poll in forty is a touch the
+/// window never sees, and the probe would be credited with ends it never
+/// reached.
+fn roomProbeA(poll: usize, prng: *std.Random.DefaultPrng) i16 {
+    const polls_per_s: usize = 44100 / 128;
+    return switch ((poll / polls_per_s) % 10) {
+        0, 1, 2 => 0, // a hand pulling the probe to ground
+        5, 6 => 25906, // and a hand taking it the other way
+        else => prng.random().intRangeAtMost(i16, 9776, 15976),
+    };
+}
+
+test "the drone's pitch answers the size of the move, not just its distance" {
+    // What the room asked for: a small raise is a small change and a big raise
+    // a big one, easy enough to notice either way.
+    //
+    // Neither half held on the old mapping. It was rectified -- how FAR the
+    // probe is from rest, never which way -- so on this rig, whose rest sits
+    // mid-range, a raise from below rest up to rest LOWERED the pitch to the
+    // floor. And at the box's span of 3000 counts, 6% of resting samples were
+    // already pinned at the top of the range, where a raise of any size at all
+    // changed nothing.
+    var detector: core.touch.Detector = .init(.{
+        .sample_rate = 44100,
+        .poll_frames = 128,
+        .model = .deviation,
+    });
+    var prng = std.Random.DefaultPrng.init(20260930);
+    for (0..32000) |poll| _ = detector.update(roomProbeA(poll, &prng));
+
+    // Settle the probe at a level and read the pitch the drone would play.
+    const at = struct {
+        fn hz(probe: *core.touch.Detector, level: i16) f32 {
+            for (0..800) |poll| {
+                _ = probe.update(level +% @as(i16, if (poll % 3 == 0) 2 else -2));
+            }
+            return core.noise.freqFromPosition(probe.pitch().?, 0.0);
+        }
+    }.hz;
+
+    const rest = at(&detector, 12908);
+    const small_raise = at(&detector, 15976);
+    const big_raise = at(&detector, 25906);
+
+    // Both raises are heard, and the big one is heard as the bigger.
+    try std.testing.expect(small_raise > rest);
+    try std.testing.expect(big_raise > small_raise);
+
+    // Audible, not merely different: a raise the width of the resting wander
+    // is worth better than a musical third, and a hand is worth more than an
+    // octave on top of it.
+    try std.testing.expect(small_raise / rest > 1.25);
+    try std.testing.expect(big_raise / small_raise > 2.0);
+
+    // And the fold is gone: a move DOWN from rest lowers the pitch, where the
+    // rectified mapping raised it by exactly as much as a move up.
+    const dropped = at(&detector, 6000);
+    try std.testing.expect(dropped < rest);
 }

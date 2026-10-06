@@ -241,6 +241,13 @@ fn runComposition(
         if (mode == .hold) {
             std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
         }
+        const order = chosen.defaultOrder();
+        if (order == .sequential) {
+            std.debug.print(
+                "loading: plant {s} plays its folder in order, part by part\n",
+                .{name},
+            );
+        }
         voices[plant] = .{
             .clips = .{
                 .stream = streams[plant].port(),
@@ -249,6 +256,7 @@ fn runComposition(
                     retrigger,
                     core.sample_rate,
                     shuffle.random(),
+                    order,
                 ),
                 .mode = mode,
                 // Shut, so the first hold is heard opening rather than arriving.

@@ -14,6 +14,20 @@ const std = @import("std");
 
 pub const Error = error{UnknownSource};
 
+/// Which clip of a folder the next touch gets.
+///
+/// `shuffled` deals the pool like a hand of cards: every clip once before any
+/// comes round again, in no order a room can predict. That is what a pool of
+/// answers wants -- a bird that called the same way every time is a recording,
+/// not a plant.
+///
+/// `sequential` walks the folder in order and wraps at the end. That is what a
+/// folder holding one piece in parts wants: the parts are in an order, and a
+/// shuffle of them is not the piece. It lives with the source rather than on
+/// the command line because the order is a fact about the folder's contents,
+/// and a room asked to remember a flag for it would forget.
+pub const Order = enum { shuffled, sequential };
+
 /// How long a clip is protected from the next hand, for everything but the
 /// recordings. Long enough that a clip has established itself, short enough
 /// that a room which has heard enough can move it on.
@@ -61,6 +75,10 @@ pub const Source = enum {
     daybird,
     insect,
     tradvn,
+    /// The second jam, which is one piece in numbered parts rather than a pool
+    /// of alternatives. Its own source and not a second folder behind `tradvn`,
+    /// because it is played in order and that one is not.
+    tradvn2,
     bell,
     piano,
 
@@ -77,9 +95,21 @@ pub const Source = enum {
     /// a fragment, and a jam cut there is not music.
     pub fn defaultSeconds(self: Source) ?f32 {
         return switch (self) {
-            .drone, .voicebox3, .voicebox5, .tradvn => null,
+            .drone, .voicebox3, .voicebox5, .tradvn, .tradvn2 => null,
             .daybird, .insect => fragment_play_s,
             .bell, .piano => stem_play_s,
+        };
+    }
+
+    /// Which clip of this folder the next touch gets.
+    ///
+    /// Everything here is a pool of answers and is shuffled. The second jam is
+    /// the exception: its folder is one piece in numbered parts, so a touch
+    /// moves it on to the next part rather than somewhere else in it.
+    pub fn defaultOrder(self: Source) Order {
+        return switch (self) {
+            .tradvn2 => .sequential,
+            else => .shuffled,
         };
     }
 
@@ -103,6 +133,7 @@ test "every source name parses to itself" {
     try std.testing.expectEqual(Source.daybird, try Source.parse("daybird"));
     try std.testing.expectEqual(Source.insect, try Source.parse("insect"));
     try std.testing.expectEqual(Source.tradvn, try Source.parse("tradvn"));
+    try std.testing.expectEqual(Source.tradvn2, try Source.parse("tradvn2"));
     try std.testing.expectEqual(Source.bell, try Source.parse("bell"));
     try std.testing.expectEqual(Source.piano, try Source.parse("piano"));
 }
@@ -124,7 +155,22 @@ test "a source that plays to its own end has no length" {
     try std.testing.expect(Source.voicebox3.defaultSeconds() == null);
     try std.testing.expect(Source.voicebox5.defaultSeconds() == null);
     try std.testing.expect(Source.tradvn.defaultSeconds() == null);
+    try std.testing.expect(Source.tradvn2.defaultSeconds() == null);
     try std.testing.expect(Source.drone.defaultSeconds() == null);
+}
+
+test "only the second jam is played in order" {
+    // Its folder is one piece in parts. Everything else is a pool of answers,
+    // and a room that can predict the next answer has stopped listening to it.
+    try std.testing.expectEqual(Order.sequential, Source.tradvn2.defaultOrder());
+
+    // Everything the enum holds but that one, so a source added later is
+    // shuffled unless somebody says otherwise here.
+    inline for (@typeInfo(Source).@"enum".fields) |field| {
+        const which: Source = @enumFromInt(field.value);
+        if (which == .tradvn2) continue;
+        try std.testing.expectEqual(Order.shuffled, which.defaultOrder());
+    }
 }
 
 test "a source that answers with a fragment carries its length" {
@@ -140,6 +186,7 @@ test "the voice boxes are protected for longer than anything else" {
     try std.testing.expectEqual(@as(f32, 10.0), Source.voicebox3.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 10.0), Source.voicebox5.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.tradvn.defaultRetriggerSeconds());
+    try std.testing.expectEqual(@as(f32, 5.0), Source.tradvn2.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.daybird.defaultRetriggerSeconds());
     try std.testing.expectEqual(@as(f32, 5.0), Source.bell.defaultRetriggerSeconds());
 }

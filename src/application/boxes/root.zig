@@ -81,17 +81,20 @@ test "a box's drone span covers the move its probe actually makes" {
     // the room hears the same throttle opened every time.
     inline for (@typeInfo(Box).@"enum".fields) |field| {
         const chosen = presetFor(@as(Box, @enumFromInt(field.value)));
-        if (chosen.touch.counts) |floor| {
-            try std.testing.expect(chosen.drone.span >= floor);
+        // A box that has left its span out has none to get wrong: its pitch
+        // is read off the ends the probe itself has been to, which cover the
+        // excursion by construction rather than by a number somebody typed.
+        if (chosen.drone.span) |span| if (chosen.touch.counts) |floor| {
+            try std.testing.expect(span >= floor);
             // And the quiet end has to be audible, or a light touch is a latch
             // nobody can hear.
             const just_over = core.noise.freqFromDeviation(
                 floor,
-                chosen.drone.span,
+                span,
                 chosen.drone.touch_floor,
             );
             try std.testing.expect(just_over > 3.0 * core.noise.freq_min);
-        }
+        };
     }
 }
 

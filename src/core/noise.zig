@@ -97,7 +97,15 @@ pub const default_touch_floor_ramped: f32 = 0.6;
 /// there, how long the sweep up to it takes, how long the tracking behind it
 /// takes, and how long the fall home takes once the hand has gone.
 pub const Shape = struct {
-    span: i16 = default_span,
+    /// Deviation that reaches the top of the range, or null to read the pitch
+    /// off where the probe sits between its own two ends instead.
+    ///
+    /// A span is a number somebody measured off a capture, and it only works
+    /// where rest is an end of the range: a distance is rectified, so on a rig
+    /// whose rest sits in the middle the pitch folds at rest and a hand going
+    /// down sounds like a hand going up. Left out, the probe supplies its own
+    /// ends and the mapping is monotonic without anything being measured.
+    span: ?i16 = default_span,
     touch_floor: f32 = default_touch_floor,
     /// Set to climb on the hold rather than on the reading. Null keeps the
     /// mapping every existing rig was tuned against.
@@ -143,6 +151,20 @@ pub fn freqFromDeviation(dev: i16, span: i16, floor: f32) f32 {
     return freq_min * std.math.pow(f32, freq_max / freq_min, reach + (1.0 - reach) * t);
 }
 
+/// Map a position between the probe's own two ends to centre frequency, on
+/// the same log scale and with the same floor as the span mapping.
+///
+/// What a rig gets when nobody has measured a span for it. `span` asks how far
+/// the probe moved from rest and needs a number off a capture; this asks where
+/// it sits between the ends it has actually been to, which the probe supplies
+/// itself. It is also the only one of the two that is monotonic on a rig whose
+/// rest sits mid-range: a distance is rectified, and folds.
+pub fn freqFromPosition(pos: f32, floor: f32) f32 {
+    const reach = std.math.clamp(floor, 0.0, 1.0);
+    const t = std.math.clamp(pos, 0.0, 1.0);
+    return freq_min * std.math.pow(f32, freq_max / freq_min, reach + (1.0 - reach) * t);
+}
+
 fn smoothingAlpha(tau_s: f32, sample_rate: u32) f32 {
     const sr = @as(f32, @floatFromInt(sample_rate));
     return 1.0 - @exp(-1.0 / (tau_s * sr));
@@ -156,8 +178,9 @@ pub const Noise = struct {
     /// pitch home to `freq_min`.
     alpha_release: f32,
     gate_step: f32,
-    /// Deviation that reaches `freq_max`.
-    span: i16,
+    /// Deviation that reaches `freq_max`, or null to read the pitch off the
+    /// probe's own position between its two ends.
+    span: ?i16,
     /// Where a touch starts the deviation counting from.
     touch_floor: f32,
     /// How long a held touch takes to reach the top, or null to ask the
@@ -208,11 +231,19 @@ pub const Noise = struct {
 
     /// Add this voice's output into `out`. Never overwrites, so voices mix by
     /// being rendered in sequence into the same block.
-    pub fn render(self: *Noise, out: []f32, dev: i16, touched: bool) void {
+    pub fn render(self: *Noise, out: []f32, dev: i16, pos: ?f32, touched: bool) void {
         // The floor belongs to the touch, so an untouched voice still maps to
         // the bottom of the range and the release still carries the pitch all
         // the way home rather than parking it on the floor.
-        const reading_fc = freqFromDeviation(dev, self.span, if (touched) self.touch_floor else 0.0);
+        const floor = if (touched) self.touch_floor else 0.0;
+        // A measured span maps the distance, which is what every rig so far
+        // was tuned against. Without one the probe's own position is the
+        // pitch -- and a probe that has not said where its ends are yet sits
+        // at the bottom rather than somewhere invented.
+        const reading_fc = if (self.span) |span|
+            freqFromDeviation(dev, span, floor)
+        else
+            freqFromPosition(pos orelse 0.0, floor);
         // A ramped voice reads its pitch off the clock instead, but only while
         // somebody is there: released, it falls home on the same mapping as
         // every other voice, which is what keeps the release one behaviour.
@@ -324,7 +355,7 @@ fn renderBlocks(voice: *Noise, blocks: usize, dev: i16, touched: bool) void {
     var block: [test_block]f32 = undefined;
     for (0..blocks) |_| {
         @memset(&block, 0);
-        voice.render(&block, dev, touched);
+        voice.render(&block, dev, null, touched);
     }
 }
 
@@ -429,8 +460,8 @@ test "the touch is heard as a burst and not only as a change of pitch" {
 
     var touched_out = [_]f32{0.0} ** 44100;
     var idle_out = [_]f32{0.0} ** 44100;
-    touched.render(&touched_out, 1500, true);
-    idle.render(&idle_out, 1500, false);
+    touched.render(&touched_out, 1500, null, true);
+    idle.render(&idle_out, 1500, null, false);
 
     try std.testing.expect(rootMeanSquare(&touched_out) > rootMeanSquare(&idle_out) * 2.0);
 }
@@ -513,4 +544,54 @@ test "no rise asked for leaves the deviation mapping exactly as it was" {
     var voice = steadyVoice();
     renderBlocks(&voice, 20, 60, true);
     try std.testing.expectApproxEqAbs(freqFromDeviation(60, 200, 0.6), voice.fc, 1.0);
+}
+
+test "a position maps across the pitch range without a span to measure" {
+    // The mapping a rig gets when nobody has measured a span for it. The ends
+    // are whatever the probe has been to, so the only thing left to say is
+    // where between them it sits -- and the range is spent on that, log
+    // scaled like every other pitch here so equal steps sound equal.
+    try std.testing.expectApproxEqRel(freq_min, freqFromPosition(0.0, 0.0), 0.001);
+    try std.testing.expectApproxEqRel(freq_max, freqFromPosition(1.0, 0.0), 0.001);
+    try std.testing.expectApproxEqRel(
+        @sqrt(freq_min * freq_max),
+        freqFromPosition(0.5, 0.0),
+        0.001,
+    );
+}
+
+test "an unset span reads the pitch off the probe's position instead" {
+    // The whole point of leaving the span out: the room does not have to know
+    // how far a hand moves this probe, because the probe has already been to
+    // both ends and said so. A span left set keeps the mapping every rig so
+    // far was tuned against, which is the next test.
+    var voice: Noise = .init(44100, 1, .{
+        .span = null,
+        .glide_s = 0.002,
+        .release_s = 0.002,
+    });
+    var block: [2048]f32 = undefined;
+    @memset(&block, 0.0);
+
+    // Halfway between the ends is the middle of the range. The deviation is
+    // handed over as nought to prove it is not what the pitch came from.
+    for (0..60) |_| voice.render(&block, 0, 0.5, false);
+    try std.testing.expectApproxEqRel(@sqrt(freq_min * freq_max), voice.fc, 0.02);
+}
+
+test "a span that is set still maps the deviation, as every rig was tuned" {
+    // Box 2 and box 5 measured a span off a capture and the drone was tuned
+    // against it. Leaving the span out is the new behaviour; setting one has
+    // to stay exactly the old one, or five boxes retune at once.
+    var voice: Noise = .init(44100, 1, .{
+        .span = 1000,
+        .glide_s = 0.002,
+        .release_s = 0.002,
+    });
+    var block: [2048]f32 = undefined;
+    @memset(&block, 0.0);
+
+    // The position is handed over as nought to prove the span wins.
+    for (0..60) |_| voice.render(&block, 1000, 0.0, false);
+    try std.testing.expectApproxEqRel(freq_max, voice.fc, 0.02);
 }

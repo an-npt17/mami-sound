@@ -15,9 +15,12 @@ from clips_ui.folders import SOURCES, UnknownSource, UnsafeName, folder_for, is_
 
 
 def test_every_source_maps_to_a_folder() -> None:
-    assert len(SOURCES) == 7
+    assert len(SOURCES) == 8
     assert "drone" not in SOURCES  # generated, has no folder at all
     assert SOURCES["piano"] == "EPiano Stems"
+    # The second jam is its own source and its own folder, not a second folder
+    # behind the first: it is played in order and that one is not.
+    assert SOURCES["tradvn2"] == "Trad Vn Jam 2"
 
 
 def test_an_unknown_source_is_refused() -> None:

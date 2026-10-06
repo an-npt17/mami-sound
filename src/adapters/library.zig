@@ -93,7 +93,190 @@ fn lessByName(_: void, a: []u8, b: []u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
+/// Every clip in `dir_path`, sorted the way the folder is numbered.
+///
+/// `listSorted` compares byte by byte, which puts `song10` between `song1` and
+/// `song2`. For a pool of alternatives that is only an order; for a folder
+/// holding one piece in numbered parts it is the wrong one, and a room would
+/// hear part ten arrive second. So a run of digits is compared as the number it
+/// spells, and everything else byte by byte as before.
+pub fn listNatural(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![][]u8 {
+    const paths = try list(gpa, io, dir_path);
+    std.mem.sort([]u8, paths, {}, lessByNatural);
+    return paths;
+}
+
+/// How long the run of digits starting at `at` is. Zero when there is none.
+fn digitRun(text: []const u8, at: usize) usize {
+    var end = at;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    return end - at;
+}
+
+/// Compare two runs of digits as numbers. `null` when they spell the same one,
+/// so the caller carries on past them rather than calling it a tie.
+///
+/// Leading zeros are skipped before the lengths are compared, so `song07` and
+/// `song7` are the same part -- which they are, to anybody who renamed half a
+/// folder and stopped.
+fn digitsLess(a: []const u8, b: []const u8) ?bool {
+    const a_digits = std.mem.trimStart(u8, a, "0");
+    const b_digits = std.mem.trimStart(u8, b, "0");
+    if (a_digits.len != b_digits.len) return a_digits.len < b_digits.len;
+    if (std.mem.eql(u8, a_digits, b_digits)) return null;
+    return std.mem.lessThan(u8, a_digits, b_digits);
+}
+
+fn lessByNatural(_: void, a: []u8, b: []u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        const a_run = digitRun(a, i);
+        const b_run = digitRun(b, j);
+
+        // A number on one side and a letter on the other is not a number
+        // comparison; fall through to the bytes.
+        if (a_run != 0 and b_run != 0) {
+            if (digitsLess(a[i..][0..a_run], b[j..][0..b_run])) |answer| return answer;
+            i += a_run;
+            j += b_run;
+            continue;
+        }
+
+        if (a[i] != b[j]) return a[i] < b[j];
+        i += 1;
+        j += 1;
+    }
+
+    // One ran out inside the other: the shorter name comes first, which is what
+    // byte order would have said too.
+    return a.len - i < b.len - j;
+}
+
 pub fn freeList(gpa: std.mem.Allocator, paths: [][]u8) void {
     for (paths) |path| gpa.free(path);
     gpa.free(paths);
+}
+
+/// Sort a list of names the natural way, so the comparator can be tested
+/// without a folder to point it at.
+fn sortedNaturally(names: [][]u8) void {
+    std.mem.sort([]u8, names, {}, lessByNatural);
+}
+
+test "a numbered folder sorts by its numbers and not its bytes" {
+    var one = "song1.wav".*;
+    var two = "song2.wav".*;
+    var nine = "song9.wav".*;
+    var ten = "song10.wav".*;
+    var twenty_one = "song21.wav".*;
+
+    var names = [_][]u8{ &ten, &one, &twenty_one, &nine, &two };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("song1.wav", names[0]);
+    try std.testing.expectEqualStrings("song2.wav", names[1]);
+    try std.testing.expectEqualStrings("song9.wav", names[2]);
+    try std.testing.expectEqualStrings("song10.wav", names[3]);
+    try std.testing.expectEqualStrings("song21.wav", names[4]);
+}
+
+test "the folder a numbered name sits in is not what orders it" {
+    // Every path carries the same directory prefix, digits in it and all.
+    var one = "Trad Vn Jam 2/song1.wav".*;
+    var ten = "Trad Vn Jam 2/song10.wav".*;
+    var two = "Trad Vn Jam 2/song2.wav".*;
+
+    var names = [_][]u8{ &ten, &two, &one };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("Trad Vn Jam 2/song1.wav", names[0]);
+    try std.testing.expectEqualStrings("Trad Vn Jam 2/song2.wav", names[1]);
+    try std.testing.expectEqualStrings("Trad Vn Jam 2/song10.wav", names[2]);
+}
+
+test "a padded number is the part it spells" {
+    // Half a folder renamed and the other half not is a folder somebody will
+    // hand over, and part seven is part seven however it is written.
+    var seven = "song07.wav".*;
+    var eight = "song8.wav".*;
+
+    var names = [_][]u8{ &eight, &seven };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("song07.wav", names[0]);
+    try std.testing.expectEqualStrings("song8.wav", names[1]);
+}
+
+test "a name with no numbers in it sorts as it always did" {
+    var bell = "bell.wav".*;
+    var cello = "cello.wav".*;
+
+    var names = [_][]u8{ &cello, &bell };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("bell.wav", names[0]);
+    try std.testing.expectEqualStrings("cello.wav", names[1]);
+}
+
+test "a name that is the start of another comes before it" {
+    // Both run out of digits at the same number, so what is left of the longer
+    // name decides -- and nothing comes before something.
+    var short = "song1".*;
+    var long = "song1.wav".*;
+
+    var names = [_][]u8{ &long, &short };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("song1", names[0]);
+    try std.testing.expectEqualStrings("song1.wav", names[1]);
+}
+
+test "what follows the number is still compared byte by byte" {
+    // Two takes of the same part. The numbers tie, so the bytes after them
+    // decide, exactly as they did before any of this -- and '-' is below '.',
+    // which is what byte order has always said.
+    var plain = "song1.wav".*;
+    var alt = "song1-alt.wav".*;
+
+    var names = [_][]u8{ &plain, &alt };
+    sortedNaturally(&names);
+
+    try std.testing.expectEqualStrings("song1-alt.wav", names[0]);
+    try std.testing.expectEqualStrings("song1.wav", names[1]);
+}
+
+test "a number on one side and a letter on the other falls through to the bytes" {
+    var numbered = "song1.wav".*;
+    var named = "songA.wav".*;
+
+    var names = [_][]u8{ &named, &numbered };
+    sortedNaturally(&names);
+
+    // '1' is below 'A', which is what byte order says and what this should not
+    // have changed.
+    try std.testing.expectEqualStrings("song1.wav", names[0]);
+    try std.testing.expectEqualStrings("songA.wav", names[1]);
+}
+
+test "sorting a numbered folder is a total order" {
+    // std.mem.sort will happily produce nonsense from a comparator that says
+    // two different names are each less than the other. Check every pair.
+    var buffers: [12][16]u8 = undefined;
+    var names: [12][]u8 = undefined;
+    for (&buffers, 0..) |*buffer, i| {
+        names[i] = std.fmt.bufPrint(buffer, "song{d}.wav", .{i + 1}) catch unreachable;
+    }
+
+    for (names) |a| {
+        for (names) |b| {
+            const a_less = lessByNatural({}, a, b);
+            const b_less = lessByNatural({}, b, a);
+            if (std.mem.eql(u8, a, b)) {
+                try std.testing.expect(!a_less and !b_less);
+            } else {
+                try std.testing.expect(a_less != b_less);
+            }
+        }
+    }
 }
