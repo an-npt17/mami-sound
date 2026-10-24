@@ -6,6 +6,8 @@ const library = @import("library.zig");
 pub const LoadedPool = struct {
     paths: []const []const u8,
     path_capacity: usize = 0,
+    /// How the selector walks `paths`, read off the folder by `loadPool`.
+    order: core.source.Order = .shuffled,
 
     pub const empty: LoadedPool = .{ .paths = &.{} };
 
@@ -73,7 +75,8 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
         .drone => unreachable,
         .voicebox3 => &.{"Voice Box 3"},
         .voicebox5 => &.{"Voice Box 5"},
-        .insect => &.{"Insect"},
+        .insect3 => &.{"Insect Box 3"},
+        .insect5 => &.{"Insect Box 5"},
         .tradvn => &.{"Trad Vn Jam"},
         .tradvn2 => &.{"Trad Vn Jam 2"},
         .bell => &.{"Bell Stems"},
@@ -90,11 +93,13 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
 /// room can tell from the piece working, and a `--plant-b` that quietly did
 /// nothing would be found out at the opening.
 ///
-/// A source played in order is listed by its numbering rather than in whatever
-/// order the disk hands back. The selector walks the pool by index and knows
-/// nothing about filenames, so this is where "part one" is decided -- and a
-/// folder listed by the filesystem would start the piece somewhere in its
-/// middle and play it in a different wrong order on the next machine.
+/// The order is read off the folder: when every clip in it is numbered, it is
+/// played in that numbering and wraps at the end; one clip without a number
+/// and the folder is shuffled. The pool is always listed by its numbering
+/// rather than in whatever order the disk hands back. The selector walks it by
+/// index and knows nothing about filenames, so this is where "part one" is
+/// decided -- and a folder listed by the filesystem would start somewhere in
+/// its middle and play in a different wrong order on the next machine.
 pub fn loadPool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -103,25 +108,44 @@ pub fn loadPool(
     var pool: LoadedPool = .empty;
     errdefer pool.deinit(gpa);
 
-    const sequential = which.defaultOrder() == .sequential;
     for (directoriesFor(which)) |directory| {
-        const paths = if (sequential)
-            try library.listNatural(gpa, io, directory)
-        else
-            try library.list(gpa, io, directory);
+        const paths = try library.listNatural(gpa, io, directory);
         defer library.freeList(gpa, paths);
 
         for (paths) |path| try appendPath(gpa, &pool, path);
     }
 
+    pool.order = orderOf(pool.paths);
     return pool;
+}
+
+/// `sequential` when every path is numbered, `shuffled` otherwise.
+fn orderOf(paths: []const []const u8) core.source.Order {
+    for (paths) |path| {
+        if (!library.isNumbered(path)) return .shuffled;
+    }
+    return .sequential;
+}
+
+test "a folder of numbered clips is played in order" {
+    try std.testing.expectEqual(
+        core.source.Order.sequential,
+        orderOf(&.{ "Bell Stems/Bell_01.mp3", "Bell Stems/Bell_02.mp3" }),
+    );
+}
+
+test "one clip without a number and the folder is shuffled" {
+    try std.testing.expectEqual(
+        core.source.Order.shuffled,
+        orderOf(&.{ "Insect/insect_1.wav", "Insect/night.mp3" }),
+    );
 }
 
 test "every source names the one folder it is made of" {
     // One each. The pool that read two folders as one went when the interviews
     // became two boxes; a plant that wants both is two plants.
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .tradvn2, .bell, .piano,
+        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano,
     };
     for (sources) |which| {
         try std.testing.expectEqual(@as(usize, 1), directoriesFor(which).len);
@@ -130,7 +154,8 @@ test "every source names the one folder it is made of" {
     try std.testing.expectEqualStrings("Voice Box 3", directoriesFor(.voicebox3)[0]);
     try std.testing.expectEqualStrings("Voice Box 5", directoriesFor(.voicebox5)[0]);
     try std.testing.expectEqualStrings("Day bird", directoriesFor(.daybird)[0]);
-    try std.testing.expectEqualStrings("Insect", directoriesFor(.insect)[0]);
+    try std.testing.expectEqualStrings("Insect Box 3", directoriesFor(.insect3)[0]);
+    try std.testing.expectEqualStrings("Insect Box 5", directoriesFor(.insect5)[0]);
     try std.testing.expectEqualStrings("Trad Vn Jam", directoriesFor(.tradvn)[0]);
     try std.testing.expectEqualStrings("Trad Vn Jam 2", directoriesFor(.tradvn2)[0]);
     try std.testing.expectEqualStrings("Bell Stems", directoriesFor(.bell)[0]);
@@ -144,6 +169,7 @@ test "the second jam loads in the order it is numbered" {
     const gpa = std.testing.allocator;
     var pool = try loadPool(gpa, std.testing.io, .tradvn2);
     defer pool.deinit(gpa);
+    try std.testing.expectEqual(core.source.Order.sequential, pool.order);
 
     var previous: ?usize = null;
     for (pool.paths) |path| {
@@ -159,9 +185,12 @@ test "the second jam loads in the order it is numbered" {
     try std.testing.expect(previous != null);
 }
 
-/// The last run of digits in a path, which is the part number for a folder
-/// named the way this one is. `null` when there is none to read.
-fn partNumber(path: []const u8) ?usize {
+/// The last run of digits in a clip's name, which is the part number for a
+/// folder named the way this one is. `null` when there is none to read. The
+/// extension is left out, or the 3 in `.mp3` would be every part's number.
+fn partNumber(full: []const u8) ?usize {
+    const name = std.fs.path.basename(full);
+    const path = name[0 .. name.len - std.fs.path.extension(name).len];
     var end = path.len;
     while (end > 0 and !std.ascii.isDigit(path[end - 1])) end -= 1;
     if (end == 0) return null;
@@ -174,7 +203,7 @@ fn partNumber(path: []const u8) ?usize {
 test "every source loads into a pool with clips in it" {
     const gpa = std.testing.allocator;
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect, .tradvn, .tradvn2, .bell, .piano,
+        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano,
     };
     for (sources) |which| {
         var pool = try loadPool(gpa, std.testing.io, which);
@@ -184,8 +213,10 @@ test "every source loads into a pool with clips in it" {
 }
 
 test "the new folders are named" {
-    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.insect).len);
-    try std.testing.expectEqualStrings("Insect", directoriesFor(.insect)[0]);
+    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.insect3).len);
+    try std.testing.expectEqualStrings("Insect Box 3", directoriesFor(.insect3)[0]);
+    try std.testing.expectEqual(@as(usize, 1), directoriesFor(.insect5).len);
+    try std.testing.expectEqualStrings("Insect Box 5", directoriesFor(.insect5)[0]);
 
     try std.testing.expectEqual(@as(usize, 1), directoriesFor(.tradvn).len);
     try std.testing.expectEqualStrings("Trad Vn Jam", directoriesFor(.tradvn)[0]);
@@ -193,7 +224,7 @@ test "the new folders are named" {
 
 test "the new folders load into non-empty pools" {
     const gpa = std.testing.allocator;
-    for ([_]core.source.Source{ .insect, .tradvn }) |which| {
+    for ([_]core.source.Source{ .insect3, .insect5, .tradvn }) |which| {
         var pool = try loadPool(gpa, std.testing.io, which);
         defer pool.deinit(gpa);
         try std.testing.expect(pool.paths.len > 0);

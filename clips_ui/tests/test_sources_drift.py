@@ -43,8 +43,8 @@ def _pairs_from_directories_for() -> dict[str, str]:
 def test_sources_json_matches_directories_for() -> None:
     pairs = _pairs_from_directories_for()
 
-    assert len(pairs) == 8, (
-        f"expected 8 source/folder pairs in directoriesFor, found {len(pairs)}: {pairs}. "
+    assert len(pairs) == 9, (
+        f"expected 9 source/folder pairs in directoriesFor, found {len(pairs)}: {pairs}. "
         "run zig build dump-sources"
     )
     assert "drone" not in pairs, "drone has no folder and must stay out of sources.json"
