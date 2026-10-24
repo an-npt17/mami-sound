@@ -574,7 +574,7 @@ test "a held plant is given no allowance to run out of" {
     // is the length, and a cap is a second answer to that question which can
     // only contradict it -- there is no rising edge left to ask for the next
     // clip with while the hand is still there.
-    for ([_]source_mod.Source{ .insect, .daybird, .bell, .piano }) |capped| {
+    for ([_]source_mod.Source{ .insect3, .insect5, .daybird, .bell, .piano }) |capped| {
         const triggered: Limit = .forSource(capped, null, .trigger, 44100);
         try std.testing.expect(triggered.total != Limit.unlimited.total);
 
@@ -586,7 +586,7 @@ test "a held plant is given no allowance to run out of" {
 test "a length asked for on the command line is refused a held plant too" {
     // `--plant-a-seconds=3 --plant-a-mode=hold` is two answers to one question.
     // The hold is the one the room gave last and the one it can see.
-    const held: Limit = .forSource(.insect, 3.0, .hold, 44100);
+    const held: Limit = .forSource(.insect3, 3.0, .hold, 44100);
     try std.testing.expectEqual(Limit.unlimited.total, held.total);
 }
 

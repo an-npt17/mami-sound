@@ -21,11 +21,12 @@ pub const Error = error{UnknownSource};
 /// answers wants -- a bird that called the same way every time is a recording,
 /// not a plant.
 ///
-/// `sequential` walks the folder in order and wraps at the end. That is what a
-/// folder holding one piece in parts wants: the parts are in an order, and a
-/// shuffle of them is not the piece. It lives with the source rather than on
-/// the command line because the order is a fact about the folder's contents,
-/// and a room asked to remember a flag for it would forget.
+/// `sequential` walks the folder in its numbering and wraps at the end. That is
+/// what a folder of numbered clips wants: somebody numbered them, and a shuffle
+/// of them is not what they handed over. It is read off the folder by the
+/// loader rather than set on the command line or here, because the order is a
+/// fact about the folder's contents, and a room asked to remember a flag for it
+/// would forget.
 pub const Order = enum { shuffled, sequential };
 
 /// How long a clip is protected from the next hand, for everything but the
@@ -40,8 +41,8 @@ pub const long_form_retrigger_s: f32 = 10.0;
 /// A tuned note plus enough of its tail to hear it as a note.
 pub const stem_play_s: f32 = 4.0;
 
-/// A call, or a few seconds of ambience. The folders behind `daybird` and
-/// `insect` hold recordings of up to forty seconds, which is a field recording
+/// A call, or a few seconds of ambience. The folders behind `daybird` and the
+/// insects hold recordings of up to forty seconds, which is a field recording
 /// rather than a plant answering somebody.
 pub const fragment_play_s: f32 = 5.0;
 
@@ -73,11 +74,12 @@ pub const Source = enum {
     voicebox3,
     voicebox5,
     daybird,
-    insect,
+    /// The insects, one mix per box.
+    insect3,
+    insect5,
     tradvn,
     /// The second jam, which is one piece in numbered parts rather than a pool
-    /// of alternatives. Its own source and not a second folder behind `tradvn`,
-    /// because it is played in order and that one is not.
+    /// of alternatives. Its own source and not a second folder behind `tradvn`.
     tradvn2,
     bell,
     piano,
@@ -96,20 +98,8 @@ pub const Source = enum {
     pub fn defaultSeconds(self: Source) ?f32 {
         return switch (self) {
             .drone, .voicebox3, .voicebox5, .tradvn, .tradvn2 => null,
-            .daybird, .insect => fragment_play_s,
+            .daybird, .insect3, .insect5 => fragment_play_s,
             .bell, .piano => stem_play_s,
-        };
-    }
-
-    /// Which clip of this folder the next touch gets.
-    ///
-    /// Everything here is a pool of answers and is shuffled. The second jam is
-    /// the exception: its folder is one piece in numbered parts, so a touch
-    /// moves it on to the next part rather than somewhere else in it.
-    pub fn defaultOrder(self: Source) Order {
-        return switch (self) {
-            .tradvn2 => .sequential,
-            else => .shuffled,
         };
     }
 
@@ -131,7 +121,8 @@ test "every source name parses to itself" {
     try std.testing.expectEqual(Source.voicebox3, try Source.parse("voicebox3"));
     try std.testing.expectEqual(Source.voicebox5, try Source.parse("voicebox5"));
     try std.testing.expectEqual(Source.daybird, try Source.parse("daybird"));
-    try std.testing.expectEqual(Source.insect, try Source.parse("insect"));
+    try std.testing.expectEqual(Source.insect3, try Source.parse("insect3"));
+    try std.testing.expectEqual(Source.insect5, try Source.parse("insect5"));
     try std.testing.expectEqual(Source.tradvn, try Source.parse("tradvn"));
     try std.testing.expectEqual(Source.tradvn2, try Source.parse("tradvn2"));
     try std.testing.expectEqual(Source.bell, try Source.parse("bell"));
@@ -142,6 +133,8 @@ test "a name no source has is refused" {
     try std.testing.expectError(Error.UnknownSource, Source.parse("cello"));
     // The pool that read two folders as one. Every source is its own folder now.
     try std.testing.expectError(Error.UnknownSource, Source.parse("recordings"));
+    // One insect pool became one per box.
+    try std.testing.expectError(Error.UnknownSource, Source.parse("insect"));
     try std.testing.expectError(Error.UnknownSource, Source.parse(""));
 }
 
@@ -159,23 +152,10 @@ test "a source that plays to its own end has no length" {
     try std.testing.expect(Source.drone.defaultSeconds() == null);
 }
 
-test "only the second jam is played in order" {
-    // Its folder is one piece in parts. Everything else is a pool of answers,
-    // and a room that can predict the next answer has stopped listening to it.
-    try std.testing.expectEqual(Order.sequential, Source.tradvn2.defaultOrder());
-
-    // Everything the enum holds but that one, so a source added later is
-    // shuffled unless somebody says otherwise here.
-    inline for (@typeInfo(Source).@"enum".fields) |field| {
-        const which: Source = @enumFromInt(field.value);
-        if (which == .tradvn2) continue;
-        try std.testing.expectEqual(Order.shuffled, which.defaultOrder());
-    }
-}
-
 test "a source that answers with a fragment carries its length" {
     try std.testing.expectEqual(@as(f32, 5.0), Source.daybird.defaultSeconds().?);
-    try std.testing.expectEqual(@as(f32, 5.0), Source.insect.defaultSeconds().?);
+    try std.testing.expectEqual(@as(f32, 5.0), Source.insect3.defaultSeconds().?);
+    try std.testing.expectEqual(@as(f32, 5.0), Source.insect5.defaultSeconds().?);
     try std.testing.expectEqual(@as(f32, 4.0), Source.bell.defaultSeconds().?);
     try std.testing.expectEqual(@as(f32, 4.0), Source.piano.defaultSeconds().?);
 }

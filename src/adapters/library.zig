@@ -34,6 +34,19 @@ pub fn isAudio(name: []const u8) bool {
     return false;
 }
 
+/// Whether a clip's own name carries a number, which is what puts it in an
+/// order. The folder's name does not count -- `Voice Box 3` numbers the box,
+/// not what is in it -- and neither does the extension, or every `.mp3` would
+/// be numbered.
+pub fn isNumbered(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    const stem = name[0 .. name.len - std.fs.path.extension(name).len];
+    for (stem) |c| {
+        if (std.ascii.isDigit(c)) return true;
+    }
+    return false;
+}
+
 /// Every clip in `dir_path`, in whatever order the directory gives them. Caller
 /// owns the paths and the slice holding them; `freeList` returns both.
 ///
@@ -162,6 +175,15 @@ pub fn freeList(gpa: std.mem.Allocator, paths: [][]u8) void {
 /// without a folder to point it at.
 fn sortedNaturally(names: [][]u8) void {
     std.mem.sort([]u8, names, {}, lessByNatural);
+}
+
+test "a clip is numbered by its own name and nothing around it" {
+    try std.testing.expect(isNumbered("Bell Stems/Bell_01.mp3"));
+    try std.testing.expect(isNumbered("Voice Box 5/VB5_Voice 10.mp3"));
+    try std.testing.expect(isNumbered("Voice Box 3/3.HồngTươi.V.02.46.wav"));
+    // The box's number is the folder's, and the 3 in `.mp3` is the format's.
+    try std.testing.expect(!isNumbered("Voice Box 3/hello.mp3"));
+    try std.testing.expect(!isNumbered("night.mp3"));
 }
 
 test "a numbered folder sorts by its numbers and not its bytes" {

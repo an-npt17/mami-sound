@@ -7,7 +7,7 @@ temp directory in tests):
 ``reload.request`` -- written by this module, deleted by the Zig side once
 read. Names the sources whose clip pools should be reloaded::
 
-    {"id": "20260913T185301Z-a1b2c3", "sources": ["piano", "insect"]}
+    {"id": "20260913T185301Z-a1b2c3", "sources": ["piano", "insect3"]}
 
 ``reload.result`` -- written by the Zig side, read by this module. Reports
 what happened to each requested source::
@@ -109,7 +109,7 @@ def write_request(root: Path, request_id: str, sources: list[str]) -> None:
         root: The installation's working directory (see module docstring).
         request_id: The id this request should be matched by; normally
             from :func:`new_request_id`.
-        sources: Source names (e.g. ``["piano", "insect"]``) whose clip
+        sources: Source names (e.g. ``["piano", "insect3"]``) whose clip
             pools should be reloaded.
     """
     payload = json.dumps({"id": request_id, "sources": sources})

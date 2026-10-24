@@ -292,10 +292,10 @@ test "a long allowance keeps a head rather than the whole clip" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const paths = try library.listSorted(gpa, io, "Insect");
+    const paths = try library.listSorted(gpa, io, "Insect Box 3");
     defer library.freeList(gpa, paths);
 
-    const long: core.clips.Limit = .forSource(.insect, 60.0, .trigger, 44100);
+    const long: core.clips.Limit = .forSource(.insect3, 60.0, .trigger, 44100);
     var heads = try decode(gpa, io, &.{paths[0]}, long, 44100);
     defer heads.deinit(gpa);
 
@@ -309,10 +309,10 @@ test "a short allowance is still taken whole" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const paths = try library.listSorted(gpa, io, "Insect");
+    const paths = try library.listSorted(gpa, io, "Insect Box 3");
     defer library.freeList(gpa, paths);
 
-    const short: core.clips.Limit = .forSource(.insect, null, .trigger, 44100);
+    const short: core.clips.Limit = .forSource(.insect3, null, .trigger, 44100);
     var heads = try decode(gpa, io, &.{paths[0]}, short, 44100);
     defer heads.deinit(gpa);
 

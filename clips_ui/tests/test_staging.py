@@ -84,12 +84,12 @@ def test_an_add_offsets_a_remove(upload: Path) -> None:
 
 
 def test_apply_names_only_the_sources_that_changed(tmp_path: Path, upload: Path) -> None:
-    _seed(tmp_path, "Insect", [])
+    _seed(tmp_path, "Insect Box 3", [])
     s = Staging()
-    s.stage_add("insect", upload, "x.wav")
+    s.stage_add("insect3", upload, "x.wav")
     request_id = s.apply(tmp_path)
     payload = json.loads((tmp_path / "reload.request").read_text())
-    assert payload["sources"] == ["insect"]
+    assert payload["sources"] == ["insect3"]
     assert payload["id"] == request_id
 
 
@@ -102,20 +102,20 @@ def test_would_empty_is_false_when_other_live_clips_remain() -> None:
 def test_apply_raises_before_touching_any_file_across_any_touched_source(
     tmp_path: Path, upload: Path
 ) -> None:
-    # "piano" would end up empty; "insect" is a perfectly fine, unrelated
+    # "piano" would end up empty; "insect3" is a perfectly fine, unrelated
     # change. The empty-pool check on "piano" must stop apply before it
     # mutates *either* source -- not just before it mutates "piano".
     _seed(tmp_path, "EPiano Stems", ["only.mp3"])
-    _seed(tmp_path, "Insect", ["a.wav"])
+    _seed(tmp_path, "Insect Box 3", ["a.wav"])
     s = Staging()
     s.stage_remove("piano", "only.mp3")
-    s.stage_add("insect", upload, "new.wav")
+    s.stage_add("insect3", upload, "new.wav")
 
     with pytest.raises(WouldEmptyPool):
         s.apply(tmp_path)
 
     assert (tmp_path / "EPiano Stems" / "only.mp3").exists()
-    assert not (tmp_path / "Insect" / "new.wav").exists()
+    assert not (tmp_path / "Insect Box 3" / "new.wav").exists()
     assert upload.exists()  # never moved
     assert not (tmp_path / "reload.request").exists()
 
@@ -141,18 +141,18 @@ def test_pending_for_reports_staged_adds_and_removes(upload: Path) -> None:
 def test_pending_for_an_untouched_source_is_empty() -> None:
     s = Staging()
     s.stage_add("piano", Path("/tmp/whatever.mp3"), "new.mp3")
-    pending = s.pending_for("insect")
-    assert pending == Pending(adds={"insect": []}, removes={"insect": []})
+    pending = s.pending_for("insect3")
+    assert pending == Pending(adds={"insect3": []}, removes={"insect3": []})
 
 
 def test_apply_clears_staged_state_so_a_second_apply_has_nothing_to_do(
     tmp_path: Path, upload: Path
 ) -> None:
-    _seed(tmp_path, "Insect", [])
+    _seed(tmp_path, "Insect Box 3", [])
     s = Staging()
-    s.stage_add("insect", upload, "x.wav")
+    s.stage_add("insect3", upload, "x.wav")
     s.apply(tmp_path)
-    assert s.pending_for("insect") == Pending(adds={"insect": []}, removes={"insect": []})
+    assert s.pending_for("insect3") == Pending(adds={"insect3": []}, removes={"insect3": []})
 
     second_id = s.apply(tmp_path)
     payload = json.loads((tmp_path / "reload.request").read_text())
@@ -208,13 +208,13 @@ def test_an_unsafe_staged_filename_is_caught_before_any_file_moves(
 
 
 def test_double_staging_the_same_removal_does_not_duplicate_it(tmp_path: Path) -> None:
-    _seed(tmp_path, "Insect", ["a.wav", "b.wav"])
+    _seed(tmp_path, "Insect Box 3", ["a.wav", "b.wav"])
     s = Staging()
-    s.stage_remove("insect", "a.wav")
-    s.stage_remove("insect", "a.wav")
+    s.stage_remove("insect3", "a.wav")
+    s.stage_remove("insect3", "a.wav")
 
-    assert s.pending_for("insect").removes["insect"] == ["a.wav"]
+    assert s.pending_for("insect3").removes["insect3"] == ["a.wav"]
 
     s.apply(tmp_path)  # a second unlink() of a.wav would raise otherwise
-    assert not (tmp_path / "Insect" / "a.wav").exists()
-    assert (tmp_path / "Insect" / "b.wav").exists()
+    assert not (tmp_path / "Insect Box 3" / "a.wav").exists()
+    assert (tmp_path / "Insect Box 3" / "b.wav").exists()

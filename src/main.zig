@@ -241,7 +241,7 @@ fn runComposition(
         if (mode == .hold) {
             std.debug.print("loading: plant {s} sounds while it is held\n", .{name});
         }
-        const order = chosen.defaultOrder();
+        const order = pools[plant].order;
         if (order == .sequential) {
             std.debug.print(
                 "loading: plant {s} plays its folder in order, part by part\n",

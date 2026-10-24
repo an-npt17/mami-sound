@@ -87,7 +87,7 @@ def test_new_request_id_sorts_chronologically(monkeypatch):
 
 def test_write_request_uses_no_leftover_tmp_file_on_repeated_writes(tmp_path):
     write_request(tmp_path, "id-1", ["piano"])
-    write_request(tmp_path, "id-2", ["piano", "insect"])
+    write_request(tmp_path, "id-2", ["piano", "insect3"])
     assert not list(tmp_path.glob("*.tmp"))
     assert json.loads((tmp_path / "reload.request").read_text())["id"] == "id-2"
 

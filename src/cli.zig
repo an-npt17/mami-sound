@@ -365,7 +365,8 @@ pub const usage =
     \\  voicebox3   ./Voice Box 3/
     \\  voicebox5   ./Voice Box 5/
     \\  daybird     ./Day bird/
-    \\  insect      ./Insect/
+    \\  insect3     ./Insect Box 3/
+    \\  insect5     ./Insect Box 5/
     \\  tradvn      ./Trad Vn Jam/
     \\  tradvn2     ./Trad Vn Jam 2/
     \\  bell        ./Bell Stems/
@@ -374,18 +375,17 @@ pub const usage =
     \\means --plant-a=daybird. Every source is one folder: a plant that wants
     \\two of them is two plants.
     \\
-    \\Every source but one is shuffled: a touch answers with a clip the folder
-    \\has not played this pass round, so a room cannot predict the next one.
-    \\tradvn2 is the exception. Its folder holds one piece in numbered parts,
-    \\so it is played in order -- song1, then song2, on to the last part and
-    \\round to the first again -- and the numbering is read as numbers, so
-    \\song10 follows song9 rather than song1. There is no flag for this: the
-    \\order is a fact about what is in the folder.
+    \\A folder whose clips are all numbered is played in order -- part 1, then
+    \\part 2, on to the last and round to the first again -- and the numbering
+    \\is read as numbers, so _10 follows _9 rather than _1. A folder with any
+    \\clip that has no number in its name is shuffled instead: a touch answers
+    \\with a clip the folder has not played this pass round. There is no flag
+    \\for this: the order is a fact about what is in the folder.
     \\
     \\--plant-a-seconds and --plant-b-seconds are how long one touch plays.
     \\Zero plays the clip to its own end, which is how a source that is normally
     \\cut is uncapped, or one that normally runs long is cut. Left off, the
-    \\source's own length stands: 4s for the stems, 5s for daybird and insect,
+    \\source's own length stands: 4s for the stems, 5s for daybird and insects,
     \\and to the end for the voice boxes and both jams.
     \\
     \\--plant-a-mode and --plant-b-mode are how a plant answers a hand:
@@ -528,8 +528,8 @@ pub const usage =
 ;
 
 test "each plant chooses its own source" {
-    const opts = try parse(&.{ "--plant-a=insect", "--plant-b=tradvn" });
-    try std.testing.expectEqual(source.Source.insect, opts.plant_sources[0].?);
+    const opts = try parse(&.{ "--plant-a=insect3", "--plant-b=tradvn" });
+    try std.testing.expectEqual(source.Source.insect3, opts.plant_sources[0].?);
     try std.testing.expectEqual(source.Source.tradvn, opts.plant_sources[1].?);
 }
 
@@ -568,7 +568,7 @@ test "a source no folder answers to is refused" {
 
 test "both lengths can be set per plant" {
     const opts = try parse(&.{
-        "--plant-a=insect",
+        "--plant-a=insect3",
         "--plant-a-seconds=8",
         "--plant-b-retrigger=20",
     });
@@ -636,7 +636,7 @@ test "the still thresholds take counts, and refuse what is not one" {
 }
 
 test "a plant can be told to hold rather than trigger" {
-    const opts = try parse(&.{ "--plant-a=insect", "--plant-a-mode=hold" });
+    const opts = try parse(&.{ "--plant-a=insect3", "--plant-a-mode=hold" });
     try std.testing.expectEqual(clips.Mode.hold, opts.plant_mode[0].?);
     try std.testing.expect(opts.plant_mode[1] == null);
 

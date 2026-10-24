@@ -387,16 +387,16 @@ test "a bird call plays five seconds and then stops" {
 }
 
 test "a capped source sounds for the length it was given" {
-    // insect is cut at five seconds. The folder holds recordings of up to
+    // insect3 is cut at five seconds. The folder holds recordings of up to
     // forty, so this is entirely down to the cap holding.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const paths = try library.listSorted(gpa, io, "Insect");
+    const paths = try library.listSorted(gpa, io, "Insect Box 3");
     defer library.freeList(gpa, paths);
     try std.testing.expect(paths.len > 0);
 
-    const limit: core.clips.Limit = .forSource(.insect, null, .trigger, 44100);
+    const limit: core.clips.Limit = .forSource(.insect3, null, .trigger, 44100);
     var adapter = try clip_stream.Adapter.init(io, gpa, &.{paths[0]}, limit);
     defer adapter.deinit();
     try adapter.primeHeads();
@@ -464,12 +464,12 @@ test "seconds=0 plays to the end, and a later touch replaces it mid-clip" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const paths = try library.listSorted(gpa, io, "Insect");
+    const paths = try library.listSorted(gpa, io, "Insect Box 3");
     defer library.freeList(gpa, paths);
     try std.testing.expect(paths.len >= 2);
 
-    // insect is normally cut at five seconds; zero is how the room uncaps it.
-    const limit: core.clips.Limit = .forSource(.insect, 0.0, .trigger, 44100);
+    // insect3 is normally cut at five seconds; zero is how the room uncaps it.
+    const limit: core.clips.Limit = .forSource(.insect3, 0.0, .trigger, 44100);
     try std.testing.expectEqual(core.clips.Limit.unlimited.total, limit.total);
 
     var adapter = try clip_stream.Adapter.init(io, gpa, paths, limit);
