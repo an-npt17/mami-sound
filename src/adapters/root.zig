@@ -5,6 +5,7 @@ pub const clip_heads = @import("clip_heads.zig");
 pub const clip_loader = @import("clip_loader.zig");
 pub const clip_ring = @import("clip_ring.zig");
 pub const clip_stream = @import("clip_stream.zig");
+pub const file_probe = @import("file_probe.zig");
 pub const interrupt = @import("interrupt.zig");
 pub const library = @import("library.zig");
 pub const probe_capture = @import("probe_capture.zig");
@@ -19,6 +20,7 @@ test {
     _ = clip_loader;
     _ = clip_ring;
     _ = clip_stream;
+    _ = file_probe;
     _ = interrupt;
     _ = library;
     _ = probe_capture;

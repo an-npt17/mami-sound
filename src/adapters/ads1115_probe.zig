@@ -2,8 +2,8 @@ const std = @import("std");
 const ads1115 = @import("ads1115.zig");
 const ports = @import("../ports/root.zig");
 
-pub const input_a: ads1115.Mux = .ain0_ain1;
-pub const input_bc: ads1115.Mux = .ain2_ain3;
+pub const input_a: ads1115.Mux = .ain0_gnd;
+pub const input_bc: ads1115.Mux = .ain1_gnd;
 pub const switch_frames: u64 = 512;
 
 const Probe = enum {
