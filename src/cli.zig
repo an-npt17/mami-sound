@@ -2,6 +2,7 @@ const std = @import("std");
 const clips = @import("core/clips.zig");
 const source = @import("core/source.zig");
 const touch = @import("core/touch.zig");
+const timbre = @import("core/timbre.zig");
 const select = @import("core/select.zig");
 const boxes = @import("application/boxes/root.zig");
 
@@ -17,8 +18,14 @@ pub const Error = error{
     InvalidStillThreshold,
     InvalidTouchFloor,
     InvalidTouchRise,
+    InvalidTouchWobble,
+    InvalidTouchClimb,
+    InvalidTimbre,
+    InvalidTouchFall,
+    InvalidDroneIdle,
     InvalidBandShare,
     InvalidCapture,
+    InvalidProbeFile,
     InvalidBox,
     TooManyArguments,
 } || select.Error;
@@ -91,6 +98,17 @@ pub const Options = struct {
     /// which is the only thing that works on the `learned` rig, where the
     /// reading offers two pitches and no more.
     touch_rise_s: ?f32 = null,
+    /// Semitones the climb bends for each tenth of the probe's share, under
+    /// `learned`. Zero is a straight climb.
+    touch_wobble: ?f32 = null,
+    /// Semitones a held climb rises from its floor, under a ramp.
+    touch_climb: ?f32 = null,
+    /// What the drone is made of, or unset for the model's own choice.
+    timbre: ?timbre.Kind = null,
+    /// How long a released climb takes to fall home, and how loud the drone
+    /// idles, 0 to 1 against held.
+    touch_fall: ?f32 = null,
+    drone_idle: ?f32 = null,
     /// How big a move a touch must be, in the counts the probe reads, per
     /// probe. Unset keeps the measured preset; zero asks for no floor at all.
     ///
@@ -111,6 +129,9 @@ pub const Options = struct {
     capture_buf: [path_max]u8 = undefined,
     capture_len: usize = 0,
     capture_s: f32 = default_capture_s,
+    /// A capture to play back in place of the ADS1115, or unset for the rig.
+    probe_file_buf: [path_max]u8 = undefined,
+    probe_file_len: usize = 0,
     /// Which box's measured numbers to run, where the room said so. `null` is
     /// the room not having said, and the hostname is asked instead.
     ///
@@ -123,6 +144,12 @@ pub const Options = struct {
     pub fn capture(self: *const Options) ?[]const u8 {
         if (self.capture_len == 0) return null;
         return self.capture_buf[0..self.capture_len];
+    }
+
+    /// The capture standing in for the probe, or null on the rig.
+    pub fn probeFile(self: *const Options) ?[]const u8 {
+        if (self.probe_file_len == 0) return null;
+        return self.probe_file_buf[0..self.probe_file_len];
     }
 
     pub fn device(self: *const Options) []const u8 {
@@ -227,6 +254,29 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidTouchRise;
             if (seconds <= 0.0) return Error.InvalidTouchRise;
             opts.touch_rise_s = seconds;
+        } else if (std.mem.startsWith(u8, arg, "--touch-fall=")) {
+            const seconds = parseSeconds(arg["--touch-fall=".len..]) orelse
+                return Error.InvalidTouchFall;
+            if (seconds <= 0.0) return Error.InvalidTouchFall;
+            opts.touch_fall = seconds;
+        } else if (std.mem.startsWith(u8, arg, "--drone-idle=")) {
+            const gain = std.fmt.parseFloat(f32, arg["--drone-idle=".len..]) catch
+                return Error.InvalidDroneIdle;
+            if (!(gain >= 0.0) or gain > 1.0) return Error.InvalidDroneIdle;
+            opts.drone_idle = gain;
+        } else if (std.mem.startsWith(u8, arg, "--drone-timbre=")) {
+            opts.timbre = std.meta.stringToEnum(timbre.Kind, arg["--drone-timbre=".len..]) orelse
+                return Error.InvalidTimbre;
+        } else if (std.mem.startsWith(u8, arg, "--touch-climb=")) {
+            const semis = std.fmt.parseFloat(f32, arg["--touch-climb=".len..]) catch
+                return Error.InvalidTouchClimb;
+            if (!(semis >= 0.0) or semis > 48.0) return Error.InvalidTouchClimb;
+            opts.touch_climb = semis;
+        } else if (std.mem.startsWith(u8, arg, "--touch-wobble=")) {
+            const semis = std.fmt.parseFloat(f32, arg["--touch-wobble=".len..]) catch
+                return Error.InvalidTouchWobble;
+            if (!(semis >= 0.0) or semis > 12.0) return Error.InvalidTouchWobble;
+            opts.touch_wobble = semis;
         } else if (std.mem.eql(u8, arg, "--plant-a")) {
             // The shorthand the flag had when it was a switch, kept so a unit
             // file already passing it keeps starting.
@@ -235,6 +285,11 @@ pub fn parse(args: []const []const u8) Error!Options {
             opts.box = parseBox(arg["--box=".len..]) orelse return Error.InvalidBox;
         } else if (std.mem.eql(u8, arg, "--test-random-probe")) {
             opts.test_random_probe = true;
+        } else if (std.mem.startsWith(u8, arg, "--test-probe-file=")) {
+            const path = arg["--test-probe-file=".len..];
+            if (path.len == 0 or path.len > path_max) return Error.InvalidProbeFile;
+            @memcpy(opts.probe_file_buf[0..path.len], path);
+            opts.probe_file_len = path.len;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return Error.UnknownFlag;
         } else {
@@ -339,9 +394,11 @@ pub const usage =
     \\                  [--band-release=FRACTION]
     \\                  [--counts=N] [--counts-b=N]
     \\                  [--touch-floor=FRACTION] [--touch-rise=SECONDS]
+    \\                  [--touch-climb=SEMITONES] [--touch-wobble=SEMITONES]
+    \\                  [--touch-fall=SECONDS] [--drone-timbre=TIMBRE] [--drone-idle=FRACTION]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--box=N]
-    \\                  [--test-random-probe]
+    \\                  [--test-random-probe] [--test-probe-file=CSV]
     \\
     \\PLANTS may be omitted, or must be exactly one of:
     \\  1  plant A only
@@ -432,6 +489,25 @@ pub const usage =
     \\of it, and --touch-rise is how long a held touch takes to climb from there
     \\to the top. A rise turns the drone's pitch into the length of the hold
     \\rather than the size of the reading.
+    \\
+    \\--touch-fall is how long a released climb takes to slide home, the level
+    \\fading to idle with it; the learned model uses 3. --drone-idle is how loud
+    \\the drone sits with nobody touching, 0 to 1 against held; the learned
+    \\model uses 0.12, the others 0.35.
+    \\
+    \\--drone-timbre is what the drone is made of: `band`, the narrow noise band
+    \\it always was; `wide`, the same noise a third as sharp, heard as texture
+    \\rather than grain; or `warm`, a tone with breath above it. The learned
+    \\model uses `wide` unless told; the others `band`.
+    \\
+    \\--touch-climb is how many semitones the climb rises above where it
+    \\started, never past the top of the range. Unset, it climbs all the way
+    \\to the top; 0 holds the touch at its floor.
+    \\
+    \\--touch-wobble is how many semitones that climb bends for each tenth of
+    \\the probe's share, the count the learned model latches on, so a hold
+    \\rises with the plant's own small wander in it rather than as a clean
+    \\line. The learned model uses 1 unless told; 0 is a straight climb.
     \\
     \\The learned model takes both without being asked, because it cannot hand a
     \\pitch to the reading: its deviation is the gap between the window's middle
@@ -524,6 +600,13 @@ pub const usage =
     \\Recording stops if the room runs out; the piece carries on either way.
     \\
     \\--test-random-probe skips I2C and simulates repeatable plant touch phases.
+    \\
+    \\--test-probe-file skips I2C and plays a capture back as the probes, one
+    \\row a poll and looping at the end, through the real detector and voices.
+    \\Any CSV with `raw_a` and `raw_bc` columns will do, which is what --capture
+    \\writes. The bench that sounds like the room:
+    \\
+    \\    mami_sound --test-probe-file=probes-box2.csv --touch-model=learned
     \\
 ;
 
@@ -695,6 +778,42 @@ test "a rise of no time at all is refused" {
     try std.testing.expectError(Error.InvalidTouchRise, parse(&.{"--touch-rise=-2"}));
 }
 
+test "a probe file is a path, and an empty one is refused" {
+    const opts = try parse(&.{"--test-probe-file=probes-box2.csv"});
+    try std.testing.expectEqualStrings("probes-box2.csv", opts.probeFile().?);
+    try std.testing.expect((try parse(&.{})).probeFile() == null);
+    try std.testing.expectError(Error.InvalidProbeFile, parse(&.{"--test-probe-file="}));
+}
+
+test "a fall is a length and an idle a fraction" {
+    const opts = try parse(&.{ "--touch-fall=5", "--drone-idle=0.1" });
+    try std.testing.expectEqual(@as(f32, 5.0), opts.touch_fall.?);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), opts.drone_idle.?, 0.0001);
+    try std.testing.expectError(Error.InvalidTouchFall, parse(&.{"--touch-fall=0"}));
+    try std.testing.expectError(Error.InvalidDroneIdle, parse(&.{"--drone-idle=2"}));
+}
+
+test "a drone timbre is named" {
+    try std.testing.expectEqual(timbre.Kind.wide, (try parse(&.{"--drone-timbre=wide"})).timbre.?);
+    try std.testing.expect((try parse(&.{})).timbre == null);
+    try std.testing.expectError(Error.InvalidTimbre, parse(&.{"--drone-timbre=loud"}));
+}
+
+test "a touch climb is a number of semitones" {
+    try std.testing.expectEqual(@as(f32, 5.0), (try parse(&.{"--touch-climb=5"})).touch_climb.?);
+    try std.testing.expect((try parse(&.{})).touch_climb == null);
+    try std.testing.expectError(Error.InvalidTouchClimb, parse(&.{"--touch-climb=-1"}));
+    try std.testing.expectError(Error.InvalidTouchClimb, parse(&.{"--touch-climb=high"}));
+}
+
+test "a touch wobble is a number of semitones, zero included" {
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), (try parse(&.{"--touch-wobble=1.5"})).touch_wobble.?, 0.0001);
+    try std.testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--touch-wobble=0"})).touch_wobble.?);
+    try std.testing.expect((try parse(&.{})).touch_wobble == null);
+    try std.testing.expectError(Error.InvalidTouchWobble, parse(&.{"--touch-wobble=-1"}));
+    try std.testing.expectError(Error.InvalidTouchWobble, parse(&.{"--touch-wobble=loud"}));
+}
+
 test "a window of no time at all is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=0"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
@@ -722,7 +841,13 @@ test "the usage banner names every flag the parser takes" {
         "--counts-b=",
         "--touch-floor=",
         "--touch-rise=",
+        "--touch-climb=",
+        "--drone-timbre=",
+        "--touch-fall=",
+        "--drone-idle=",
+        "--touch-wobble=",
         "--test-random-probe",
+        "--test-probe-file=",
     };
     const banner_end = std.mem.indexOf(u8, usage, "\nPLANTS").?;
     const banner = usage[0..banner_end];

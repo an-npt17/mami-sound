@@ -890,6 +890,21 @@ pub const Detector = struct {
         };
     }
 
+    /// How much of the window the probe spent past a line, 0 to 1, or null
+    /// where there is no such count to give.
+    ///
+    /// The one thing about a held probe on the `learned` rig that varies by
+    /// degree. The reading only visits two levels, but how often it visits the
+    /// far one wanders through a hold -- about 0.55 to 0.8 on the box captures
+    /// -- and that wander is the plant's own, which is what the drone's wobble
+    /// is read off. Null on the other models, and before a touch has shown the
+    /// rig where its second level is.
+    pub fn share(self: *const Detector) ?f32 {
+        if (self.model != .learned) return null;
+        if (self.spread.edge_lo == null and self.spread.edge_hi == null) return null;
+        return @max(self.spread.above, self.spread.below);
+    }
+
     /// Where the probe sits between the two ends it has been to, 0 to 1, or
     /// null before it has been anywhere worth mapping between.
     ///

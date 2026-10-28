@@ -54,7 +54,10 @@ pub const Voice = union(enum) {
         touched: bool,
     ) void {
         switch (self.*) {
-            .drone => |*voice| voice.render(piece, probe.deviation(), probe.pitch(), touched),
+            .drone => |*voice| {
+                voice.share = probe.share();
+                voice.render(piece, probe.deviation(), probe.pitch(), touched);
+            },
             .clips => |*clips| renderClips(clips, piece, touched),
         }
     }

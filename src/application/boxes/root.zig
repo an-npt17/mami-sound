@@ -93,7 +93,8 @@ test "a box's drone span covers the move its probe actually makes" {
                 span,
                 chosen.drone.touch_floor,
             );
-            try std.testing.expect(just_over > 3.0 * core.noise.freq_min);
+            // An octave clear of idle, in a range of three.
+            try std.testing.expect(just_over > 2.0 * core.noise.freq_min);
         };
     }
 }

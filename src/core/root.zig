@@ -10,6 +10,7 @@ pub const spread = @import("spread.zig");
 pub const source = @import("source.zig");
 pub const touch = @import("touch.zig");
 pub const noise = @import("noise.zig");
+pub const timbre = @import("timbre.zig");
 pub const pcm = @import("pcm.zig");
 
 test {
@@ -21,5 +22,6 @@ test {
     _ = source;
     _ = touch;
     _ = noise;
+    _ = timbre;
     _ = pcm;
 }

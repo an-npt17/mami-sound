@@ -104,6 +104,18 @@ pub const Overrides = struct {
     /// climb to the top from there. Unset leaves the box's own numbers.
     touch_floor: ?f32 = null,
     touch_rise_s: ?f32 = null,
+    /// Semitones the climb bends per tenth of the probe's share. Zero is a
+    /// straight climb; unset leaves the model's own choice.
+    wobble_semis: ?f32 = null,
+    /// What the drone is made of. Unset leaves the model's own choice.
+    timbre: ?core.timbre.Kind = null,
+    /// How long a released climb takes to fall home, and how loud the drone
+    /// idles. Unset leaves the model's own choice.
+    touch_fall_s: ?f32 = null,
+    idle_gain: ?f32 = null,
+    /// Semitones a held climb rises from its floor. Unset leaves the model's
+    /// own choice; there is no way to ask for "all the way up" but a big one.
+    touch_climb_semis: ?f32 = null,
 };
 
 /// How long a tap may last and still be a tap, for whichever plant asks to be
@@ -213,11 +225,40 @@ pub fn droneWith(
         // Starting a ramp at the bottom of the range spends its first second
         // inaudible, which on a four-second climb is a quarter of the gesture.
         if (shape.touch_floor == 0.0) shape.touch_floor = core.noise.default_touch_floor_ramped;
+        // The share is the one thing this rig's probe gives by degree, and
+        // only this model counts it, so only this model bends on it.
+        shape.wobble_semis = core.noise.default_wobble_semis;
+        // The narrow band the room has always known: the wide one was too much
+        // hiss. The gate is slow enough that a touch swells in rather than
+        // switching on. The climb goes all the way to the top.
+        shape.gate_ms = ramped_gate_ms;
+        // Down as it went up: a slide home over seconds, the level fading with
+        // it, rather than the glide dropping it off a cliff.
+        shape.touch_fall_s = core.noise.default_touch_fall_s;
     }
+    if (overrides.touch_climb_semis) |semis| shape.touch_climb_semis = semis;
+    if (overrides.timbre) |kind| shape.timbre = kind;
+    if (overrides.touch_fall_s) |seconds| shape.touch_fall_s = seconds;
+    if (overrides.idle_gain) |gain| shape.idle_gain = gain;
+    if (overrides.wobble_semis) |semis| shape.wobble_semis = semis;
     if (overrides.touch_floor) |fraction| shape.touch_floor = fraction;
     if (overrides.touch_rise_s) |seconds| shape.touch_rise_s = seconds;
+    // A ramped touch skips the burst and reaches its floor through the glide
+    // alone, so the preset's four-second glide stacked on the four-second rise:
+    // a second after a touch was called the drone had covered a fifth of the
+    // way to its floor. The ramp is already the smooth part, so the glide only
+    // has to take the edge off the jump to the floor.
+    if (shape.touch_rise_s != null) shape.glide_s = @min(shape.glide_s, ramped_glide_s);
     return shape;
 }
+
+/// The glide under a ramp. Short enough that a touch is heard leaving the
+/// bottom as soon as it is called, long enough that the jump to the floor is a
+/// swell into the climb rather than a step: at 0.15 s the room heard the jump.
+pub const ramped_glide_s: f32 = 0.4;
+
+/// The gate under the learned drone, from the bench's pick.
+pub const ramped_gate_ms: f32 = 400.0;
 
 const std = @import("std");
 
@@ -227,6 +268,57 @@ test "the learned model is given a pitch it can actually carry" {
     const ramped = droneWith(drone, .{}, .learned);
     try std.testing.expect(ramped.touch_rise_s != null);
     try std.testing.expect(ramped.touch_floor > 0.0);
+}
+
+test "the learned drone falls home slowly and idles as the band always has" {
+    const ramped = droneWith(drone, .{}, .learned);
+    try std.testing.expectEqual(core.noise.default_touch_fall_s, ramped.touch_fall_s.?);
+    try std.testing.expectEqual(core.noise.default_idle_gain, ramped.idle_gain);
+    const asked = droneWith(drone, .{ .touch_fall_s = 6.0, .idle_gain = 0.2 }, .learned);
+    try std.testing.expectEqual(@as(f32, 6.0), asked.touch_fall_s.?);
+    try std.testing.expectEqual(@as(f32, 0.2), asked.idle_gain);
+    // The models tuned on the old release keep it.
+    const plain = droneWith(drone, .{}, .deviation);
+    try std.testing.expect(plain.touch_fall_s == null);
+    try std.testing.expectEqual(core.noise.default_idle_gain, plain.idle_gain);
+}
+
+test "the learned drone climbs to the top, in the narrow band the room knows" {
+    const ramped = droneWith(drone, .{}, .learned);
+    try std.testing.expect(ramped.touch_climb_semis == null);
+    try std.testing.expectEqual(core.timbre.Kind.band, ramped.timbre);
+    // The room can ask for any voice on any model.
+    try std.testing.expectEqual(core.timbre.Kind.warm, droneWith(drone, .{ .timbre = .warm }, .learned).timbre);
+    try std.testing.expectEqual(core.timbre.Kind.wide, droneWith(drone, .{ .timbre = .wide }, .deviation).timbre);
+    try std.testing.expectEqual(ramped_gate_ms, ramped.gate_ms);
+    // The models that read their pitch off the probe keep the voice they
+    // were tuned in.
+    try std.testing.expectEqual(core.timbre.Kind.band, droneWith(drone, .{}, .deviation).timbre);
+    try std.testing.expectEqual(@as(f32, 12.0), droneWith(drone, .{ .touch_climb_semis = 12.0 }, .learned).touch_climb_semis.?);
+    // The models that read their pitch off the probe are not ramps at all.
+    try std.testing.expect(droneWith(drone, .{}, .deviation).touch_climb_semis == null);
+}
+
+test "the learned drone bends with the plant, and the others stay straight" {
+    try std.testing.expect(droneWith(drone, .{}, .learned).wobble_semis > 0.0);
+    for ([_]core.touch.Model{ .deviation, .steady }) |model| {
+        try std.testing.expectEqual(@as(f32, 0.0), droneWith(drone, .{}, model).wobble_semis);
+    }
+    // The room can still ask for a straight climb, or a wider bend.
+    try std.testing.expectEqual(@as(f32, 0.0), droneWith(drone, .{ .wobble_semis = 0.0 }, .learned).wobble_semis);
+    try std.testing.expectEqual(@as(f32, 2.5), droneWith(drone, .{ .wobble_semis = 2.5 }, .learned).wobble_semis);
+}
+
+test "a ramped drone does not stack the slow glide on the rise" {
+    const ramped = droneWith(drone, .{}, .learned);
+    try std.testing.expect(ramped.glide_s <= ramped_glide_s);
+
+    // Asking for the ramp on another model gets the short glide too.
+    const asked = droneWith(drone, .{ .touch_rise_s = 2.0 }, .deviation);
+    try std.testing.expect(asked.glide_s <= ramped_glide_s);
+
+    // Without a ramp the glide is the piece and stays as tuned.
+    try std.testing.expectEqual(drone.glide_s, droneWith(drone, .{}, .steady).glide_s);
 }
 
 test "the models that can carry a pitch keep the mapping they were tuned on" {
@@ -372,9 +464,10 @@ test "the span is the move the probe actually makes" {
     try std.testing.expect(drone.span.? >= 20000);
 
     // And the quiet end has to be audible, or a light touch is a latch nobody
-    // can hear.
+    // can hear: an octave clear of the idle pitch. The range is three octaves
+    // now, so the old bar of three times idle was most of it.
     const just_over = core.noise.freqFromDeviation(default_counts, drone.span.?, drone.touch_floor);
-    try std.testing.expect(just_over > 3.0 * core.noise.freq_min);
+    try std.testing.expect(just_over > 2.0 * core.noise.freq_min);
     try std.testing.expect(just_over < 0.5 * core.noise.freq_max);
 }
 

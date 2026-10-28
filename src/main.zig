@@ -14,6 +14,7 @@ const interrupt = @import("adapters/interrupt.zig");
 const clip_stream = @import("adapters/clip_stream.zig");
 const voice_mod = @import("application/voice.zig");
 const random_probe = @import("adapters/random_probe.zig");
+const file_probe = @import("adapters/file_probe.zig");
 const probe_capture = @import("adapters/probe_capture.zig");
 const stderr_status = @import("adapters/stderr_status.zig");
 
@@ -24,8 +25,24 @@ const ProductionProbeOpener = struct {
 };
 
 const TestProbeOpener = struct {
-    fn open(_: *TestProbeOpener, _: std.Io) !random_probe.Adapter {
-        return random_probe.Adapter.init();
+    style: random_probe.Style,
+
+    fn open(self: *TestProbeOpener, _: std.Io) !random_probe.Adapter {
+        return random_probe.Adapter.initStyle(self.style);
+    }
+};
+
+const FileProbeOpener = struct {
+    gpa: std.mem.Allocator,
+    path: []const u8,
+
+    fn open(self: *FileProbeOpener, io: std.Io) !file_probe.Adapter {
+        const probe = try file_probe.Adapter.load(io, self.gpa, self.path);
+        std.debug.print(
+            "loading: playing {s} as the probes, {d:.0} s a pass\n",
+            .{ self.path, probe.seconds() },
+        );
+        return probe;
     }
 };
 
@@ -87,6 +104,16 @@ pub fn main(init: std.process.Init) !void {
                 "the drone already sounds while it is held; it takes no mode.\n\n",
                 .{},
             ),
+            error.InvalidTouchFall => std.debug.print("--touch-fall takes a number of seconds above zero.\n\n", .{}),
+            error.InvalidDroneIdle => std.debug.print("--drone-idle takes a fraction from zero to one.\n\n", .{}),
+            error.InvalidTimbre => std.debug.print(
+                "--drone-timbre takes a timbre: {s}.\n\n",
+                .{core.timbre.names},
+            ),
+            error.InvalidProbeFile => std.debug.print(
+                "--test-probe-file takes the path of a capture CSV.\n\n",
+                .{},
+            ),
             error.UnknownFlag => std.debug.print("unknown flag.\n\n", .{}),
             else => std.debug.print("could not read arguments: {s}\n\n", .{@errorName(err)}),
         }
@@ -95,9 +122,20 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var sink_opener = ProductionSinkOpener{};
+    if (opts.probeFile()) |path| {
+        var probe_opener = FileProbeOpener{ .gpa = gpa, .path = path };
+        return runComposition(io, gpa, opts, &probe_opener, &sink_opener) catch |err| {
+            std.debug.print("mami_sound stopped: {s}\n", .{@errorName(err)});
+            return err;
+        };
+    }
     if (opts.test_random_probe) {
-        std.debug.print("loading: using test random probe\n", .{});
-        var probe_opener = TestProbeOpener{};
+        // The learned model was written for the installed rig, whose probe
+        // flips between rails under a hand; a probe held still at one level
+        // gives it a share that never moves and the drone nothing to bend on.
+        const style: random_probe.Style = if (opts.model == .learned) .rig else .steady;
+        std.debug.print("loading: using test random probe ({s} touches)\n", .{@tagName(style)});
+        var probe_opener = TestProbeOpener{ .style = style };
         return runComposition(io, gpa, opts, &probe_opener, &sink_opener) catch |err| {
             std.debug.print("mami_sound stopped: {s}\n", .{@errorName(err)});
             return err;
@@ -159,6 +197,11 @@ fn runComposition(
     const drone_shape = production_config.droneWith(preset.drone, .{
         .touch_floor = opts.touch_floor,
         .touch_rise_s = opts.touch_rise_s,
+        .wobble_semis = opts.touch_wobble,
+        .touch_climb_semis = opts.touch_climb,
+        .timbre = opts.timbre,
+        .touch_fall_s = opts.touch_fall,
+        .idle_gain = opts.drone_idle,
     }, opts.model orelse preset.touch.model);
     var voices: [2]voice_mod.Voice = .{ droneVoice(drone_shape), droneVoice(drone_shape) };
     // What each plant does with a hand, in the one place both the voice and
