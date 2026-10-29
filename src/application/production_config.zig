@@ -228,13 +228,16 @@ pub fn droneWith(
         // The share is the one thing this rig's probe gives by degree, and
         // only this model counts it, so only this model bends on it.
         shape.wobble_semis = core.noise.default_wobble_semis;
-        // The narrow band the room has always known: the wide one was too much
-        // hiss. The gate is slow enough that a touch swells in rather than
-        // switching on. The climb goes all the way to the top.
+        // The ../drone-playground pick, "Warm pad + plant wobble": a tone
+        // carrying the note with the breath an octave above it, where the
+        // narrow band was all grain. The gate is slow enough that a touch
+        // swells in rather than switching on. The climb goes all the way up.
+        shape.timbre = .warm;
         shape.gate_ms = ramped_gate_ms;
-        // Down as it went up: a slide home over seconds, the level fading with
-        // it, rather than the glide dropping it off a cliff.
+        // Let go, the climb slows to a rest a little under where it was, the
+        // level fading with it, rather than sliding three octaves downhill.
         shape.touch_fall_s = core.noise.default_touch_fall_s;
+        shape.touch_settle_semis = core.noise.default_touch_settle_semis;
     }
     if (overrides.touch_climb_semis) |semis| shape.touch_climb_semis = semis;
     if (overrides.timbre) |kind| shape.timbre = kind;
@@ -283,12 +286,14 @@ test "the learned drone falls home slowly and idles as the band always has" {
     try std.testing.expectEqual(core.noise.default_idle_gain, plain.idle_gain);
 }
 
-test "the learned drone climbs to the top, in the narrow band the room knows" {
+test "the learned drone climbs to the top in the warm voice, and settles when let go" {
     const ramped = droneWith(drone, .{}, .learned);
     try std.testing.expect(ramped.touch_climb_semis == null);
-    try std.testing.expectEqual(core.timbre.Kind.band, ramped.timbre);
+    try std.testing.expectEqual(core.timbre.Kind.warm, ramped.timbre);
+    try std.testing.expectEqual(core.noise.default_touch_settle_semis, ramped.touch_settle_semis.?);
+    try std.testing.expect(droneWith(drone, .{}, .deviation).touch_settle_semis == null);
     // The room can ask for any voice on any model.
-    try std.testing.expectEqual(core.timbre.Kind.warm, droneWith(drone, .{ .timbre = .warm }, .learned).timbre);
+    try std.testing.expectEqual(core.timbre.Kind.band, droneWith(drone, .{ .timbre = .band }, .learned).timbre);
     try std.testing.expectEqual(core.timbre.Kind.wide, droneWith(drone, .{ .timbre = .wide }, .deviation).timbre);
     try std.testing.expectEqual(ramped_gate_ms, ramped.gate_ms);
     // The models that read their pitch off the probe keep the voice they

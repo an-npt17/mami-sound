@@ -376,7 +376,26 @@ const mad_floor: f32 = 50.0;
 /// touch occupying a tenth of an evening is still found.
 const level_percentile: u32 = 5;
 
-pub const Model = enum { deviation, steady, learned };
+pub const Model = enum { deviation, steady, learned, scatter };
+
+/// Where the `scatter` model's verdict on which state is rest flips, as a share
+/// of the long window spent still. Two numbers for the reason every latch here
+/// has two: a probe split evenly between still and scattered would otherwise
+/// swap rest and touch on alternate polls.
+const scatter_rest_still: f32 = 0.6;
+const scatter_rest_scatter: f32 = 0.4;
+
+/// How long an unbroken touch may last before the `learned` and `scatter`
+/// models take it for where the probe now lives, in seconds.
+///
+/// Both read rest off the probe as whichever state it keeps coming back to,
+/// and a hand is not that state however long it stays -- so while touched
+/// neither counts the hand towards rest. A probe that never comes back is
+/// another matter: wiring that has shifted, or something left leaning on the
+/// plant, would hold the piece latched for the rest of the evening. Five
+/// minutes is longer than anybody holds a plant, and short enough that a probe
+/// that really has moved is heard as rest again before the room gives up.
+pub const default_long_hold_s: f32 = 300.0;
 
 /// How wide the window the `steady` model measures a probe's spread over.
 ///
@@ -548,6 +567,14 @@ pub const Config = struct {
     sample_rate: u32,
     poll_frames: usize,
     model: Model = .deviation,
+    /// Probe BC's own model. `null` gives it A's.
+    ///
+    /// For the rig whose two probes need two different questions: A sits at
+    /// one of two levels with a wide gap between them, which `learned` reads
+    /// off the probe, while BC sits still at one level and scatters across a
+    /// range that runs straight through it, so no line between two levels can
+    /// tell the states apart and only the spread can.
+    model_bc: ?Model = null,
     /// How long the stillness must be gone before the touch is. `steady` only.
     drop_ms: f32 = default_drop_ms,
     /// The window and the two thresholds the `steady` model judges by.
@@ -557,6 +584,9 @@ pub const Config = struct {
     still_release: i16 = default_still_release,
     still_move: i16 = default_still_move,
     still_rest_s: f32 = default_still_rest_s,
+    /// How long a touch may last before it is taken for rest. `learned` and
+    /// `scatter` only.
+    long_hold_s: f32 = default_long_hold_s,
     touch_band_lo: ?i16 = default_touch_band_lo,
     touch_band_hi: ?i16 = default_touch_band_hi,
     /// Probe BC's own band. `null` puts it on A's.
@@ -634,6 +664,8 @@ pub const Config = struct {
     /// given them, A's everywhere else.
     pub fn forBc(self: Config) Config {
         var bc = self;
+        bc.model = self.model_bc orelse self.model;
+        bc.model_bc = null;
         bc.level = self.level_bc orelse self.level;
         bc.hold_ms = self.hold_bc_ms orelse self.hold_ms;
         bc.still_range = self.still_range_bc orelse self.still_range;
@@ -760,6 +792,22 @@ pub const Detector = struct {
     band_share: f32,
     /// The share at or below which the touch is over. `learned` only.
     band_release: f32,
+    /// Whether the window is still, as last decided. Null until a window has
+    /// been plainly one or the other. `scatter` only.
+    calm: ?bool,
+    /// The share of the long window spent still, how many polls it averages
+    /// over so far, and the most it ever will. `scatter` only.
+    calm_share: f32,
+    calm_polls: u32,
+    calm_horizon: u32,
+    /// Polls of watching before rest is decided at all. `scatter` only.
+    calm_warmup: u32,
+    /// Which state is rest: still, or scattered. `scatter` only.
+    rest_calm: bool,
+    /// Polls the current touch has lasted, and how many it may before it is
+    /// taken for rest. `learned` and `scatter` only.
+    on_for: u32,
+    long_hold_polls: u32,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -819,6 +867,14 @@ pub const Detector = struct {
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
             ),
+            .calm = null,
+            .calm_share = 0.0,
+            .calm_polls = 0,
+            .calm_horizon = @max(holdPolls(cfg.baseline_s * 1000.0, cfg.sample_rate, cfg.poll_frames), 1),
+            .calm_warmup = @max(holdPolls(cfg.still_rest_s * 1000.0, cfg.sample_rate, cfg.poll_frames), 1),
+            .rest_calm = true,
+            .on_for = 0,
+            .long_hold_polls = @max(holdPolls(cfg.long_hold_s * 1000.0, cfg.sample_rate, cfg.poll_frames), 1),
         };
     }
 
@@ -852,7 +908,7 @@ pub const Detector = struct {
             .deviation => self.last_mean,
             // Both window models are looking at the middle of the window, so
             // the status line shows the same thing for either.
-            .steady, .learned => self.spread.level,
+            .steady, .learned, .scatter => self.spread.level,
         };
     }
 
@@ -887,6 +943,8 @@ pub const Detector = struct {
                 clampedAbsDiff(self.spread.level, self.baseline.base)
             else
                 0,
+            // A scatter has no level to be far from rest by, only a width.
+            .scatter => if (self.on) self.spread.range else 0,
         };
     }
 
@@ -1090,7 +1148,12 @@ pub const Detector = struct {
         // hand would learn the hand. This one has to see BOTH levels -- a
         // frozen window holds one cluster and can never find the other, and
         // the line between them is the whole method.
-        self.baseline.pushBoth(level, raw);
+        //
+        // A hand is not where the probe lives, however long it stays, so while
+        // touched the middle fed in is rest itself: the readings still teach
+        // the window where the hand goes, and the median cannot follow it.
+        const middle = if (self.on) self.baseline.base else level;
+        self.baseline.pushBoth(middle, raw);
         if (self.baseline.count < self.rest_samples) {
             self.reset();
             return false;
@@ -1178,7 +1241,99 @@ pub const Detector = struct {
             !away;
         self.at_rest = loose;
 
-        return self.settle(held, loose);
+        const counted = self.settle(held, loose);
+        if (self.outlasted()) {
+            // Past any hand: rest is measured again wherever the probe sits.
+            self.baseline.clear();
+            self.reset();
+            return false;
+        }
+        return counted;
+    }
+
+    /// Whether the touch under way has lasted longer than any hand does.
+    fn outlasted(self: *Detector) bool {
+        self.on_for = if (self.on) self.on_for + 1 else 0;
+        if (self.on_for < self.long_hold_polls) return false;
+        self.on_for = 0;
+        return true;
+    }
+
+    /// The model for a probe whose two states are still and scattered.
+    ///
+    /// On box 6 probe BC sits at 1030 to 1040, and otherwise scatters anywhere
+    /// from 50 to 2000 -- straight through the level it rests at, so a line
+    /// between two levels cannot separate them and `learned` would read the
+    /// scatter's middle as home. What does separate them is the window's width:
+    /// a few counts one way, hundreds the other.
+    ///
+    /// Which of the two is rest is read off the probe as `learned` reads it:
+    /// whichever it spends most of the long window in. Never frozen, for the
+    /// same reason -- the window has to keep seeing both states to know which
+    /// is the common one.
+    fn stepScatter(self: *Detector, raw: i16) bool {
+        self.spread.push(raw);
+        if (!self.spread.ready()) {
+            self.reset();
+            return false;
+        }
+
+        // Between the two spreads the window is whatever it last plainly was.
+        //
+        // Where the room has said where a hand holds the probe, still counts
+        // only there. A probe sliding off a hand to a new level and stopping
+        // never spreads far enough to count as a scatter, and is as still at
+        // the new level as it was under the hand -- so without the band it
+        // was held on as a touch nobody was making.
+        const range = self.spread.range;
+        const placed = self.inBand(self.spread.level);
+        if (range <= self.still_range and placed) {
+            self.calm = true;
+        } else if (range >= self.still_release or !placed) {
+            self.calm = false;
+        }
+        const calm = self.calm orelse {
+            self.reset();
+            return false;
+        };
+
+        // A running average that becomes a rolling one: every poll counts the
+        // same until the long window is full, so the first minutes are not
+        // decided by the first second.
+        //
+        // Only while untouched: a hand is not where the probe lives however
+        // long it stays, and counting it would hand rest to anybody who held
+        // on for a few minutes.
+        if (!self.on) {
+            self.calm_polls = @min(self.calm_polls + 1, self.calm_horizon);
+            const weight = 1.0 / @as(f32, @floatFromInt(self.calm_polls));
+            const sample: f32 = if (calm) 1.0 else 0.0;
+            self.calm_share += weight * (sample - self.calm_share);
+        }
+
+        if (self.calm_polls < self.calm_warmup) {
+            self.reset();
+            return false;
+        }
+        if (self.calm_polls == self.calm_warmup) {
+            self.rest_calm = self.calm_share >= 0.5;
+        } else if (self.calm_share >= scatter_rest_still) {
+            self.rest_calm = true;
+        } else if (self.calm_share <= scatter_rest_scatter) {
+            self.rest_calm = false;
+        }
+
+        const held = calm != self.rest_calm;
+        self.at_rest = !held;
+        const counted = self.settle(held, !held);
+        if (self.outlasted()) {
+            // Past any hand: the state the probe is stuck in is rest now.
+            self.rest_calm = calm;
+            self.calm_share = if (calm) 1.0 else 0.0;
+            self.reset();
+            return false;
+        }
+        return counted;
     }
 
     /// Feed the median what rest looks like, and nothing else.
@@ -1310,6 +1465,7 @@ pub const Detector = struct {
             .deviation => if (!self.stepDeviation(raw)) return false,
             .steady => if (!self.stepSteady(raw)) return false,
             .learned => if (!self.stepLearned(raw)) return false,
+            .scatter => if (!self.stepScatter(raw)) return false,
         }
 
         // The tap layer is the same question of either model: did the state go
@@ -1419,7 +1575,7 @@ pub const Machine = struct {
         // band, so there is nothing to see through — and freezing a baseline
         // the steady model never reads, or resetting BC's stillness for a third
         // of a second every time A latches, would only lose real touches.
-        if (self.bc.model == .steady) {
+        if (self.bc.model == .steady or self.bc.model == .scatter) {
             const bc_on = self.bc.update(raw_bc);
             if (a_on and bc_on) return .both;
             if (a_on) return .plant_a;
@@ -2893,4 +3049,126 @@ test "the drone's pitch rises with the reading rather than folding at rest" {
 
     try std.testing.expect(below < at_rest);
     try std.testing.expect(at_rest < above);
+}
+
+/// Box 6's probe BC at rest: a few counts either side of 1035.
+fn sittingStill(poll: usize) i16 {
+    return 1030 + @as(i16, @intCast(poll % 11));
+}
+
+/// Box 6's probe BC scattering anywhere from 50 to 2000, straight through the
+/// level it rests at.
+fn scattering(poll: usize) i16 {
+    const mixed = (poll *% 2654435761) >> 7;
+    return 50 + @as(i16, @intCast(mixed % 1951));
+}
+
+fn scatterConfig() Config {
+    return .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .scatter,
+    };
+}
+
+test "a probe that rests still is touched when it scatters" {
+    var detector: Detector = .init(scatterConfig());
+    for (0..20 * poll_rate) |poll| _ = detector.update(sittingStill(poll));
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.rest_calm);
+
+    for (0..3 * poll_rate) |poll| _ = detector.update(scattering(poll));
+    try std.testing.expect(detector.on);
+
+    for (0..3 * poll_rate) |poll| _ = detector.update(sittingStill(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "a probe that rests scattered is touched when it goes still" {
+    // The same probe the other way round: whichever state it lives in is rest,
+    // and the other is the hand.
+    var detector: Detector = .init(scatterConfig());
+    for (0..20 * poll_rate) |poll| _ = detector.update(scattering(poll));
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(!detector.rest_calm);
+
+    for (0..3 * poll_rate) |poll| _ = detector.update(sittingStill(poll));
+    try std.testing.expect(detector.on);
+
+    for (0..3 * poll_rate) |poll| _ = detector.update(scattering(poll));
+    try std.testing.expect(!detector.on);
+}
+
+test "probe BC can be asked its own question" {
+    const cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+        .model_bc = .scatter,
+    };
+    try std.testing.expectEqual(Model.learned, cfg.model);
+    try std.testing.expectEqual(Model.scatter, cfg.forBc().model);
+    // Left unset, BC asks what A asks, as every rig before this one did.
+    try std.testing.expectEqual(Model.steady, steadyConfig().forBc().model);
+}
+
+test "a hand held longer than rest has lasted is still a hand, until it outlasts any hand" {
+    // Ten seconds of rest, then a hand held for longer than that. Counted
+    // towards rest, the hand would be most of what the probe had ever done and
+    // would become home; it is not counted, so it stays a touch.
+    var cfg = scatterConfig();
+    cfg.long_hold_s = 30.0;
+    var detector: Detector = .init(cfg);
+    for (0..10 * poll_rate) |poll| _ = detector.update(scattering(poll));
+    try std.testing.expect(!detector.rest_calm);
+
+    for (0..25 * poll_rate) |poll| _ = detector.update(sittingStill(poll));
+    try std.testing.expect(detector.on);
+    try std.testing.expect(!detector.rest_calm);
+
+    // Past the limit it is taken for where the probe now lives.
+    for (0..10 * poll_rate) |poll| _ = detector.update(sittingStill(poll));
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.rest_calm);
+}
+
+test "a long hand does not teach the learned model a new rest" {
+    const cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+        .long_hold_s = 30.0,
+    };
+    var detector: Detector = .init(cfg);
+    for (0..10 * poll_rate) |poll| _ = detector.update(@intCast(582 + poll % 11));
+    try std.testing.expect(!detector.on);
+
+    // Held two and a half times as long as the probe had rested.
+    for (0..25 * poll_rate) |poll| _ = detector.update(-2060 + @as(i16, @intCast(poll % 31)));
+    try std.testing.expect(detector.on);
+    try std.testing.expect(detector.baseline.base > 500);
+
+    // Past the limit, rest is measured again where the probe sits.
+    for (0..15 * poll_rate) |poll| _ = detector.update(-2060 + @as(i16, @intCast(poll % 31)));
+    try std.testing.expect(!detector.on);
+    try std.testing.expect(detector.baseline.base < -2000);
+}
+
+test "a probe that slides off a hand and stops elsewhere is let go" {
+    // Box 6's journal: BC held at 1045, then sliding to 790 and sitting still
+    // there. Never a scatter, so only the band can say the hand has gone.
+    var cfg = scatterConfig();
+    cfg.touch_band_lo = 1020;
+    cfg.touch_band_hi = 1060;
+    var detector: Detector = .init(cfg);
+    for (0..20 * poll_rate) |poll| _ = detector.update(scattering(poll));
+    for (0..3 * poll_rate) |poll| _ = detector.update(1040 + @as(i16, @intCast(poll % 9)));
+    try std.testing.expect(detector.on);
+
+    for (0..poll_rate) |poll| {
+        const slid = 1045 - @as(i16, @intCast(poll * 255 / poll_rate));
+        _ = detector.update(slid);
+    }
+    for (0..2 * poll_rate) |poll| _ = detector.update(786 + @as(i16, @intCast(poll % 9)));
+    try std.testing.expect(!detector.on);
 }

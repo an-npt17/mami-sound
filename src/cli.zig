@@ -357,7 +357,7 @@ fn parseMode(name: []const u8) ?clips.Mode {
 fn parseBox(text: []const u8) ?boxes.Box {
     if (text.len != 1) return null;
     const which = std.fmt.parseInt(u8, text, 10) catch return null;
-    if (which < 1 or which > 5) return null;
+    if (which < 1 or which > @typeInfo(boxes.Box).@"enum".fields.len) return null;
     return @enumFromInt(which - 1);
 }
 
@@ -365,6 +365,7 @@ fn parseModel(name: []const u8) ?touch.Model {
     if (std.mem.eql(u8, name, "deviation")) return .deviation;
     if (std.mem.eql(u8, name, "steady")) return .steady;
     if (std.mem.eql(u8, name, "learned")) return .learned;
+    if (std.mem.eql(u8, name, "scatter")) return .scatter;
     return null;
 }
 
@@ -408,12 +409,12 @@ pub const usage =
     \\--device selects the ALSA device for aplay. It defaults to `default`.
     \\Use `aplay -l` to list cards; for example, `plughw:0,0`.
     \\
-    \\--box is which of the five installations this is, 1 to 5. It picks the
+    \\--box is which of the six installations this is, 1 to 6. It picks the
     \\numbers that box's rig was measured at: the counts floor each probe needs,
     \\how far the drone's pitch spends its range, and what each plant plays.
     \\Left off, the hostname is read -- box3, box3.local and box3-pi are all
-    \\box 3 -- and a machine that is none of the five runs the unmeasured
-    \\defaults and says so on the loading line. Every other flag still wins over
+    \\box 3 -- and a machine that is none of the six runs box 6, which this
+    \\branch is built for. Every other flag still wins over
     \\whatever the box says.
     \\
     \\--plant-a and --plant-b each name what that plant plays. Either plant
@@ -1007,7 +1008,7 @@ test "a box that does not exist is refused rather than rounded" {
     // Either one silently answered with box1's floors is a rig running numbers
     // measured somewhere else, which is the fault this whole directory exists
     // to stop.
-    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=6"}));
+    try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=7"}));
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=0"}));
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box="}));
     try std.testing.expectError(Error.InvalidBox, parse(&.{"--box=two"}));

@@ -186,8 +186,8 @@ fn runComposition(
         std.debug.print("loading: {t}\n", .{which});
     } else {
         std.debug.print(
-            "loading: no box named, and this machine is none of the five: " ++
-                "running the unmeasured defaults\n",
+            "loading: no box named, and this machine is none of the six: " ++
+                "running box6, which this branch is built for\n",
             .{},
         );
     }
