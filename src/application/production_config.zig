@@ -358,8 +358,12 @@ pub const bell_clip_gain: f32 = 1.0;
 
 /// Voice box 3 down 3 dB against the other clips, asked for on 2026-10-30:
 /// about 20% quieter to the ear, then another 10% step on top, -4.5 dB in
-/// all. Voice box 5 is left where it was.
+/// all.
 pub const voicebox3_clip_gain: f32 = 0.7079 * ten_percent_quieter;
+
+/// Voice box 5 down by the same -4.5 dB as voice box 3, asked for on
+/// 2026-10-30.
+pub const voicebox5_clip_gain: f32 = voicebox3_clip_gain;
 
 /// A step 10% louder to the ear: 10*log2(1.1) = +1.4 dB.
 const ten_percent_louder: f32 = 1.1717;

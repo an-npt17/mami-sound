@@ -269,6 +269,7 @@ fn runComposition(
         if (chosen == .bell) streams[plant].gain *= production_config.bell_clip_gain;
         if (chosen == .insect3 or chosen == .insect5) streams[plant].gain *= production_config.insect_clip_gain;
         if (chosen == .voicebox3) streams[plant].gain *= production_config.voicebox3_clip_gain;
+        if (chosen == .voicebox5) streams[plant].gain *= production_config.voicebox5_clip_gain;
         if (chosen == .noise2 or chosen == .noise4) streams[plant].gain *= production_config.noise_clip_gain;
         stream_live[plant] = true;
 
