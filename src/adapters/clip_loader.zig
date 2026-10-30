@@ -82,7 +82,8 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
         .bell => &.{"Bell Stems"},
         .daybird => &.{"Day bird"},
         .piano => &.{"EPiano Stems"},
-        .wind => &.{"wind"},
+        .noise2 => &.{"Noise Box 2"},
+        .noise4 => &.{"Noise Box 4"},
     };
 }
 
@@ -146,7 +147,7 @@ test "every source names the one folder it is made of" {
     // One each. The pool that read two folders as one went when the interviews
     // became two boxes; a plant that wants both is two plants.
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano, .wind,
+        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano, .noise2, .noise4,
     };
     for (sources) |which| {
         try std.testing.expectEqual(@as(usize, 1), directoriesFor(which).len);
@@ -161,7 +162,8 @@ test "every source names the one folder it is made of" {
     try std.testing.expectEqualStrings("Trad Vn Jam 2", directoriesFor(.tradvn2)[0]);
     try std.testing.expectEqualStrings("Bell Stems", directoriesFor(.bell)[0]);
     try std.testing.expectEqualStrings("EPiano Stems", directoriesFor(.piano)[0]);
-    try std.testing.expectEqualStrings("wind", directoriesFor(.wind)[0]);
+    try std.testing.expectEqualStrings("Noise Box 2", directoriesFor(.noise2)[0]);
+    try std.testing.expectEqualStrings("Noise Box 4", directoriesFor(.noise4)[0]);
 }
 
 test "the second jam loads in the order it is numbered" {
@@ -185,6 +187,21 @@ test "the second jam loads in the order it is numbered" {
         previous = number;
     }
     try std.testing.expect(previous != null);
+}
+
+test "the noise beds load as part one to the last, in order" {
+    // Each box's noise is one piece in numbered parts, so it plays 1, 2, ... n
+    // and round again, never shuffled. Index i has to be part i + 1.
+    const gpa = std.testing.allocator;
+    for ([_]core.source.Source{ .noise2, .noise4 }) |which| {
+        var pool = try loadPool(gpa, std.testing.io, which);
+        defer pool.deinit(gpa);
+        try std.testing.expectEqual(core.source.Order.sequential, pool.order);
+        try std.testing.expect(pool.paths.len > 0);
+        for (pool.paths, 1..) |path, part| {
+            try std.testing.expectEqual(@as(?usize, part), partNumber(path));
+        }
+    }
 }
 
 /// The last run of digits in a clip's name, which is the part number for a

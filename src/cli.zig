@@ -484,7 +484,8 @@ pub const usage =
     \\  tradvn2     ./Trad Vn Jam 2/
     \\  bell        ./Bell Stems/
     \\  piano       ./EPiano Stems/
-    \\  wind        ./wind/, wind_1.wav to wind_N.wav in order
+    \\  noise2      ./Noise Box 2/
+    \\  noise4      ./Noise Box 4/
     \\Unasked, plant A is the drone and plant B is voicebox3. Bare --plant-a
     \\means --plant-a=daybird. Every source is one folder: a plant that wants
     \\two of them is two plants.
@@ -500,7 +501,7 @@ pub const usage =
     \\Zero plays the clip to its own end, which is how a source that is normally
     \\cut is uncapped, or one that normally runs long is cut. Left off, the
     \\source's own length stands: 4s for the stems, 5s for daybird and insects,
-    \\and to the end for the voice boxes, both jams and the wind.
+    \\and to the end for the voice boxes, both jams and the noise.
     \\
     \\--plant-a-mode and --plant-b-mode are how a plant answers a hand:
     \\  trigger  a touch sets a clip going and it runs its own length
