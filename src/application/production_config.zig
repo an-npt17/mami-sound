@@ -107,6 +107,9 @@ pub const Overrides = struct {
     /// flag off: off keeps the measured number, zero asks the score alone.
     counts: ?i16 = null,
     counts_bc: ?i16 = null,
+    /// How long a plant must stay latched before it counts as touched. Unset
+    /// keeps `confirm_ms`; zero answers the latch at once.
+    confirm_ms: ?f32 = null,
     /// How far up the pitch range a touch starts, and how long it takes to
     /// climb to the top from there. Unset leaves the box's own numbers.
     touch_floor: ?f32 = null,
@@ -136,6 +139,11 @@ pub const Overrides = struct {
 /// wanted it or not.
 pub const tap_window_ms: f32 = 1000.0;
 
+/// How long a plant must stay latched before it counts as touched, under every
+/// model. The probes jump for a few hundred milliseconds with nobody on them,
+/// and each jump was starting a clip; asked for on 2026-10-30.
+pub const confirm_ms: f32 = 1500.0;
+
 /// Which box a run is: what the room said, or failing that what the machine is
 /// called, or failing that nobody.
 pub fn chosenBox(asked: ?boxes.Box, hostname: []const u8) ?boxes.Box {
@@ -155,6 +163,7 @@ pub fn touchWith(
 ) core.touch.Config {
     var cfg = base;
     if (overrides.model) |chosen| cfg.model = chosen;
+    cfg.confirm_ms = overrides.confirm_ms orelse confirm_ms;
 
     // Under `learned`, probe BC's line is drawn halfway to the deepest dip it
     // has seen, and on this rig that is ground: a line near thirteen thousand.
@@ -334,6 +343,10 @@ pub const drone_lift_gain: f32 = 1.2589;
 /// How loud the piano stems sit against the other clips: 2 dB up, asked for
 /// in the room on 2026-10-29.
 pub const piano_clip_gain: f32 = 1.2589;
+
+/// How loud the second jam sits against the other clips: 3 dB up, asked for
+/// on 2026-10-30.
+pub const tradvn2_clip_gain: f32 = 1.4125;
 
 /// The gate under the learned drone, from the bench's pick.
 pub const ramped_gate_ms: f32 = 400.0;

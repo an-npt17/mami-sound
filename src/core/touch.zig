@@ -604,6 +604,12 @@ pub const Config = struct {
     /// learns regardless. `deviation` only.
     baseline_stale_s: f32 = default_baseline_stale_s,
     settle_ms: f32 = default_settle_ms,
+    /// How long a plant has to stay latched before the machine reports it
+    /// touched. Zero reports the latch as it happens. Any model: a reading that
+    /// jumps for a few hundred milliseconds with nobody there latches and lets
+    /// go inside this, and is never heard. A tap plant is exempt -- its answer
+    /// is the one poll a gesture ends on, which no wait can outlast.
+    confirm_ms: f32 = 0.0,
     /// Probe BC's own threshold and hold, when it wants asking a different
     /// question from A's. `null` gives it A's.
     ///
@@ -1427,6 +1433,10 @@ pub const Machine = struct {
     /// BC was already touched before A arrived.
     rebasing: bool,
     prev_a: bool,
+    /// Polls a plant must stay latched before it is reported, and how long
+    /// each has been latched so far. Zero polls is no wait.
+    confirm_polls: u32,
+    run: [2]u32,
 
     pub fn init(cfg: Config) Machine {
         return initLive(cfg, plant.all);
@@ -1442,6 +1452,11 @@ pub const Machine = struct {
             .settle_left = 0,
             .rebasing = false,
             .prev_a = false,
+            .confirm_polls = if (cfg.confirm_ms > 0.0)
+                holdPolls(cfg.confirm_ms, cfg.sample_rate, cfg.poll_frames)
+            else
+                0,
+            .run = .{ 0, 0 },
         };
     }
 
@@ -1452,6 +1467,33 @@ pub const Machine = struct {
     /// the shadow rule. Its detector is left where it was, so the status line
     /// reports zeroes for it rather than noise.
     pub fn update(self: *Machine, raw_a: i16, raw_bc: i16) State {
+        const latched = self.latch(raw_a, raw_bc);
+        if (self.confirm_polls == 0) return latched;
+
+        // Gated after the shadow rule rather than inside it: the rule wants A's
+        // latch the moment it happens, or BC learns A's crosstalk as rest.
+        const a_on = self.confirmed(0, latched == .plant_a or latched == .both, self.a.window != null);
+        const bc_on = self.confirmed(1, latched == .plant_bc or latched == .both, self.bc.window != null);
+        if (a_on and bc_on) return .both;
+        if (a_on) return .plant_a;
+        if (bc_on) return .plant_bc;
+        return .none;
+    }
+
+    /// Whether one plant has been latched long enough to report. Letting go is
+    /// reported at once; only arriving waits.
+    fn confirmed(self: *Machine, which: usize, on: bool, tap: bool) bool {
+        if (tap) return on;
+        if (!on) {
+            self.run[which] = 0;
+            return false;
+        }
+        self.run[which] = @min(self.run[which] + 1, self.confirm_polls);
+        return self.run[which] == self.confirm_polls;
+    }
+
+    /// Both detectors and the shadow rule, before any wait to confirm.
+    fn latch(self: *Machine, raw_a: i16, raw_bc: i16) State {
         if (!self.live[0]) {
             if (!self.live[1]) return .none;
             return if (self.bc.update(raw_bc)) .plant_bc else .none;
@@ -2515,6 +2557,31 @@ test "a machine with neither probe on the rig answers nothing at all" {
     }
     try std.testing.expect(!none.a.baseline.ready());
     try std.testing.expect(!none.bc.baseline.ready());
+}
+
+test "a latch shorter than the confirm wait is never reported" {
+    var cfg = deviationConfig();
+    cfg.confirm_ms = 1500.0;
+    var machine: Machine = .initLive(cfg, .{ true, false });
+    for (0..70 * poll_rate) |poll| {
+        _ = machine.update(restingAt(4805, poll), 0);
+    }
+
+    // A jump of a few hundred milliseconds: the detector latches, the machine
+    // says nothing.
+    for (0..poll_rate * 3 / 10) |poll| {
+        try std.testing.expectEqual(State.none, machine.update(restingAt(12000, poll), 0));
+    }
+    for (0..2 * poll_rate) |poll| {
+        try std.testing.expectEqual(State.none, machine.update(restingAt(4805, poll), 0));
+    }
+
+    // A hand that stays is reported once it has outlasted the wait.
+    var reported = false;
+    for (0..3 * poll_rate) |poll| {
+        if (machine.update(restingAt(12000, poll), 0) == .plant_a) reported = true;
+    }
+    try std.testing.expect(reported);
 }
 
 fn learnedConfig() Config {

@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
             ),
             error.InvalidStillThreshold => std.debug.print(
                 "--still-range, --still-release, --still-window and --edge-b take a number " ++
-                    "above zero.\n--plant-a-band and --plant-b-band take LO:HI in counts, low end " ++
+                    "above zero.\n--touch-confirm takes seconds, zero or more.\n--plant-a-band and --plant-b-band take LO:HI in counts, low end " ++
                     "first, both ends given.\n\n",
                 .{},
             ),
@@ -265,6 +265,7 @@ fn runComposition(
 
         streams[plant] = try clip_stream.Adapter.init(io, gpa, pools[plant].paths, limit);
         if (chosen == .piano) streams[plant].gain *= production_config.piano_clip_gain;
+        if (chosen == .tradvn2) streams[plant].gain *= production_config.tradvn2_clip_gain;
         stream_live[plant] = true;
 
         // Before `start`, and never fatal. The heads are what make a touch
@@ -353,6 +354,7 @@ fn runComposition(
             .plant_window = opts.plant_window,
             .counts = opts.counts,
             .counts_bc = opts.counts_bc,
+            .confirm_ms = opts.confirm_ms,
         }, modes),
         probe.source(),
         sink_port,

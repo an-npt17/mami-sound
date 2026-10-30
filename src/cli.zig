@@ -80,6 +80,8 @@ pub const Options = struct {
     still_range: ?i16 = null,
     still_release: ?i16 = null,
     still_window_ms: ?f32 = null,
+    /// How long a plant must stay latched before it counts as touched.
+    confirm_ms: ?f32 = null,
     /// How much of the window must be past the line before a touch counts,
     /// under the `learned` model.
     ///
@@ -250,6 +252,11 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidStillThreshold;
             if (ms <= 0.0) return Error.InvalidStillThreshold;
             opts.still_window_ms = ms * 1000.0;
+        } else if (std.mem.startsWith(u8, arg, "--touch-confirm=")) {
+            const ms = parseSeconds(arg["--touch-confirm=".len..]) orelse
+                return Error.InvalidStillThreshold;
+            if (ms < 0.0) return Error.InvalidStillThreshold;
+            opts.confirm_ms = ms * 1000.0;
         } else if (std.mem.startsWith(u8, arg, "--band-share=")) {
             const fraction = std.fmt.parseFloat(f32, arg["--band-share=".len..]) catch
                 return Error.InvalidBandShare;
@@ -436,7 +443,8 @@ pub const usage =
     \\                  [--plant-b=SOURCE] [--plant-b-mode=MODE] [--plant-b-band=LO:HI]
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
-    \\                  [--still-window=SECONDS] [--band-share=FRACTION]
+    \\                  [--still-window=SECONDS] [--touch-confirm=SECONDS]
+    \\                  [--band-share=FRACTION]
     \\                  [--band-release=FRACTION] [--band-share-b=FRACTION]
     \\                  [--band-release-b=FRACTION] [--edge-a=N] [--edge-b=N]
     \\                  [--counts=N] [--counts-b=N]
@@ -661,6 +669,11 @@ pub const usage =
     \\Default 1.161, which is 400 readings at this rig's poll rate. `zig build
     \\replay -- CAPTURE --sweep` picks all three from a recording rather than
     \\from the room.
+    \\
+    \\--touch-confirm is how long a plant must stay touched, in seconds, before
+    \\it answers, under every model. A reading that jumps for less than this
+    \\with nobody there is never heard; a real hand is heard this much later.
+    \\Tap plants are not held to it. Default 1.5; zero answers at once.
     \\
     \\--capture writes down what the probes actually read, every poll of both,
     \\to a file `zig build replay` can sweep. Start it, touch each plant a few
@@ -912,6 +925,13 @@ test "a window of no time at all is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
 }
 
+test "a touch confirm is seconds, and zero is no wait" {
+    try std.testing.expectEqual(@as(f32, 2000.0), (try parse(&.{"--touch-confirm=2"})).confirm_ms.?);
+    try std.testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--touch-confirm=0"})).confirm_ms.?);
+    try std.testing.expect((try parse(&.{})).confirm_ms == null);
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--touch-confirm=-1"}));
+}
+
 test "the usage banner names every flag the parser takes" {
     // The banner has gone stale twice: --plant-a-mode and --still-window both
     // worked, were documented in the body, and were missing from the summary
@@ -930,6 +950,7 @@ test "the usage banner names every flag the parser takes" {
         "--still-range=",
         "--still-release=",
         "--still-window=",
+        "--touch-confirm=",
         "--counts=",
         "--counts-b=",
         "--touch-floor=",
