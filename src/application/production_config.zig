@@ -340,9 +340,14 @@ pub const learned_out_gain: f32 = 0.3981;
 /// 2026-10-29.
 pub const drone_lift_gain: f32 = 1.2589;
 
-/// How loud the piano stems sit against the other clips: 2 dB up, asked for
-/// in the room on 2026-10-29.
-pub const piano_clip_gain: f32 = 1.2589;
+/// How loud the piano stems sit against the other clips: matched by measure
+/// to the second jam, asked for on 2026-10-30 after +7.2 dB of steps by ear
+/// still left the piano small. The stems are mastered quiet: -33.6 LUFS mean
+/// as decoded (mono), against -20.4 for the second jam, which plays at
+/// -17.4 after its +3 dB. -17.4 - -33.6 = +16.2 dB = 6.457. The loudest stem
+/// peaks at -20.4 dBFS mono, so with `voice_gain` it reaches about -12 dBFS
+/// and the clamp in pcm.zig is still nowhere near.
+pub const piano_clip_gain: f32 = 6.457;
 
 /// How loud the second jam sits against the other clips: 3 dB up, asked for
 /// on 2026-10-30.
