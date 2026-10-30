@@ -268,6 +268,8 @@ fn runComposition(
         if (chosen == .tradvn2) streams[plant].gain *= production_config.tradvn2_clip_gain;
         if (chosen == .bell) streams[plant].gain *= production_config.bell_clip_gain;
         if (chosen == .insect3 or chosen == .insect5) streams[plant].gain *= production_config.insect_clip_gain;
+        if (chosen == .voicebox3) streams[plant].gain *= production_config.voicebox3_clip_gain;
+        if (chosen == .noise2 or chosen == .noise4) streams[plant].gain *= production_config.noise_clip_gain;
         stream_live[plant] = true;
 
         // Before `start`, and never fatal. The heads are what make a touch

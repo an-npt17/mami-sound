@@ -348,14 +348,27 @@ pub const piano_clip_gain: f32 = 1.2589;
 /// on 2026-10-30.
 pub const tradvn2_clip_gain: f32 = 1.4125;
 
-/// The bell stems 10% quieter to the ear than the other clips, asked for on
-/// 2026-10-30. Loudness doubles about every 10 dB, so 10% quieter is
-/// 10*log2(0.9) = -1.5 dB, not an amplitude of 0.9.
-pub const bell_clip_gain: f32 = 0.8395;
+/// A step 10% quieter to the ear. Loudness doubles about every 10 dB, so 10%
+/// quieter is 10*log2(0.9) = -1.5 dB, not an amplitude of 0.9.
+const ten_percent_quieter: f32 = 0.8395;
 
-/// Both insect mixes 10% louder to the ear, asked for on 2026-10-30:
-/// 10*log2(1.1) = +1.4 dB.
-pub const insect_clip_gain: f32 = 1.1717;
+/// The bell stems at the same level as the other clips (0 dB), settled on
+/// 2026-10-30 after a day of steps between -3 dB and +3.6 dB.
+pub const bell_clip_gain: f32 = 1.0;
+
+/// Voice box 3 down 3 dB against the other clips, asked for on 2026-10-30:
+/// about 20% quieter to the ear, then another 10% step on top, -4.5 dB in
+/// all. Voice box 5 is left where it was.
+pub const voicebox3_clip_gain: f32 = 0.7079 * ten_percent_quieter;
+
+/// A step 10% louder to the ear: 10*log2(1.1) = +1.4 dB.
+const ten_percent_louder: f32 = 1.1717;
+
+/// Both insect mixes 10% louder to the ear, asked for on 2026-10-30.
+pub const insect_clip_gain: f32 = ten_percent_louder;
+
+/// Both noise boxes (2 and 4) 10% louder to the ear, asked for on 2026-10-30.
+pub const noise_clip_gain: f32 = ten_percent_louder;
 
 /// The gate under the learned drone, from the bench's pick.
 pub const ramped_gate_ms: f32 = 400.0;
