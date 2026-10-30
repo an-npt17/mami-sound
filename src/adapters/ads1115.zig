@@ -1,9 +1,15 @@
 //! ADS1115 16-bit ADC over Linux i2c-dev.
 //!
-//! This is the low-level driver used by the real ECG probe adapter. The chip is
-//! put in continuous-conversion mode once, at open, and
-//! every later read is a two-byte fetch of the conversion register, so a read
-//! costs one I2C transaction and never waits on the chip.
+//! This is the low-level driver used by the real ECG probe adapter. Every
+//! reading is a single-shot conversion: the config write names the input and
+//! starts the conversion, the driver polls the status bit until the chip says
+//! it is done, and only then fetches the conversion register. A reading can
+//! therefore only ever come from the input that was asked for.
+//!
+//! This replaced continuous mode, where a mux switch leaves the *previous*
+//! input's result in the conversion register for one sample period. Anything
+//! that read inside that window filed probe A's value under probe BC, and the
+//! window was only guarded by the audio sink happening to block in between.
 //!
 //! Both directions are checked. A register read is one combined transaction so
 //! nothing can get between the pointer and the data, and a config write is read
@@ -80,6 +86,9 @@ pub const Error = error{
     /// chip is on an input, gain or rate nobody asked for and the driver has
     /// no way to know which.
     ConfigUnverified,
+    /// The status bit never reported a finished conversion within
+    /// `conversion_polls` polls.
+    ConversionTimeout,
 };
 
 /// Input multiplexer. The first four are differential pairs, the last four are
@@ -153,10 +162,6 @@ pub const Config = struct {
     rate: Rate = .sps_860,
 };
 
-/// The 16-bit config register value: continuous conversion, comparator off.
-///
-/// Bit 15 (OS) is a one-shot trigger that is ignored in continuous mode; it is
-/// set anyway so the same word also works if the mode bit is ever flipped.
 /// How many times a config write is retried before it is called a fault.
 ///
 /// A read-back can be corrupted as easily as a write on a marginal bus, so a
@@ -164,6 +169,17 @@ pub const Config = struct {
 /// unlikely to be luck and few enough that a genuinely broken bus is reported
 /// rather than retried forever.
 const config_attempts: u32 = 3;
+
+/// How many status polls a conversion gets before it is called a fault.
+///
+/// Each poll is a full I2C transaction (about 0.3 ms at 100 kHz, 75 us at
+/// 400 kHz), so the bus itself paces the loop. 64 polls is at least ~5 ms even
+/// on a fast bus, against a conversion of 1.16 ms at 860 SPS (+/-10% clock).
+const conversion_polls: u32 = 64;
+
+/// Bit 15 of the config register: written 1 it starts a single-shot
+/// conversion; read back it is 0 while converting and 1 once done.
+const status_bit: u16 = 0x8000;
 
 /// Whether a config register read back matches what was written.
 ///
@@ -173,15 +189,17 @@ const config_attempts: u32 = 3;
 /// that landed wrong files every later reading under the wrong probe, and does
 /// it silently.
 pub fn configMatches(seen: u16, written: u16) bool {
-    const status_bit: u16 = 0x8000;
     return (seen & ~status_bit) == (written & ~status_bit);
 }
 
+/// The 16-bit config register value: start a single-shot conversion,
+/// comparator off.
 pub fn configWord(cfg: Config) u16 {
-    return (@as(u16, 1) << 15) |
+    return status_bit |
         (@as(u16, @intFromEnum(cfg.mux)) << 12) |
         (@as(u16, @intFromEnum(cfg.gain)) << 9) |
-        // bit 8 = 0: continuous conversion.
+        // bit 8 = 1: single-shot, power down after each conversion.
+        (@as(u16, 1) << 8) |
         (@as(u16, @intFromEnum(cfg.rate)) << 5) |
         // bits 4..2 default, bits 1..0 = 11: comparator disabled.
         0b11;
@@ -196,15 +214,15 @@ pub const Ads1115 = struct {
     /// kernel says it cannot, and never set again: a bus that has no repeated
     /// START still works the old way, just less reliably.
     combined: bool,
-    /// What was last written to the config register, so a mux change can rewrite
-    /// it without the caller repeating the gain and rate.
+    /// What was last written to the config register, so a conversion on
+    /// another input can rewrite it without the caller repeating the gain and
+    /// rate.
     cfg: Config,
 
     /// Open the bus, claim the address and write the config register.
     ///
-    /// The first conversion is not ready for one sample period; a read before
-    /// then returns whatever the chip powered up with, which is harmless here
-    /// because the caller reads once per audio block forever after.
+    /// The write also starts one conversion nobody reads; that only proves the
+    /// chip takes the config before the engine depends on it.
     pub fn open(bus: [*:0]const u8, address: u16, cfg: Config) Error!Ads1115 {
         const rc = linux.open(bus, .{ .ACCMODE = .RDWR }, 0);
         if (linux.errno(rc) != .SUCCESS) return Error.OpenFailed;
@@ -226,28 +244,33 @@ pub const Ads1115 = struct {
         self.fd = -1;
     }
 
-    /// Point the multiplexer at another input.
+    /// One fresh conversion on `mux`, waited for and returned.
     ///
-    /// The chip has one converter, so reading two probes means switching
-    /// between them. Writing the config register restarts conversion on the new
-    /// input, and the conversion register holds the *old* input's last result
-    /// until that finishes — one sample period, 1.2 ms at 860 SPS. So this
-    /// returns immediately and never waits: it is the caller's business to read
-    /// far enough after the switch, which the probe adapter does by holding the
-    /// multiplexer still for a whole block, so the sink's blocking write falls
-    /// between the switch and the next read.
-    /// A failed switch leaves `cfg` describing the input the chip was already
-    /// on, because the write is only believed once the chip has agreed to it.
-    /// Before the read-back this cached the new mux first and the caller had to
-    /// put it back, which meant a write corrupted on the wire -- ACKed, so not
-    /// an error -- left the driver certain of an input the chip had left.
-    pub fn selectInput(self: *Ads1115, mux: Mux) Error!void {
-        if (self.cfg.mux == mux) return;
-
+    /// Blocks for one sample period (about 1.2 ms at 860 SPS) plus the bus
+    /// traffic. The config write is verified before the wait, so the mux the
+    /// result came from is known, not assumed. A failure at any step returns
+    /// an error and no number: the caller keeps its last good reading rather
+    /// than file a stale one under the wrong probe.
+    pub fn convert(self: *Ads1115, mux: Mux) Error!i16 {
         var next = self.cfg;
         next.mux = mux;
         try self.writeConfig(next);
         self.cfg = next;
+
+        try self.awaitConversion();
+        return self.readRaw();
+    }
+
+    /// Poll the status bit until the conversion just started has finished.
+    fn awaitConversion(self: *Ads1115) Error!void {
+        var poll: u32 = 0;
+        while (poll < conversion_polls) : (poll += 1) {
+            // A failed poll is a bus glitch, not a finished conversion; it
+            // spends one poll and the loop asks again.
+            const seen = self.readRegister(reg_config) catch continue;
+            if (seen & status_bit != 0) return;
+        }
+        return Error.ConversionTimeout;
     }
 
     /// Write the config register and read it back until the chip agrees.
@@ -301,8 +324,9 @@ pub const Ads1115 = struct {
     /// full scale, so the gain is a hardware setting and not a factor anything
     /// multiplies by.
     ///
-    /// Which input this reads is whatever `selectInput` last pointed at.
-    pub fn readRaw(self: *Ads1115) Error!i16 {
+    /// Only meaningful straight after `awaitConversion`; `convert` is the
+    /// public way in.
+    fn readRaw(self: *Ads1115) Error!i16 {
         return @bitCast(try self.readRegister(reg_conversion));
     }
 
@@ -377,6 +401,15 @@ test "a mux that came back wrong does not match" {
     const asked = configWord(.{ .mux = .ain0_ain1 });
     const got = configWord(.{ .mux = .ain2_ain3 });
     try std.testing.expect(!configMatches(got, asked));
+}
+
+test "the config word starts a single-shot conversion" {
+    const word = configWord(.{});
+    // OS set: start converting. MODE set: single-shot, not continuous.
+    try std.testing.expect(word & status_bit != 0);
+    try std.testing.expect(word & 0x0100 != 0);
+    // The default input is AIN0 against GND.
+    try std.testing.expectEqual(@as(u16, 0b100), (word >> 12) & 0b111);
 }
 
 test "a gain or rate that came back wrong does not match" {

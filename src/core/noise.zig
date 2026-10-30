@@ -7,9 +7,10 @@ const timbre = @import("timbre.zig");
 /// `freq_min` is where the drone sits with nobody in the room, so it has to be
 /// heard rather than merely felt: 20 Hz was under most speakers and the room
 /// read as switched off. 100 Hz is what the ../drone-playground bench was
-/// tuned at, and its three octaves to `freq_max` are the climb the room picked.
-pub const freq_min: f32 = 50.0;
-pub const freq_max: f32 = 500.0;
+/// tuned at. 650 is the top picked on the bench on 2026-10-29, listening to
+/// the climb with the wind gust riding it.
+pub const freq_min: f32 = 150.0;
+pub const freq_max: f32 = 400.0;
 
 /// Time constant of the pitch smoother. This *is* the slow-envelope extraction:
 /// deviation wiggles faster than this never reach the filter. Raise it to make
@@ -110,6 +111,30 @@ pub const default_touch_floor_ramped: f32 = 0.35;
 /// steady musical rate, and the gate fades to idle over the same time.
 pub const default_touch_fall_s: f32 = 3.0;
 
+/// How far a released ramp eases down over its fall, in semitones, when it
+/// settles rather than falling home.
+///
+/// A fall all the way to `freq_min` is three octaves going downhill, and the
+/// room hears the drone dropping rather than the plant letting go. Settled, a
+/// release is the climb slowing to a rest a little under where the hand left
+/// it: the level fades to idle and the pitch barely moves.
+pub const default_touch_settle_semis: f32 = 2.0;
+
+/// How far a hand coming back lifts the pitch, in semitones, before the climb
+/// carries on.
+///
+/// Carried on exactly, a hand returning near the top of a climb is heard as
+/// nothing: the climb is all but flat up there, and only the level swelling
+/// says the plant noticed. A lift a little bigger than the settle gives back
+/// what the release let go of and then some, so every touch is answered by
+/// the pitch going up.
+pub const default_retouch_boost_semis: f32 = 3.0;
+
+/// Time constant of the drift home once a settle is over. Long enough that
+/// nobody hears it as a fall, short enough that an empty room is back near
+/// the bottom within a couple of minutes and the next visitor gets a climb.
+pub const settle_home_s: f32 = 30.0;
+
 /// How far a ramped touch's pitch bends for each tenth of the probe's share,
 /// in semitones. Zero leaves the climb a clean line.
 ///
@@ -135,6 +160,21 @@ const wobble_base_s: f32 = 1.5;
 /// The furthest the wobble may take the pitch, in tenths of share. A share
 /// that leaps when a hand shifts is a gesture, not an octave.
 const wobble_swing_max: f32 = 2.0;
+
+/// The furthest a gust may take a ramped climb's pitch, in semitones. Gusts are
+/// texture on the rise, not a second melody: past a couple of semitones a gust
+/// down outweighs the climb under it and the rise is heard going backwards.
+pub const gust_max_semis: f32 = 2.0;
+
+/// How far the learned drone's climb gusts either way, in semitones. The
+/// bench's pick: the glide softens it to about two thirds of this as heard,
+/// enough that the rise is uneven like wind and still always a rise.
+pub const default_gust_semis: f32 = 0.65;
+
+/// The shortest and longest a gust takes to swell from one offset to the next.
+/// Uneven lengths are what keep it from being heard as a vibrato.
+const gust_min_s: f32 = 0.6;
+const gust_max_s: f32 = 1.8;
 
 /// How plant A's pitch answers a touch: how far up the range a touch reaches
 /// before the reading is consulted at all, how far up a deviation reaches from
@@ -164,15 +204,36 @@ pub const Shape = struct {
     /// it, and only while a share is offered.
     wobble_semis: f32 = 0.0,
     wobble_s: f32 = default_wobble_s,
+    /// How far a ramped climb drifts at random either way, in semitones, like
+    /// wind rising unevenly. Only a ramp gusts. Zero leaves the climb as it was.
+    gust_semis: f32 = 0.0,
     /// What the drone is made of. See timbre.zig.
     timbre: timbre.Kind = .band,
     gate_ms: f32 = default_gate_ms,
     /// How long a released ramp takes to fall home, and the gate with it.
     /// Null leaves the release to the smoother and the gate, as before.
     touch_fall_s: ?f32 = null,
+    /// Set to settle a released ramp this many semitones down over its fall,
+    /// and drift home slowly after, rather than fall all the way home. Null
+    /// falls home as before.
+    touch_settle_semis: ?f32 = null,
+    /// How far a hand coming back during a settle lifts the pitch before the
+    /// climb carries on, in semitones.
+    retouch_boost_semis: f32 = default_retouch_boost_semis,
     /// How loud the drone sits with nobody touching, against 1 when held.
     idle_gain: f32 = default_idle_gain,
+    /// The drone's level as a whole, before the clip. 1 is the level every
+    /// box was tuned at.
+    out_gain: f32 = 1.0,
 };
+
+/// Time constant of the follower behind the shaped gate.
+///
+/// The gate's curve rounds both ends of a fade, but a hand coming back while
+/// the drone is fading turns it round in the middle, where the curve is at its
+/// steepest -- a corner the room hears as a bump. This rounds that corner, and
+/// is short enough that nothing else about a fade changes.
+const gain_follow_s: f32 = 0.08;
 
 /// Filter damping, `1 / Q`. Lower is a narrower, more whistle-like band.
 const damping: f32 = 0.08;
@@ -246,6 +307,16 @@ pub const Noise = struct {
     /// Where the fall under way started, and how far into it the voice is.
     fall_from: f32,
     fall_samples: u64,
+    /// Semitones a release settles by, or null to fall home.
+    touch_settle_semis: ?f32,
+    retouch_boost_semis: f32,
+    alpha_home: f32,
+    /// Where a settling release has the pitch resting.
+    rest_fc: f32,
+    /// Where the ramp under way climbs from: the floor, or under a settle,
+    /// wherever the last release left the pitch if that is higher, so a touch
+    /// never swoops down before it climbs.
+    climb_from: f32,
     /// Deviation that reaches `freq_max`, or null to read the pitch off the
     /// probe's own position between its two ends.
     span: ?i16,
@@ -271,14 +342,30 @@ pub const Noise = struct {
     share: ?f32,
     share_fast: f32,
     share_slow: f32,
+    /// Semitones of random drift either way, and its own generator so turning
+    /// it on leaves the noise the drone is made of exactly as it was.
+    gust_semis: f32,
+    gust_prng: std.Random.DefaultPrng,
+    /// The gust under way: the offset it leaves, the one it swells to, how
+    /// long it takes and how far into it the climb is, in samples.
+    gust_from: f32,
+    gust_to: f32,
+    gust_len: u32,
+    gust_pos: u32,
+    /// The voice's level as a whole.
+    out_gain: f32,
 
     /// Smoothed centre frequency, in Hz.
     fc: f32,
     /// Chamberlin state-variable filter state.
     low: f32,
     band: f32,
-    /// Gate envelope, `idle_gain` when untouched and 1 when held.
+    /// Gate envelope, `idle_gain` when untouched and 1 when held. A straight
+    /// line between the two, which is what a fade's progress is read off.
     env: f32,
+    /// What is actually heard: `env` through an S-curve and a short follower.
+    gain: f32,
+    alpha_gain: f32,
     /// How far through the sweep a new touch is, from 0 at `freq_min` to 1 at
     /// the reading's pitch. Held at 1 once the sweep is over, which is what
     /// hands the pitch to the glide; put back to 0 on release, so the next
@@ -306,6 +393,11 @@ pub const Noise = struct {
             .touch_fall_s = if (shape.touch_rise_s != null) shape.touch_fall_s else null,
             .fall_from = freq_min,
             .fall_samples = 0,
+            .touch_settle_semis = shape.touch_settle_semis,
+            .retouch_boost_semis = shape.retouch_boost_semis,
+            .alpha_home = smoothingAlpha(settle_home_s, sample_rate),
+            .climb_from = freq_min,
+            .rest_fc = freq_min,
             .span = shape.span,
             .touch_floor = shape.touch_floor,
             .touch_rise_s = shape.touch_rise_s,
@@ -318,16 +410,46 @@ pub const Noise = struct {
             .share = null,
             .share_fast = 0.0,
             .share_slow = 0.0,
+            .gust_semis = std.math.clamp(shape.gust_semis, 0.0, gust_max_semis),
+            .gust_prng = std.Random.DefaultPrng.init(seed ^ 0x9e3779b97f4a7c15),
+            .gust_from = 0.0,
+            .gust_to = 0.0,
+            .gust_len = 0,
+            .gust_pos = 0,
+            .out_gain = shape.out_gain,
             .fc = freq_min,
             .low = 0.0,
             .band = 0.0,
             .env = shape.idle_gain,
+            .gain = shape.idle_gain,
+            .alpha_gain = smoothingAlpha(gain_follow_s, sample_rate),
             .burst = 0.0,
             .prev_touch = false,
             .timbre = shape.timbre,
             .warm = .init(sample_rate),
             .wide = .init(sample_rate),
         };
+    }
+
+    /// The gust's offset at this sample, in semitones, and one sample on.
+    ///
+    /// Each gust swells from where the last one left the pitch to a new
+    /// offset drawn at random, over an uneven length, along half a cosine: it
+    /// leaves and arrives with no slope, so the joins between gusts have no
+    /// corners in them and the climb under them stays a smooth line.
+    fn gustSemis(self: *Noise, sr: f32) f32 {
+        if (self.gust_pos >= self.gust_len) {
+            const rand = self.gust_prng.random();
+            self.gust_from = self.gust_to;
+            self.gust_to = (rand.float(f32) * 2.0 - 1.0) * self.gust_semis;
+            const seconds = gust_min_s + rand.float(f32) * (gust_max_s - gust_min_s);
+            self.gust_len = @intFromFloat(seconds * sr);
+            self.gust_pos = 0;
+        }
+        const x = @as(f32, @floatFromInt(self.gust_pos)) / @as(f32, @floatFromInt(self.gust_len));
+        const eased = 0.5 - 0.5 * @cos(std.math.pi * x);
+        self.gust_pos += 1;
+        return self.gust_from + (self.gust_to - self.gust_from) * eased;
     }
 
     /// Add this voice's output into `out`. Never overwrites, so voices mix by
@@ -364,12 +486,46 @@ pub const Noise = struct {
             // to make and dropping the pitch to the bottom first would put a
             // swoop in front of every hand. The glide carries it to the floor.
             if (!ramping) self.fc = freq_min;
+            const floor_fc = freq_min * std.math.pow(
+                f32,
+                freq_max / freq_min,
+                std.math.clamp(self.touch_floor, 0.0, 1.0),
+            );
+            self.climb_from = floor_fc;
+            // Under a settle, a hand coming back is the same gesture carrying
+            // on, not a new one: the climb is picked up at the point on it
+            // where the pitch now sits, at the speed it had there, rather
+            // than a fresh four-second rise from wherever the fall had got to,
+            // which made a hand coming back sound like a different touch.
+            //
+            // Picked up a little ahead of the pitch rather than at it, so the
+            // hand is answered by a lift the glide carries the pitch up, and
+            // the climb goes on from the top of that.
+            if (ramping and self.touch_settle_semis != null and self.fc > floor_fc) {
+                const lifted = @min(
+                    freq_max,
+                    self.fc * std.math.pow(f32, 2.0, self.retouch_boost_semis / 12.0),
+                );
+                const reached = if (self.touch_climb_semis) |semis|
+                    12.0 * std.math.log2(lifted / floor_fc) / @max(semis, 0.001)
+                else
+                    @log(lifted / floor_fc) / @log(freq_max / floor_fc);
+                // The climb is eased out, `1 - (1 - x)^2`; this is its inverse.
+                const linear = 1.0 - @sqrt(1.0 - std.math.clamp(reached, 0.0, 1.0));
+                self.touch_samples = @intFromFloat(linear * self.touch_rise_s.? * sr);
+            }
             // The share leaps when a hand arrives. Starting both smoothers
             // there keeps that leap from playing as a lurch at every touch.
             if (self.share) |share| {
                 self.share_fast = share;
                 self.share_slow = share;
             }
+            // Every touch's wind starts still and picks up from there, so the
+            // first thing heard is the climb and not a lurch to some offset.
+            self.gust_from = 0.0;
+            self.gust_to = 0.0;
+            self.gust_len = 0;
+            self.gust_pos = 0;
         } else if (!touched) {
             // A hand just gone: the fall starts from wherever the pitch is.
             if (self.prev_touch) {
@@ -405,15 +561,15 @@ pub const Noise = struct {
                 // the top rather than hitting it. A straight line turned a
                 // corner at both ends, which the room heard as steps.
                 const t = 1.0 - (1.0 - linear) * (1.0 - linear);
-                const reach = std.math.clamp(self.touch_floor, 0.0, 1.0);
+                const start = self.climb_from;
                 if (self.touch_climb_semis) |semis| {
                     // A set number of semitones up from the floor, still never
                     // past the top of the range.
-                    const start = freq_min * std.math.pow(f32, freq_max / freq_min, reach);
                     target_fc = @min(freq_max, start * std.math.pow(f32, 2.0, semis * t / 12.0));
                 } else {
-                    target_fc = freq_min *
-                        std.math.pow(f32, freq_max / freq_min, reach + (1.0 - reach) * t);
+                    // The same line in the log domain as the floor-to-top
+                    // climb always was, only from wherever the touch starts.
+                    target_fc = start * std.math.pow(f32, freq_max / start, t);
                 }
                 self.touch_samples += 1;
 
@@ -429,15 +585,36 @@ pub const Noise = struct {
                         target_fc *= std.math.pow(f32, 2.0, self.wobble_semis * swing / 12.0);
                     }
                 }
+
+                if (self.gust_semis > 0.0) {
+                    target_fc = @min(freq_max, target_fc * std.math.pow(f32, 2.0, self.gustSemis(sr) / 12.0));
+                }
             }
 
             if (falling) {
                 const fall = self.touch_fall_s.?;
                 const age = @as(f32, @floatFromInt(self.fall_samples)) / sr;
                 const t = if (fall > 0.0) std.math.clamp(age / fall, 0.0, 1.0) else 1.0;
-                // Down in the log domain, at a steady musical rate, for the
-                // same reason the climb goes up in it.
-                target_fc = self.fall_from * std.math.pow(f32, freq_min / self.fall_from, t);
+                if (self.touch_settle_semis) |semis| {
+                    // Eased out like the climb: it leaves at its quickest and
+                    // comes to rest, which is heard as slowing, not dropping.
+                    if (t < 1.0) {
+                        const eased = 1.0 - (1.0 - t) * (1.0 - t);
+                        self.rest_fc = @max(
+                            freq_min,
+                            self.fall_from * std.math.pow(f32, 2.0, -semis * eased / 12.0),
+                        );
+                    } else {
+                        // Rested: from there the pitch is only drifted home,
+                        // far too slowly to hear as a fall.
+                        self.rest_fc += (freq_min - self.rest_fc) * self.alpha_home;
+                    }
+                    target_fc = self.rest_fc;
+                } else {
+                    // Down in the log domain, at a steady musical rate, for the
+                    // same reason the climb goes up in it.
+                    target_fc = self.fall_from * std.math.pow(f32, freq_min / self.fall_from, t);
+                }
                 self.fall_samples += 1;
             }
 
@@ -474,7 +651,16 @@ pub const Noise = struct {
                 self.env = @max(gate_target, self.env - self.gate_step_down);
             }
 
-            const value = source * self.env * voice_gain;
+            // Raised cosine between idle and full, so a fade leaves and arrives
+            // gently instead of turning a corner at both ends.
+            const width = 1.0 - self.idle_gain;
+            const shaped = if (width > 0.0) blk: {
+                const u = std.math.clamp((self.env - self.idle_gain) / width, 0.0, 1.0);
+                break :blk self.idle_gain + width * (0.5 - 0.5 * @cos(std.math.pi * u));
+            } else self.env;
+            self.gain += (shaped - self.gain) * self.alpha_gain;
+
+            const value = source * self.gain * voice_gain * self.out_gain;
             // The warm voice is matched to the band's loudness with gain to
             // spare, so it saturates softly rather than squaring off.
             sample.* += switch (self.timbre) {
@@ -827,6 +1013,65 @@ test "a voice offered no share climbs straight whatever the wobble" {
     try std.testing.expectApproxEqAbs(plain.fc, voice.fc, 0.001);
 }
 
+/// Plays a ramped voice through a still hold with the given gust, and returns
+/// the pitch at the end of each tenth of a second.
+fn gustedHold(semis: f32) [40]f32 {
+    var voice: Noise = .init(44100, 1, .{
+        .span = 3000,
+        .touch_floor = 0.35,
+        .touch_rise_s = 4.0,
+        .glide_s = 0.15,
+        .gust_semis = semis,
+    });
+    var pitches: [40]f32 = undefined;
+    var block: [441]f32 = undefined;
+    for (0..40) |step| {
+        for (0..10) |_| {
+            @memset(&block, 0);
+            voice.render(&block, 0, null, true);
+        }
+        pitches[step] = voice.fc;
+    }
+    return pitches;
+}
+
+test "a gust bends the climb, but only a little" {
+    const straight = gustedHold(0.0);
+    const gusty = gustedHold(0.65);
+    var widest: f32 = 0.0;
+    for (straight, gusty) |a, b| widest = @max(widest, @abs(@log2(b / a)) * 12.0);
+    try std.testing.expect(widest > 0.05);
+    try std.testing.expect(widest <= 0.65 + 0.01);
+}
+
+test "the gusty climb still climbs" {
+    const gusty = gustedHold(0.65);
+    for (1..4) |second| {
+        try std.testing.expect(gusty[second * 10 + 9] > gusty[second * 10 - 1]);
+    }
+}
+
+test "no gust asked for leaves the climb exactly as it was" {
+    const plain = gustedHold(0.0);
+    const unbent = wobbledHold(0.0, false);
+    for (plain, unbent) |a, b| try std.testing.expectEqual(a, b);
+}
+
+test "a gust is never more than the cap, whatever is asked" {
+    const voice: Noise = .init(44100, 1, .{ .touch_rise_s = 4.0, .gust_semis = 10.0 });
+    try std.testing.expectEqual(gust_max_semis, voice.gust_semis);
+}
+
+test "the out gain scales the drone and nothing else" {
+    var loud: Noise = .init(44100, 1, .{});
+    var quiet: Noise = .init(44100, 1, .{ .out_gain = 0.5 });
+    var a = [_]f32{0} ** 4410;
+    var b = [_]f32{0} ** 4410;
+    loud.render(&a, 0, null, false);
+    quiet.render(&b, 0, null, false);
+    for (a, b) |x, y| try std.testing.expectApproxEqAbs(x * 0.5, y, 1e-6);
+}
+
 test "a climb given in semitones stops there and not at the top" {
     // The room heard a climb to freq_max as a siren. Told seven semitones, a
     // held touch ends a fifth above where it started, however long the hold.
@@ -910,4 +1155,86 @@ test "a fall is only a ramp's: a voice reading its pitch releases as before" {
 test "the idle level is the shape's to set" {
     const voice: Noise = .init(44100, 1, .{ .idle_gain = 0.12 });
     try std.testing.expectApproxEqAbs(@as(f32, 0.12), voice.env, 0.0001);
+}
+
+fn settlingVoice() Noise {
+    var shape: Shape = .{
+        .span = 3000,
+        .touch_floor = 0.35,
+        .touch_rise_s = 4.0,
+        .glide_s = 0.15,
+        .touch_fall_s = 3.0,
+    };
+    shape.touch_settle_semis = 2.0;
+    return .init(44100, 1, shape);
+}
+
+test "a settling release eases a little way down and rests, not downhill" {
+    var voice = settlingVoice();
+    renderBlocks(&voice, 50, 0, true);
+    const top = voice.fc;
+    try std.testing.expect(top > 0.9 * freq_max);
+
+    // Well past the fall: two semitones under where the hand left it, and
+    // nowhere near the bottom of the range.
+    renderBlocks(&voice, 40, 0, false);
+    const rested = top * std.math.pow(f32, 2.0, -2.0 / 12.0);
+    try std.testing.expectApproxEqRel(rested, voice.fc, 0.03);
+    try std.testing.expect(voice.fc > 4.0 * freq_min);
+}
+
+test "a settled drone drifts home slowly, and the next touch climbs without a swoop" {
+    var voice = settlingVoice();
+    renderBlocks(&voice, 50, 0, true);
+    renderBlocks(&voice, 40, 0, false);
+    const rested = voice.fc;
+
+    // A touch now starts its climb where the pitch is resting: never lower.
+    var lowest = voice.fc;
+    for (0..10) |_| {
+        renderBlocks(&voice, 1, 0, true);
+        lowest = @min(lowest, voice.fc);
+    }
+    try std.testing.expect(lowest > 0.98 * rested);
+
+    // Left alone for minutes it is back near the bottom of the range.
+    renderBlocks(&voice, 40, 0, false);
+    renderBlocks(&voice, 3000, 0, false);
+    try std.testing.expect(voice.fc < 1.3 * freq_min);
+}
+
+test "a hand back during the fall carries the climb on rather than starting it again" {
+    var voice = settlingVoice();
+    // Two seconds up a four-second climb, then let go for a second.
+    renderBlocks(&voice, 20, 0, true);
+    renderBlocks(&voice, 10, 0, false);
+    const before = voice.fc;
+
+    // Back on: never a dip, and a lift the room can hear inside half a
+    // second -- more than the settle gave away -- that the glide carries
+    // rather than a step.
+    var lowest = voice.fc;
+    for (0..5) |_| {
+        renderBlocks(&voice, 1, 0, true);
+        lowest = @min(lowest, voice.fc);
+    }
+    try std.testing.expect(lowest > 0.99 * before);
+    const lift = 12.0 * std.math.log2(voice.fc / before);
+    try std.testing.expect(lift > 2.0);
+    try std.testing.expect(lift < 5.0);
+
+    // And it is the same gesture: it reaches the top well inside a fresh rise.
+    renderBlocks(&voice, 25, 0, true);
+    try std.testing.expect(voice.fc > 0.95 * freq_max);
+}
+
+test "the gate's fade leaves and arrives gently" {
+    var voice = fallingVoice();
+    renderBlocks(&voice, 50, 0, true);
+    // A tenth of the way into the fall the line has gone a tenth of the way,
+    // and what is heard has barely started to move.
+    renderBlocks(&voice, 3, 0, false);
+    const line = 1.0 - voice.env;
+    const heard = 1.0 - voice.gain;
+    try std.testing.expect(heard < 0.5 * line);
 }

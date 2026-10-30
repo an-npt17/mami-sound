@@ -86,14 +86,15 @@ pub fn main(init: std.process.Init) !void {
                 .{},
             ),
             error.InvalidStillThreshold => std.debug.print(
-                "--still-range, --still-release and --still-window take a number " ++
+                "--still-range, --still-release, --still-window and --edge-b take a number " ++
                     "above zero.\n--plant-a-band and --plant-b-band take LO:HI in counts, low end " ++
                     "first, both ends given.\n\n",
                 .{},
             ),
             error.InvalidBandShare => std.debug.print(
-                "--band-share takes a fraction above zero and at most one, and " ++
-                    "--band-release one from zero to one.\n\n",
+                "--band-share and --band-share-b take a fraction above zero and at " ++
+                    "most one, and --band-release and --band-release-b one from zero " ++
+                    "to one.\n\n",
                 .{},
             ),
             error.InvalidMode => std.debug.print(
@@ -105,6 +106,11 @@ pub fn main(init: std.process.Init) !void {
                 .{},
             ),
             error.InvalidTouchFall => std.debug.print("--touch-fall takes a number of seconds above zero.\n\n", .{}),
+            error.InvalidTouchGust => std.debug.print(
+                "--touch-gust takes a number of semitones from zero to {d}.\n\n",
+                .{core.noise.gust_max_semis},
+            ),
+            error.InvalidDroneGain => std.debug.print("--drone-gain takes a level in dB from -40 to 6.\n\n", .{}),
             error.InvalidDroneIdle => std.debug.print("--drone-idle takes a fraction from zero to one.\n\n", .{}),
             error.InvalidTimbre => std.debug.print(
                 "--drone-timbre takes a timbre: {s}.\n\n",
@@ -198,6 +204,8 @@ fn runComposition(
         .touch_floor = opts.touch_floor,
         .touch_rise_s = opts.touch_rise_s,
         .wobble_semis = opts.touch_wobble,
+        .gust_semis = opts.touch_gust,
+        .drone_gain_db = opts.drone_gain,
         .touch_climb_semis = opts.touch_climb,
         .timbre = opts.timbre,
         .touch_fall_s = opts.touch_fall,
@@ -256,6 +264,7 @@ fn runComposition(
         }
 
         streams[plant] = try clip_stream.Adapter.init(io, gpa, pools[plant].paths, limit);
+        if (chosen == .piano) streams[plant].gain *= production_config.piano_clip_gain;
         stream_live[plant] = true;
 
         // Before `start`, and never fatal. The heads are what make a touch
@@ -336,6 +345,10 @@ fn runComposition(
             .still_window_ms = opts.still_window_ms,
             .band_share = opts.band_share,
             .band_release = opts.band_release,
+            .band_share_bc = opts.band_share_bc,
+            .band_release_bc = opts.band_release_bc,
+            .edge_bc = opts.edge_bc,
+            .edge = opts.edge_a,
             .plant_band = opts.plant_band,
             .plant_window = opts.plant_window,
             .counts = opts.counts,

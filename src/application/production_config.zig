@@ -87,6 +87,13 @@ pub const Overrides = struct {
     band_share: ?f32 = null,
     /// The share at or below which the touch is over, under `learned`.
     band_release: ?f32 = null,
+    /// Probe BC's own share and release. Unset, BC takes A's.
+    band_share_bc: ?f32 = null,
+    band_release_bc: ?f32 = null,
+    /// Probe BC's lines at a fixed distance from rest, under `learned`.
+    edge_bc: ?i16 = null,
+    /// Probe A's lines at a fixed distance from rest, under `learned`.
+    edge: ?i16 = null,
     /// Where a held probe sits, per plant. The two probes do not sit at the
     /// same place: on this rig a hand puts one near six hundred and sixty and
     /// the other near twenty-five thousand.
@@ -107,6 +114,12 @@ pub const Overrides = struct {
     /// Semitones the climb bends per tenth of the probe's share. Zero is a
     /// straight climb; unset leaves the model's own choice.
     wobble_semis: ?f32 = null,
+    /// Semitones the climb drifts at random either way. Unset leaves the
+    /// model's own choice.
+    gust_semis: ?f32 = null,
+    /// The drone's level in dB against the level the boxes were tuned at.
+    /// Unset leaves the model's own choice.
+    drone_gain_db: ?f32 = null,
     /// What the drone is made of. Unset leaves the model's own choice.
     timbre: ?core.timbre.Kind = null,
     /// How long a released climb takes to fall home, and how loud the drone
@@ -143,6 +156,32 @@ pub fn touchWith(
     var cfg = base;
     if (overrides.model) |chosen| cfg.model = chosen;
 
+    // Under `learned`, probe BC's line is drawn halfway to the deepest dip it
+    // has seen, and on this rig that is ground: a line near thirteen thousand.
+    // A hand on BC does not hold it down there -- it scatters it, 1158, 9421,
+    // 17862, back to the rail a third of the time -- so only a fifth to a
+    // third of a touch's window is past that line and it never latches. The
+    // probe sits steady over 26k untouched, so the question that works is
+    // whether it has left the rail at all: a line a thousand under rest, which
+    // nothing untouched crosses and a touch is past 0.5 to 0.8 of the time.
+    // Measured on the 2026-10-29 capture. The command line still wins.
+    //
+    // Probe A asks the same question for the same reason, deeper: untouched
+    // it wanders from about 22k to 25.7k, and a hand drags it well down,
+    // mostly under 15k and as far as nought. A line five thousand under rest
+    // is clear of the wander by sixteen hundred, and every touch on that
+    // capture spent most of its window past it. Rest is the model's own
+    // rolling median, so a probe that settles somewhere new takes its line
+    // with it rather than sounding until somebody restarts the box.
+    if (cfg.model == .learned) {
+        if (cfg.edge == null) cfg.edge = learned_edge_a;
+        cfg.band_share = learned_band_share_a;
+        cfg.band_release = learned_band_release_a;
+        if (cfg.edge_bc == null) cfg.edge_bc = learned_edge_bc;
+        if (cfg.band_share_bc == null) cfg.band_share_bc = learned_band_share_bc;
+        if (cfg.band_release_bc == null) cfg.band_release_bc = learned_band_release_bc;
+    }
+
     cfg.hold = modes[0] == .hold;
     cfg.hold_bc = modes[1] == .hold;
     cfg.window_ms = if (modes[0] == .tap) tap_window_ms else null;
@@ -153,6 +192,10 @@ pub fn touchWith(
     if (overrides.still_window_ms) |ms| cfg.still_window_ms = ms;
     if (overrides.band_share) |fraction| cfg.band_share = fraction;
     if (overrides.band_release) |fraction| cfg.band_release = fraction;
+    if (overrides.band_share_bc) |fraction| cfg.band_share_bc = fraction;
+    if (overrides.band_release_bc) |fraction| cfg.band_release_bc = fraction;
+    if (overrides.edge_bc) |counts| cfg.edge_bc = counts;
+    if (overrides.edge) |counts| cfg.edge = counts;
     if (overrides.plant_band[0]) |band| {
         cfg.touch_band_lo = band[0];
         cfg.touch_band_hi = band[1];
@@ -175,6 +218,18 @@ pub fn touchWith(
     if (overrides.counts_bc) |floor| cfg.counts_bc = if (floor == 0) null else floor;
     return cfg;
 }
+
+/// Probe A's line under `learned`, in counts under rest, and the share of the
+/// window past it that starts and ends a touch. See `touchWith`.
+pub const learned_edge_a: i16 = 5000;
+pub const learned_band_share_a: f32 = 0.5;
+pub const learned_band_release_a: f32 = 0.25;
+
+/// Probe BC's line under `learned`, in counts under rest, and the share of the
+/// window past it that starts and ends a touch. See `touchWith`.
+pub const learned_edge_bc: i16 = 1000;
+pub const learned_band_share_bc: f32 = 0.4;
+pub const learned_band_release_bc: f32 = 0.2;
 
 pub const seed: u64 = 0xC0FFEE;
 
@@ -225,22 +280,32 @@ pub fn droneWith(
         // Starting a ramp at the bottom of the range spends its first second
         // inaudible, which on a four-second climb is a quarter of the gesture.
         if (shape.touch_floor == 0.0) shape.touch_floor = core.noise.default_touch_floor_ramped;
-        // The share is the one thing this rig's probe gives by degree, and
-        // only this model counts it, so only this model bends on it.
-        shape.wobble_semis = core.noise.default_wobble_semis;
-        // The narrow band the room has always known: the wide one was too much
-        // hiss. The gate is slow enough that a touch swells in rather than
-        // switching on. The climb goes all the way to the top.
+        // The ../drone-playground pick of 2026-10-29, "Current + wind gust":
+        // the narrow band the room knows, its climb made uneven by the gust
+        // below rather than by the plant. The probe only says touched -- the
+        // share's wobble is left off, so nothing about the reading reaches
+        // the pitch; `--touch-wobble` brings it back. The gate is slow enough
+        // that a touch swells in rather than switching on.
+        shape.timbre = .band;
         shape.gate_ms = ramped_gate_ms;
-        // Down as it went up: a slide home over seconds, the level fading with
-        // it, rather than the glide dropping it off a cliff.
+        // Let go, the climb slows to a rest a little under where it was, the
+        // level fading with it, rather than sliding three octaves downhill.
         shape.touch_fall_s = core.noise.default_touch_fall_s;
+        shape.touch_settle_semis = core.noise.default_touch_settle_semis;
+        // The bench's 2026-10-29 pick: small random swells along the climb,
+        // so it rises like wind rather than a line, and the drone a little
+        // quieter than the level the other models were tuned at.
+        shape.gust_semis = core.noise.default_gust_semis;
+        shape.out_gain = learned_out_gain;
     }
+    shape.out_gain *= drone_lift_gain;
     if (overrides.touch_climb_semis) |semis| shape.touch_climb_semis = semis;
     if (overrides.timbre) |kind| shape.timbre = kind;
     if (overrides.touch_fall_s) |seconds| shape.touch_fall_s = seconds;
     if (overrides.idle_gain) |gain| shape.idle_gain = gain;
     if (overrides.wobble_semis) |semis| shape.wobble_semis = semis;
+    if (overrides.gust_semis) |semis| shape.gust_semis = semis;
+    if (overrides.drone_gain_db) |db| shape.out_gain = std.math.pow(f32, 10.0, db / 20.0);
     if (overrides.touch_floor) |fraction| shape.touch_floor = fraction;
     if (overrides.touch_rise_s) |seconds| shape.touch_rise_s = seconds;
     // A ramped touch skips the burst and reaches its floor through the glide
@@ -256,6 +321,19 @@ pub fn droneWith(
 /// bottom as soon as it is called, long enough that the jump to the floor is a
 /// swell into the climb rather than a step: at 0.15 s the room heard the jump.
 pub const ramped_glide_s: f32 = 0.4;
+
+/// The learned drone's level against the others: 8 dB down. The bench's pick
+/// was 5; with the piano on plant B answering again the drone sat too far
+/// forward, so it went down another 3. `--drone-gain` tries others.
+pub const learned_out_gain: f32 = 0.3981;
+
+/// The drone lifted 2 dB under every model, asked for in the room on
+/// 2026-10-29.
+pub const drone_lift_gain: f32 = 1.2589;
+
+/// How loud the piano stems sit against the other clips: 2 dB up, asked for
+/// in the room on 2026-10-29.
+pub const piano_clip_gain: f32 = 1.2589;
 
 /// The gate under the learned drone, from the bench's pick.
 pub const ramped_gate_ms: f32 = 400.0;
@@ -283,12 +361,15 @@ test "the learned drone falls home slowly and idles as the band always has" {
     try std.testing.expectEqual(core.noise.default_idle_gain, plain.idle_gain);
 }
 
-test "the learned drone climbs to the top, in the narrow band the room knows" {
+test "the learned drone climbs to the top in the band voice, and settles when let go" {
     const ramped = droneWith(drone, .{}, .learned);
     try std.testing.expect(ramped.touch_climb_semis == null);
     try std.testing.expectEqual(core.timbre.Kind.band, ramped.timbre);
-    // The room can ask for any voice on any model.
     try std.testing.expectEqual(core.timbre.Kind.warm, droneWith(drone, .{ .timbre = .warm }, .learned).timbre);
+    try std.testing.expectEqual(core.noise.default_touch_settle_semis, ramped.touch_settle_semis.?);
+    try std.testing.expect(droneWith(drone, .{}, .deviation).touch_settle_semis == null);
+    // The room can ask for any voice on any model.
+    try std.testing.expectEqual(core.timbre.Kind.band, droneWith(drone, .{ .timbre = .band }, .learned).timbre);
     try std.testing.expectEqual(core.timbre.Kind.wide, droneWith(drone, .{ .timbre = .wide }, .deviation).timbre);
     try std.testing.expectEqual(ramped_gate_ms, ramped.gate_ms);
     // The models that read their pitch off the probe keep the voice they
@@ -299,14 +380,50 @@ test "the learned drone climbs to the top, in the narrow band the room knows" {
     try std.testing.expect(droneWith(drone, .{}, .deviation).touch_climb_semis == null);
 }
 
-test "the learned drone bends with the plant, and the others stay straight" {
-    try std.testing.expect(droneWith(drone, .{}, .learned).wobble_semis > 0.0);
-    for ([_]core.touch.Model{ .deviation, .steady }) |model| {
+test "no drone bends with the plant unless asked" {
+    // The learned drone's pitch is the hold and the gust, never the reading.
+    for ([_]core.touch.Model{ .deviation, .steady, .learned }) |model| {
         try std.testing.expectEqual(@as(f32, 0.0), droneWith(drone, .{}, model).wobble_semis);
     }
-    // The room can still ask for a straight climb, or a wider bend.
+    // The room can still ask for the plant's bend.
     try std.testing.expectEqual(@as(f32, 0.0), droneWith(drone, .{ .wobble_semis = 0.0 }, .learned).wobble_semis);
     try std.testing.expectEqual(@as(f32, 2.5), droneWith(drone, .{ .wobble_semis = 2.5 }, .learned).wobble_semis);
+}
+
+test "the learned drone gusts and sits a little lower, and the others do neither" {
+    const ramped = droneWith(drone, .{}, .learned);
+    try std.testing.expectEqual(core.noise.default_gust_semis, ramped.gust_semis);
+    try std.testing.expectEqual(learned_out_gain * drone_lift_gain, ramped.out_gain);
+    for ([_]core.touch.Model{ .deviation, .steady }) |model| {
+        const plain = droneWith(drone, .{}, model);
+        try std.testing.expectEqual(@as(f32, 0.0), plain.gust_semis);
+        try std.testing.expectEqual(drone_lift_gain, plain.out_gain);
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), droneWith(drone, .{ .gust_semis = 0.0 }, .learned).gust_semis);
+    try std.testing.expectEqual(@as(f32, 1.2), droneWith(drone, .{ .gust_semis = 1.2 }, .learned).gust_semis);
+    // The room can set the level on any model, in dB.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), droneWith(drone, .{ .drone_gain_db = -6.0206 }, .learned).out_gain, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), droneWith(drone, .{ .drone_gain_db = 0.0 }, .deviation).out_gain, 0.0001);
+}
+
+test "under learned, plant B asks whether its probe has left the rail" {
+    const learned = touchWith(touch, .{ .model = .learned }, .{ .trigger, .trigger });
+    try std.testing.expectEqual(@as(?i16, learned_edge_bc), learned.edge_bc);
+    try std.testing.expectEqual(@as(?f32, learned_band_share_bc), learned.band_share_bc);
+    try std.testing.expectEqual(@as(?f32, learned_band_release_bc), learned.band_release_bc);
+    // Plant A gets its own, deeper line and shares.
+    try std.testing.expectEqual(@as(?i16, learned_edge_a), learned.edge);
+    try std.testing.expectEqual(learned_band_share_a, learned.band_share);
+    try std.testing.expectEqual(learned_band_release_a, learned.band_release);
+    // The command line still wins.
+    const said = touchWith(touch, .{ .model = .learned, .edge_bc = 600, .band_share_bc = 0.25, .band_share = 0.7 }, .{ .trigger, .trigger });
+    try std.testing.expectEqual(@as(?i16, 600), said.edge_bc);
+    try std.testing.expectEqual(@as(?f32, 0.25), said.band_share_bc);
+    try std.testing.expectEqual(@as(f32, 0.7), said.band_share);
+    // The other models never read these.
+    const plain = touchWith(touch, .{ .model = .deviation }, .{ .trigger, .trigger });
+    try std.testing.expect(plain.edge_bc == null);
+    try std.testing.expect(plain.edge == null);
 }
 
 test "a ramped drone does not stack the slow glide on the rise" {

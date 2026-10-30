@@ -19,6 +19,9 @@ pub const Adapter = struct {
     /// How much of a clip one touch plays. Spent per clip: each decode takes a
     /// fresh copy, so this one is only ever the template.
     limit: core.clips.Limit,
+    /// How loud this pool's clips sit. `voice_gain` unless the caller lifts
+    /// one source against the others.
+    gain: f32,
     /// The opening of every clip, decoded up front. Written by `primeHeads`
     /// before the worker exists and read-only from then on, which is what lets
     /// both the audio thread and the worker hold it without a lock.
@@ -50,6 +53,7 @@ pub const Adapter = struct {
             .paths = paths,
             .ring = try clip_ring.Ring.init(gpa),
             .limit = limit,
+            .gain = voice_gain,
             .heads = .none,
             .head = &.{},
             .head_cursor = 0,
@@ -151,13 +155,13 @@ pub const Adapter = struct {
         if (self.head_cursor < self.head.len) {
             const count = @min(out.len, self.head.len - self.head_cursor);
             for (out[0..count], self.head[self.head_cursor..][0..count]) |*sample, head| {
-                sample.* += head * voice_gain;
+                sample.* += head * self.gain;
             }
             self.head_cursor += count;
             offset = count;
         }
 
-        _ = self.ring.mix(out[offset..], generation);
+        _ = self.ring.mix(out[offset..], generation, self.gain);
     }
 
     fn workerMain(self: *Adapter) void {

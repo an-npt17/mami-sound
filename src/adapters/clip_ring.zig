@@ -90,14 +90,14 @@ pub const Ring = struct {
         return count;
     }
 
-    pub fn mix(self: *Ring, output: []f32, generation: u64) usize {
+    pub fn mix(self: *Ring, output: []f32, generation: u64, gain: f32) usize {
         const read = self.read_index.load(.acquire);
         const write = self.write_index.load(.acquire);
         const count = @min(output.len, write - read);
         for (output[0..count], 0..) |*sample, i| {
             const index = (read + i) % self.samples.len;
             if (self.tags[index] == generation) {
-                sample.* += self.samples[index] * voice_gain;
+                sample.* += self.samples[index] * gain;
             }
         }
         self.read_index.store(read + count, .release);
@@ -128,7 +128,7 @@ test "ring mixing preserves audio already in the engine block" {
     var input = [_]f32{ 1.0, 2.0 };
     var output = [_]f32{ 10.0, 20.0, 30.0 };
     _ = ring.push(&input, 1);
-    try std.testing.expectEqual(@as(usize, 2), ring.mix(&output, 1));
+    try std.testing.expectEqual(@as(usize, 2), ring.mix(&output, 1, voice_gain));
     try std.testing.expectApproxEqAbs(@as(f32, 10.4), output[0], 0.000001);
     try std.testing.expectApproxEqAbs(@as(f32, 20.8), output[1], 0.000001);
     try std.testing.expectEqual(@as(f32, 30.0), output[2]);

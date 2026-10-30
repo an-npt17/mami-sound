@@ -568,6 +568,26 @@ pub const Config = struct {
     touch_band_hi_bc: ?i16 = null,
     band_share: f32 = default_band_share,
     band_release: f32 = default_band_release,
+    /// Probe BC's own share and release. `null` puts it on A's.
+    ///
+    /// The two probes are not past their lines for the same share of a touch.
+    /// On the rig this was added for, a light hand on BC only knocks it off
+    /// the rail about one poll in five -- a share of 0.15 to 0.2, against
+    /// nought untouched -- while A, untouched, already drops past its line
+    /// more than a third of the time. One number cannot sit between both.
+    band_share_bc: ?f32 = null,
+    band_release_bc: ?f32 = null,
+    /// How far from rest the lines sit, fixed rather than learned. `null`
+    /// learns them halfway to where hands take the probe. `learned` only.
+    ///
+    /// Halfway is the wrong place for a probe resting on a rail. Untouched, it
+    /// throws an odd single reading anywhere down the range -- mains hum on an
+    /// unbuffered input -- and a hand barely moves the share past a line that
+    /// deep: on the room's capture, 3% untouched against 23% touched. A line
+    /// just under the rail asks whether the probe is off it at all, and that
+    /// splits the same capture 7% against 54 to 87%.
+    edge: ?i16 = null,
+    edge_bc: ?i16 = null,
     /// Probe BC's own thresholds. `null` puts it on A's.
     ///
     /// The two probes are not equally clean and do not have to be judged
@@ -639,6 +659,12 @@ pub const Config = struct {
         bc.still_range = self.still_range_bc orelse self.still_range;
         bc.still_release = self.still_release_bc orelse self.still_release;
         bc.still_move = self.still_move_bc orelse self.still_move;
+        bc.band_share = self.band_share_bc orelse self.band_share;
+        bc.band_release = self.band_release_bc orelse self.band_release;
+        bc.band_share_bc = null;
+        bc.band_release_bc = null;
+        bc.edge = self.edge_bc orelse self.edge;
+        bc.edge_bc = null;
         if (self.touch_band_lo_bc) |lo| bc.touch_band_lo = lo;
         if (self.touch_band_hi_bc) |hi| bc.touch_band_hi = hi;
         bc.touch_band_lo_bc = null;
@@ -760,6 +786,19 @@ pub const Detector = struct {
     band_share: f32,
     /// The share at or below which the touch is over. `learned` only.
     band_release: f32,
+    /// How far out from rest each line was last drawn, kept once a hand has
+    /// shown where it goes. `learned` only.
+    ///
+    /// The far level is a percentile of the last five minutes, and a quiet
+    /// room lets it slide back to rest: a few minutes untouched and the lines
+    /// were gone, the stand-in a hundred counts out took over, and a probe's
+    /// own small dips off the rail were past it -- clip after clip with nobody
+    /// there. Where a hand goes does not change because nobody is touching.
+    reach_up: ?i16,
+    reach_down: ?i16,
+    /// The fixed distance from rest to both lines, where the room gave one.
+    /// `learned` only.
+    edge: ?i16,
 
     pub fn init(cfg: Config) Detector {
         return .{
@@ -815,6 +854,9 @@ pub const Detector = struct {
             .band_hi = cfg.touch_band_hi,
             .band_share = cfg.band_share,
             .band_release = cfg.band_release,
+            .reach_up = null,
+            .reach_down = null,
+            .edge = cfg.edge,
             .rest_samples = @max(
                 @as(u32, @intFromFloat(cfg.still_rest_s * baseline_hz)),
                 1,
@@ -1109,41 +1151,51 @@ pub const Detector = struct {
         const up = clampedAbsDiff(self.baseline.high, rest);
         const down = clampedAbsDiff(self.baseline.low, rest);
 
-        const hi_line: ?i16 = if (up >= self.still_move)
-            saturatingAdd(rest, @divTrunc(up, 2))
-        else
-            null;
-        const lo_line: ?i16 = if (down >= self.still_move)
-            saturatingAdd(rest, -@divTrunc(down, 2))
-        else
-            null;
+        //
+        // Kept as a distance from rest, so a rest that moves carries its lines
+        // with it, and only ever widened: in a quiet stretch the probe's own
+        // small dips become the far end of the window, and a line drawn
+        // halfway to those is one they cross by themselves.
+        if (up >= self.still_move) {
+            self.reach_up = @max(self.reach_up orelse 0, @divTrunc(up, 2));
+        }
+        if (down >= self.still_move) {
+            self.reach_down = @max(self.reach_down orelse 0, @divTrunc(down, 2));
+        }
+        const hi_line: ?i16 = if (self.reach_up) |reach| saturatingAdd(rest, reach) else null;
+        const lo_line: ?i16 = if (self.reach_down) |reach| saturatingAdd(rest, -reach) else null;
 
-        // Whether the probe has been anywhere but home. Short of this nothing
-        // has ever taken it anywhere, so there is no second level and no line.
-        const second_level = hi_line != null or lo_line != null;
-
-        self.spread.watchEdges(lo_line, hi_line);
-
-        const away = if (second_level)
-            // A touch has been seen, so the rig is known and the question is a
-            // count: how much of the last window was past a line. Counted
-            // rather than measured, because a hand that drops out one poll in
-            // fifteen has a median dragged home and a range the height of the
-            // dropout, and neither reads as the hand that is there.
-            //
-            // The maximum of the two and never their sum. A probe wandering
-            // across its range is past each line about a quarter of the time,
-            // and summing those says only that it left the middle -- which is
-            // the one thing a wander and a hand have in common. On box1's
-            // capture the sum puts a wanderer at about a half against a share
-            // of 0.6, which is no margin at all.
-            @max(self.spread.above, self.spread.below) >= self.band_share
+        // Where nothing has shown the far level yet, a line a little way out
+        // from home stands in for it, and is asked the same question. The
+        // stand-in used to be the window's middle leaving home, and a light
+        // hand on a probe resting at a rail only knocks it off one poll in
+        // five: the middle never moves, the far level needs a twentieth of
+        // five minutes of such polls before it is found, and until then the
+        // hand was not heard at all.
+        //
+        // A fixed edge, where the room gave one, overrides both.
+        const lo_edge = if (self.edge) |edge|
+            saturatingAdd(rest, -edge)
         else
-            // Nobody has touched it yet, so there is no second cluster to find
-            // and no line to draw. Until there is, a touch is the plain thing:
-            // the window sitting somewhere the probe does not live. The first
-            // hand of the evening is answered on this, and teaches the rest.
-            clampedAbsDiff(level, rest) >= self.still_move;
+            lo_line orelse saturatingAdd(rest, -self.still_move);
+        const hi_edge = if (self.edge) |edge|
+            saturatingAdd(rest, edge)
+        else
+            hi_line orelse saturatingAdd(rest, self.still_move);
+        self.spread.watchEdges(lo_edge, hi_edge);
+
+        // A count rather than a measurement, because a hand that drops out one
+        // poll in fifteen has a median dragged home and a range the height of
+        // the dropout, and neither reads as the hand that is there.
+        //
+        // The maximum of the two and never their sum. A probe wandering
+        // across its range is past each line about a quarter of the time,
+        // and summing those says only that it left the middle -- which is
+        // the one thing a wander and a hand have in common. On box1's
+        // capture the sum puts a wanderer at about a half against a share
+        // of 0.6, which is no margin at all.
+        const past = @max(self.spread.above, self.spread.below);
+        const away = past >= self.band_share;
 
         // The count is the whole test, and stillness is not asked at all.
         //
@@ -1172,10 +1224,7 @@ pub const Detector = struct {
         // The other two branches keep one line each. Neither is a share, and
         // neither has been seen to sit on its own threshold.
         const held = away;
-        const loose = if (second_level)
-            @max(self.spread.above, self.spread.below) <= self.band_release
-        else
-            !away;
+        const loose = past <= self.band_release;
         self.at_rest = loose;
 
         return self.settle(held, loose);
@@ -2893,4 +2942,130 @@ test "the drone's pitch rises with the reading rather than folding at rest" {
 
     try std.testing.expect(below < at_rest);
     try std.testing.expect(at_rest < above);
+}
+
+test "probe BC can be held to its own share" {
+    const cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+        .band_share_bc = 0.08,
+        .band_release_bc = 0.03,
+    };
+    try std.testing.expectApproxEqAbs(default_band_share, cfg.band_share, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.08), cfg.forBc().band_share, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), cfg.forBc().band_release, 0.0001);
+    // Unset, BC is held to A's.
+    const plain: Config = .{ .sample_rate = 44100, .poll_frames = sensor_poll_frames };
+    try std.testing.expectApproxEqAbs(plain.band_share, plain.forBc().band_share, 0.0001);
+}
+
+test "a light hand that only knocks the probe off its rail now and then is heard" {
+    // BC resting on the rail, then a hand that drops it somewhere into the
+    // range one poll in five. Against a share of 0.6 that is never a touch;
+    // against BC's own share it is.
+    var cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+    };
+    var strict: Detector = .init(cfg.forBc());
+    cfg.band_share_bc = 0.08;
+    cfg.band_release_bc = 0.03;
+    var light: Detector = .init(cfg.forBc());
+
+    for (0..20 * poll_rate) |_| {
+        _ = strict.update(26346);
+        _ = light.update(26346);
+    }
+    try std.testing.expect(!light.on);
+
+    for (0..5 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 5 == 0) 2500 + @as(i16, @intCast(poll % 7919)) else 26346;
+        _ = strict.update(reading);
+        _ = light.update(reading);
+    }
+    try std.testing.expect(!strict.on);
+    try std.testing.expect(light.on);
+
+    for (0..5 * poll_rate) |_| _ = light.update(26346);
+    try std.testing.expect(!light.on);
+}
+
+test "a quiet room does not forget where a hand takes the probe" {
+    // BC on the rail, a few busy minutes of light hands, then nobody. The far
+    // level falls out of the five-minute window, and the probe's own small
+    // dips off the rail -- a few hundred to three thousand counts -- must not
+    // be heard as hands against a line that has crept back to rest.
+    const cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+        .band_share = 0.08,
+        .band_release = 0.03,
+        .baseline_s = 60.0,
+    };
+    var detector: Detector = .init(cfg);
+    for (0..10 * poll_rate) |_| _ = detector.update(26346);
+    for (0..30 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 5 == 0) 2500 + @as(i16, @intCast(poll % 7919)) else 26346;
+        _ = detector.update(reading);
+    }
+    try std.testing.expect(detector.on);
+
+    // Two window-lengths of nobody, dipping a little one poll in eight.
+    var latched = false;
+    for (0..120 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 8 == 0) 23400 + @as(i16, @intCast(poll % 2900)) else 26346;
+        _ = detector.update(reading);
+        if (poll > 5 * poll_rate and detector.on) latched = true;
+    }
+    try std.testing.expect(!latched);
+}
+
+test "a line just under the rail tells stray dips from a hand" {
+    // BC as the room's captures show it. Untouched it sits on the rail with a
+    // second level about 490 under it one poll in eleven, and now and then a
+    // single reading anywhere down the range; under a light hand it is off
+    // the rail in runs, more than half the time. A learned line sat between
+    // the rail and that second level and latched for minutes with nobody
+    // there; a line 600 under rest sits past both.
+    const cfg: Config = .{
+        .sample_rate = 44100,
+        .poll_frames = sensor_poll_frames,
+        .model = .learned,
+        .band_share_bc = 0.25,
+        .band_release_bc = 0.15,
+        .edge_bc = 600,
+    };
+    var detector: Detector = .init(cfg.forBc());
+    var prng: std.Random.DefaultPrng = .init(20261029);
+    const random = prng.random();
+
+    for (0..60 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 173 == 0)
+            random.intRangeAtMost(i16, 2400, 26000)
+        else if (poll % 11 == 0)
+            random.intRangeAtMost(i16, 25840, 25890)
+        else
+            26347;
+        try std.testing.expect(!detector.update(reading));
+    }
+
+    for (0..5 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 10 < 6) random.intRangeAtMost(i16, 2400, 26000) else 26347;
+        _ = detector.update(reading);
+    }
+    try std.testing.expect(detector.on);
+
+    for (0..5 * poll_rate) |poll| {
+        const reading: i16 = if (poll % 173 == 0)
+            random.intRangeAtMost(i16, 2400, 26000)
+        else if (poll % 11 == 0)
+            random.intRangeAtMost(i16, 25840, 25890)
+        else
+            26347;
+        _ = detector.update(reading);
+    }
+    try std.testing.expect(!detector.on);
 }

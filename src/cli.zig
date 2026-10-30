@@ -3,6 +3,7 @@ const clips = @import("core/clips.zig");
 const source = @import("core/source.zig");
 const touch = @import("core/touch.zig");
 const timbre = @import("core/timbre.zig");
+const core_noise = @import("core/noise.zig");
 const select = @import("core/select.zig");
 const boxes = @import("application/boxes/root.zig");
 
@@ -19,6 +20,8 @@ pub const Error = error{
     InvalidTouchFloor,
     InvalidTouchRise,
     InvalidTouchWobble,
+    InvalidTouchGust,
+    InvalidDroneGain,
     InvalidTouchClimb,
     InvalidTimbre,
     InvalidTouchFall,
@@ -91,6 +94,14 @@ pub const Options = struct {
     /// Below the share it latches at, so a hand sitting on the line holds
     /// rather than latching and releasing on alternate windows.
     band_release: ?f32 = null,
+    /// Probe BC's own share and release, where it is past its line for a
+    /// different share of a touch than A is. Unset, BC takes A's.
+    band_share_bc: ?f32 = null,
+    band_release_bc: ?f32 = null,
+    /// Plant B's lines this many counts from rest instead of learned.
+    edge_bc: ?i16 = null,
+    /// Probe A's lines at a fixed distance from rest, under `learned`.
+    edge_a: ?i16 = null,
     /// How far up the pitch range a touch starts, as a fraction of it.
     touch_floor: ?f32 = null,
     /// How long a held touch takes to climb from that start to the top. Set,
@@ -101,6 +112,11 @@ pub const Options = struct {
     /// Semitones the climb bends for each tenth of the probe's share, under
     /// `learned`. Zero is a straight climb.
     touch_wobble: ?f32 = null,
+    /// Semitones the climb drifts at random either way, like wind, under a
+    /// ramp. Zero is a climb with no gusts.
+    touch_gust: ?f32 = null,
+    /// The drone's level in dB, or unset for the model's own.
+    drone_gain: ?f32 = null,
     /// Semitones a held climb rises from its floor, under a ramp.
     touch_climb: ?f32 = null,
     /// What the drone is made of, or unset for the model's own choice.
@@ -244,6 +260,26 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidBandShare;
             if (!(fraction >= 0.0) or fraction > 1.0) return Error.InvalidBandShare;
             opts.band_release = fraction;
+        } else if (std.mem.startsWith(u8, arg, "--band-share-b=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-share-b=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction > 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_share_bc = fraction;
+        } else if (std.mem.startsWith(u8, arg, "--band-release-b=")) {
+            const fraction = std.fmt.parseFloat(f32, arg["--band-release-b=".len..]) catch
+                return Error.InvalidBandShare;
+            if (!(fraction >= 0.0) or fraction > 1.0) return Error.InvalidBandShare;
+            opts.band_release_bc = fraction;
+        } else if (std.mem.startsWith(u8, arg, "--edge-a=")) {
+            const counts = std.fmt.parseInt(i16, arg["--edge-a=".len..], 10) catch
+                return Error.InvalidStillThreshold;
+            if (counts <= 0) return Error.InvalidStillThreshold;
+            opts.edge_a = counts;
+        } else if (std.mem.startsWith(u8, arg, "--edge-b=")) {
+            const counts = std.fmt.parseInt(i16, arg["--edge-b=".len..], 10) catch
+                return Error.InvalidStillThreshold;
+            if (counts <= 0) return Error.InvalidStillThreshold;
+            opts.edge_bc = counts;
         } else if (std.mem.startsWith(u8, arg, "--touch-floor=")) {
             const fraction = std.fmt.parseFloat(f32, arg["--touch-floor=".len..]) catch
                 return Error.InvalidTouchFloor;
@@ -277,6 +313,16 @@ pub fn parse(args: []const []const u8) Error!Options {
                 return Error.InvalidTouchWobble;
             if (!(semis >= 0.0) or semis > 12.0) return Error.InvalidTouchWobble;
             opts.touch_wobble = semis;
+        } else if (std.mem.startsWith(u8, arg, "--touch-gust=")) {
+            const semis = std.fmt.parseFloat(f32, arg["--touch-gust=".len..]) catch
+                return Error.InvalidTouchGust;
+            if (!(semis >= 0.0) or semis > core_noise.gust_max_semis) return Error.InvalidTouchGust;
+            opts.touch_gust = semis;
+        } else if (std.mem.startsWith(u8, arg, "--drone-gain=")) {
+            const db = std.fmt.parseFloat(f32, arg["--drone-gain=".len..]) catch
+                return Error.InvalidDroneGain;
+            if (!(db >= -40.0) or db > 6.0) return Error.InvalidDroneGain;
+            opts.drone_gain = db;
         } else if (std.mem.eql(u8, arg, "--plant-a")) {
             // The shorthand the flag had when it was a switch, kept so a unit
             // file already passing it keeps starting.
@@ -391,10 +437,12 @@ pub const usage =
     \\                  [--plant-b-seconds=N] [--plant-b-retrigger=N] [--plant-b-window=N|off]
     \\                  [--touch-model=MODEL] [--still-range=N] [--still-release=N]
     \\                  [--still-window=SECONDS] [--band-share=FRACTION]
-    \\                  [--band-release=FRACTION]
+    \\                  [--band-release=FRACTION] [--band-share-b=FRACTION]
+    \\                  [--band-release-b=FRACTION] [--edge-a=N] [--edge-b=N]
     \\                  [--counts=N] [--counts-b=N]
     \\                  [--touch-floor=FRACTION] [--touch-rise=SECONDS]
     \\                  [--touch-climb=SEMITONES] [--touch-wobble=SEMITONES]
+    \\                  [--touch-gust=SEMITONES] [--drone-gain=DB]
     \\                  [--touch-fall=SECONDS] [--drone-timbre=TIMBRE] [--drone-idle=FRACTION]
     \\                  [--capture=PATH] [--capture-seconds=N]
     \\                  [--box=N]
@@ -497,8 +545,8 @@ pub const usage =
     \\
     \\--drone-timbre is what the drone is made of: `band`, the narrow noise band
     \\it always was; `wide`, the same noise a third as sharp, heard as texture
-    \\rather than grain; or `warm`, a tone with breath above it. The learned
-    \\model uses `wide` unless told; the others `band`.
+    \\rather than grain; or `warm`, a tone with breath above it. Every model
+    \\uses `band` unless told.
     \\
     \\--touch-climb is how many semitones the climb rises above where it
     \\started, never past the top of the range. Unset, it climbs all the way
@@ -507,7 +555,16 @@ pub const usage =
     \\--touch-wobble is how many semitones that climb bends for each tenth of
     \\the probe's share, the count the learned model latches on, so a hold
     \\rises with the plant's own small wander in it rather than as a clean
-    \\line. The learned model uses 1 unless told; 0 is a straight climb.
+    \\line. Off unless asked: the learned drone climbs on the hold and the gust.
+    \\
+    \\--touch-gust is how many semitones that climb drifts at random either way,
+    \\swelling to a new offset every 0.6 to 1.8 seconds, so the rise is uneven
+    \\like wind and still always a rise. Nothing about the probe drives it. The
+    \\learned model uses 0.65 unless told; 0 is no gust, and 2 the most allowed.
+    \\
+    \\--drone-gain is the drone's level in dB, from -40 to 6, against the level
+    \\the boxes were tuned at. The learned model uses -8 unless told; the others
+    \\0. Only the drone moves: plant B's clips keep their level.
     \\
     \\The learned model takes both without being asked, because it cannot hand a
     \\pitch to the reading: its deviation is the gap between the window's middle
@@ -534,6 +591,23 @@ pub const usage =
     \\under --band-share, and between the two nothing changes: a hand whose
     \\share lands on the line then holds rather than latching and releasing on
     \\alternate windows. The default is 0.5.
+    \\
+    \\--band-share-b and --band-release-b are the same two numbers for plant B
+    \\alone, where its probe is past its line for a different share of a touch
+    \\than plant A's. Left off, plant B takes plant A's.
+    \\
+    \\--edge-a is the same for plant A. Under the learned model plant A's line
+    \\sits 5000 under rest unless told (touch at a share of 0.5, over at 0.25),
+    \\and plant B's 1000 (0.4 and 0.2): each probe sits near the top of the
+    \\range untouched and a hand drags it down.
+    \\
+    \\--edge-b puts plant B's lines N counts either side of rest, instead of
+    \\halfway to where hands have taken it. For a probe resting on a rail that
+    \\throws odd single readings untouched: the line then asks whether the
+    \\probe is off the rail at all. Set it deeper than the probe's own small
+    \\dips: on the room's capture plant B rests with one poll in eleven about
+    \\490 under the rail, so 600 with --band-share-b=0.25 --band-release-b=0.15.
+    \\`learned` only.
     \\
     \\--counts and --counts-b are how big a move a touch has to be on each probe,
     \\in the counts the status line's l0 and l1 show. `deviation` only.
@@ -814,6 +888,24 @@ test "a touch wobble is a number of semitones, zero included" {
     try std.testing.expectError(Error.InvalidTouchWobble, parse(&.{"--touch-wobble=loud"}));
 }
 
+test "a touch gust is a small number of semitones, zero included" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), (try parse(&.{"--touch-gust=0.65"})).touch_gust.?, 0.0001);
+    try std.testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--touch-gust=0"})).touch_gust.?);
+    try std.testing.expect((try parse(&.{})).touch_gust == null);
+    try std.testing.expectError(Error.InvalidTouchGust, parse(&.{"--touch-gust=-1"}));
+    try std.testing.expectError(Error.InvalidTouchGust, parse(&.{"--touch-gust=3"}));
+    try std.testing.expectError(Error.InvalidTouchGust, parse(&.{"--touch-gust=wind"}));
+}
+
+test "a drone gain is a number of dB in range" {
+    try std.testing.expectApproxEqAbs(@as(f32, -12.0), (try parse(&.{"--drone-gain=-12"})).drone_gain.?, 0.0001);
+    try std.testing.expectEqual(@as(f32, 0.0), (try parse(&.{"--drone-gain=0"})).drone_gain.?);
+    try std.testing.expect((try parse(&.{})).drone_gain == null);
+    try std.testing.expectError(Error.InvalidDroneGain, parse(&.{"--drone-gain=-50"}));
+    try std.testing.expectError(Error.InvalidDroneGain, parse(&.{"--drone-gain=10"}));
+    try std.testing.expectError(Error.InvalidDroneGain, parse(&.{"--drone-gain=quiet"}));
+}
+
 test "a window of no time at all is refused" {
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=0"}));
     try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--still-window=-1"}));
@@ -846,6 +938,8 @@ test "the usage banner names every flag the parser takes" {
         "--touch-fall=",
         "--drone-idle=",
         "--touch-wobble=",
+        "--touch-gust=",
+        "--drone-gain=",
         "--test-random-probe",
         "--test-probe-file=",
     };
@@ -1054,4 +1148,24 @@ test "the share that ends a touch is its own flag" {
     // when nothing at all is left past the line.
     try std.testing.expect((try parse(&.{"--band-release=0"})).band_release.? == 0.0);
     try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-release=1.2"}));
+
+    // Plant B's own pair, kept apart from A's.
+    const own = try parse(&.{ "--band-share-b=0.08", "--band-release-b=0.03" });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.08), own.band_share_bc.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.03), own.band_release_bc.?, 0.0001);
+    try std.testing.expect(own.band_share == null);
+    try std.testing.expectError(Error.InvalidBandShare, parse(&.{"--band-share-b=0"}));
+}
+
+test "plant A's lines can be put a fixed distance from rest" {
+    try std.testing.expectEqual(@as(?i16, 4000), (try parse(&.{"--edge-a=4000"})).edge_a);
+    try std.testing.expect((try parse(&.{})).edge_a == null);
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--edge-a=0"}));
+}
+
+test "plant B's lines can be put a fixed distance from rest" {
+    try std.testing.expectEqual(@as(?i16, 300), (try parse(&.{"--edge-b=300"})).edge_bc);
+    try std.testing.expect((try parse(&.{})).edge_bc == null);
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--edge-b=0"}));
+    try std.testing.expectError(Error.InvalidStillThreshold, parse(&.{"--edge-b=rail"}));
 }
