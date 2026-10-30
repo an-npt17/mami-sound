@@ -348,6 +348,15 @@ pub const piano_clip_gain: f32 = 1.2589;
 /// on 2026-10-30.
 pub const tradvn2_clip_gain: f32 = 1.4125;
 
+/// The bell stems 10% quieter to the ear than the other clips, asked for on
+/// 2026-10-30. Loudness doubles about every 10 dB, so 10% quieter is
+/// 10*log2(0.9) = -1.5 dB, not an amplitude of 0.9.
+pub const bell_clip_gain: f32 = 0.8395;
+
+/// Both insect mixes 10% louder to the ear, asked for on 2026-10-30:
+/// 10*log2(1.1) = +1.4 dB.
+pub const insect_clip_gain: f32 = 1.1717;
+
 /// The gate under the learned drone, from the bench's pick.
 pub const ramped_gate_ms: f32 = 400.0;
 

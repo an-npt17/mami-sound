@@ -266,6 +266,8 @@ fn runComposition(
         streams[plant] = try clip_stream.Adapter.init(io, gpa, pools[plant].paths, limit);
         if (chosen == .piano) streams[plant].gain *= production_config.piano_clip_gain;
         if (chosen == .tradvn2) streams[plant].gain *= production_config.tradvn2_clip_gain;
+        if (chosen == .bell) streams[plant].gain *= production_config.bell_clip_gain;
+        if (chosen == .insect3 or chosen == .insect5) streams[plant].gain *= production_config.insect_clip_gain;
         stream_live[plant] = true;
 
         // Before `start`, and never fatal. The heads are what make a touch
