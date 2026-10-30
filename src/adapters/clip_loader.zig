@@ -82,6 +82,7 @@ pub fn directoriesFor(source: core.source.Source) []const []const u8 {
         .bell => &.{"Bell Stems"},
         .daybird => &.{"Day bird"},
         .piano => &.{"EPiano Stems"},
+        .wind => &.{"wind"},
     };
 }
 
@@ -145,7 +146,7 @@ test "every source names the one folder it is made of" {
     // One each. The pool that read two folders as one went when the interviews
     // became two boxes; a plant that wants both is two plants.
     const sources = [_]core.source.Source{
-        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano,
+        .voicebox3, .voicebox5, .daybird, .insect3, .insect5, .tradvn, .tradvn2, .bell, .piano, .wind,
     };
     for (sources) |which| {
         try std.testing.expectEqual(@as(usize, 1), directoriesFor(which).len);
@@ -160,6 +161,7 @@ test "every source names the one folder it is made of" {
     try std.testing.expectEqualStrings("Trad Vn Jam 2", directoriesFor(.tradvn2)[0]);
     try std.testing.expectEqualStrings("Bell Stems", directoriesFor(.bell)[0]);
     try std.testing.expectEqualStrings("EPiano Stems", directoriesFor(.piano)[0]);
+    try std.testing.expectEqualStrings("wind", directoriesFor(.wind)[0]);
 }
 
 test "the second jam loads in the order it is numbered" {

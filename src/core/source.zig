@@ -83,6 +83,8 @@ pub const Source = enum {
     tradvn2,
     bell,
     piano,
+    /// Wind, in numbered parts played one after another, each to its end.
+    wind,
 
     pub fn parse(name: []const u8) Error!Source {
         return std.meta.stringToEnum(Source, name) orelse Error.UnknownSource;
@@ -97,7 +99,7 @@ pub const Source = enum {
     /// a fragment, and a jam cut there is not music.
     pub fn defaultSeconds(self: Source) ?f32 {
         return switch (self) {
-            .drone, .voicebox3, .voicebox5, .tradvn, .tradvn2 => null,
+            .drone, .voicebox3, .voicebox5, .tradvn, .tradvn2, .wind => null,
             .daybird, .insect3, .insect5 => fragment_play_s,
             .bell, .piano => stem_play_s,
         };
@@ -127,6 +129,7 @@ test "every source name parses to itself" {
     try std.testing.expectEqual(Source.tradvn2, try Source.parse("tradvn2"));
     try std.testing.expectEqual(Source.bell, try Source.parse("bell"));
     try std.testing.expectEqual(Source.piano, try Source.parse("piano"));
+    try std.testing.expectEqual(Source.wind, try Source.parse("wind"));
 }
 
 test "a name no source has is refused" {
@@ -149,6 +152,7 @@ test "a source that plays to its own end has no length" {
     try std.testing.expect(Source.voicebox5.defaultSeconds() == null);
     try std.testing.expect(Source.tradvn.defaultSeconds() == null);
     try std.testing.expect(Source.tradvn2.defaultSeconds() == null);
+    try std.testing.expect(Source.wind.defaultSeconds() == null);
     try std.testing.expect(Source.drone.defaultSeconds() == null);
 }
 
