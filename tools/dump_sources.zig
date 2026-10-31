@@ -30,7 +30,7 @@ const clip_loader = adapters.adapters.clip_loader;
 /// generated audio with no folder at all, and `directoriesFor(.drone)` is
 /// `unreachable`.
 const sources = [_]core.source.Source{
-    .voicebox3, .voicebox5, .insect3, .insect5, .tradvn, .tradvn2, .bell, .daybird, .piano, .wind,
+    .voicebox3, .voicebox5, .insect3, .insect5, .tradvn, .tradvn2, .bell, .daybird, .piano, .noise2, .noise4,
 };
 
 pub fn main(init: std.process.Init) !void {
