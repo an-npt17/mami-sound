@@ -9,7 +9,7 @@
 # touch that starts and ends between two lines is missed.
 #
 # Usage:
-#   ./trigger-count.sh                            # today, gap 5 s
+#   ./trigger-count.sh                            # today, gap 60 s (one visit)
 #   ./trigger-count.sh -g 0                       # every edge its own trigger
 #   ./trigger-count.sh -s yesterday -u today
 #   ./trigger-count.sh -s "2026-11-03 09:00"
@@ -19,7 +19,7 @@ set -euo pipefail
 unit=mami-sound
 since=today
 until=
-gap=5
+gap=60
 file=
 
 usage() { sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
