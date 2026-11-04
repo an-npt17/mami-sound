@@ -10,8 +10,24 @@ User=pi
 SupplementaryGroups=audio i2c
 WorkingDirectory=/home/pi/mami-sound
 ExecStartPre=/bin/sleep 5
+# Mixer to 100% on every start: ALSA forgets alsamixer changes when the box
+# is switched off at the wall. `-` so a mixer hiccup never stops the sound.
+ExecStartPre=-/home/pi/mami-sound/set-volume.sh 0
+# This machine's hostname is none of the five, so it runs the unmeasured
+# defaults: no counts floor, and the deviation score asked alone. Probe BC
+# drifts about six thousand counts with nobody on it -- 18817 to 24942 in the
+# service log -- which is many deviations of its own wobble and latches clip
+# after clip. A floor of ten thousand is above that drift and under the move a
+# hand makes, so the drift is refused and a hand is not. Replayed against
+# probes-box22.csv the same floor takes BC from 126 episodes, latched 73.9% of
+# the run, to 2 at 5.3%.
+#
+# Probe A is left on the score alone: it drifts 244 counts, scores about three
+# deviations against a threshold of six, and nobody has measured what a hand
+# moves it on this rig -- so there is no floor to set that is not a guess.
 ExecStart=/home/pi/mami-sound/zig-out/bin/mami_sound \
-    --device=plughw:0,0
+    --device=plughw:0,0 \
+    --counts-b=10000
 
 # Ride out a transient card hiccup, but give up after 3 tries in 2 min
 # so the box sits idle and sshable instead of looping ffmpeg decodes.

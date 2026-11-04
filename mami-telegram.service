@@ -1,0 +1,33 @@
+[Unit]
+Description=Mami hourly touch counts to Telegram
+After=network-online.target mami-sound.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# trigger-count.sh reads mami-sound's journal, which needs this group.
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/home/pi/mami-sound
+
+# The name this box signs its messages with. Each of the five boxes sets its
+# own here, so deploying to another one means changing this one line.
+Environment="MAMI_BOX_NAME=Box 1"
+# What each plant plays, shown beside its count. Box 1 is a bird on plant A
+# and a bell on plant B (src/application/boxes/box1.zig); set these to match
+# the box. Leave one empty to show the plant letter alone.
+Environment="MAMI_PLANT_A_SOUND=tiếng chim"
+Environment="MAMI_PLANT_B_SOUND=tiếng chuông"
+
+# Bot token and chat id live in this file, not here: this file is in git and
+# the token is a secret. Copy telegram.env.example to telegram.env and fill it.
+EnvironmentFile=/home/pi/mami-sound/telegram.env
+
+ExecStart=/home/pi/mami-sound/telegram-report.sh
+
+# Run forever: a crash or a network-less boot just comes back a minute later.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
