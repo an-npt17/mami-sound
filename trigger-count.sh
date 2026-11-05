@@ -3,14 +3,17 @@
 #
 # mami_sound prints one status line a second, ending in touch=XY: X is A
 # while plant A is touched, Y is B while plant B is touched, '-' otherwise.
-# A hold is one trigger however long it lasts. A release of GAP seconds or
-# less followed by another touch (a flicker, a hand tapping) folds into the
-# same trigger; "raw" counts every edge. Lines come once a second, so a
-# touch that starts and ends between two lines is missed.
+# A hold is one trigger however long it lasts; only a release (an untouched
+# line) ends it, and the next touch is a new trigger. With -g GAP, a release
+# of GAP seconds or less followed by another touch folds into the same
+# trigger instead; "raw" always counts every edge. A hold already going on
+# at the first line began before the window and is not counted, so splitting
+# a day into hours never counts one hold twice. Lines come once a second, so
+# a touch that starts and ends between two lines is missed.
 #
 # Usage:
-#   ./trigger-count.sh                            # today, gap 60 s (one visit)
-#   ./trigger-count.sh -g 0                       # every edge its own trigger
+#   ./trigger-count.sh                            # today, every touch counted
+#   ./trigger-count.sh -g 60                      # fold re-touches within 60 s
 #   ./trigger-count.sh -s yesterday -u today
 #   ./trigger-count.sh -s "2026-11-03 09:00"
 #   ./trigger-count.sh -f service-log4.txt        # a saved log instead
@@ -19,7 +22,7 @@ set -euo pipefail
 unit=mami-sound
 since=today
 until=
-gap=60
+gap=0
 file=
 
 usage() { sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -87,6 +90,11 @@ BEGIN { name[1] = "A"; name[2] = "B" }
     }
     run_lines[runs]++
 
+    # A hold on the first line of the window began before it: carry it, uncounted.
+    if (lines == 1)
+        for (p = 1; p <= 2; p++)
+            if (substr(touch, p, 1) == name[p]) { on[p] = 1; seen[p] = start[p] = now }
+
     for (p = 1; p <= 2; p++) {
         if (substr(touch, p, 1) != name[p]) { on[p] = 0; continue }
         if (!on[p]) {
@@ -112,7 +120,8 @@ END {
     if (!lines) { print "no status lines found (service not running, or wrong window?)"; exit }
     printf "log span  %s -> %s  (%d status lines, ~%s running, %d boots/restarts)\n", \
         first, last, lines, dur(lines), runs
-    printf "a re-touch within %ss of release counts as the same trigger\n\n", gap
+    if (gap > 0) printf "a re-touch within %ss of release counts as the same trigger\n\n", gap
+    else printf "every touch after a release counts as a new trigger\n\n"
     printf "%-6s%9s%6s%12s%10s\n", "plant", "triggers", "raw", "touched", "longest"
     for (p = 1; p <= 2; p++)
         printf "%-6s%9d%6d%12s%10s\n", name[p], trig[p], raw[p], dur(touched[p]), dur(longest[p])

@@ -10,17 +10,10 @@ User=pi
 SupplementaryGroups=systemd-journal
 WorkingDirectory=/home/pi/mami-sound
 
-# The name this box signs its messages with. Each of the five boxes sets its
-# own here, so deploying to another one means changing this one line.
-Environment="MAMI_BOX_NAME=Box 1"
-# What each plant plays, shown beside its count. Box 1 is a bird on plant A
-# and a bell on plant B (src/application/boxes/box1.zig); set these to match
-# the box. Leave one empty to show the plant letter alone.
-Environment="MAMI_PLANT_A_SOUND=tiếng chim"
-Environment="MAMI_PLANT_B_SOUND=tiếng chuông"
-
-# Bot token and chat id live in this file, not here: this file is in git and
-# the token is a secret. Copy telegram.env.example to telegram.env and fill it.
+# Everything per box lives in telegram.env, not here, so this file is the
+# same on all five Pis: the box name (MAMI_BOX_NAME), plus the bot token and
+# chat id, which are secrets and stay out of git. Copy telegram.env.example
+# to telegram.env and fill it.
 EnvironmentFile=/home/pi/mami-sound/telegram.env
 
 ExecStart=/home/pi/mami-sound/telegram-report.sh

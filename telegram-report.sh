@@ -2,18 +2,16 @@
 # Send each hour's plant triggers to a Telegram chat.
 #
 # Just after every full hour it runs trigger-count.sh over the hour that
-# ended (10:00 -> 11:00, say) and posts the A and B trigger counts, so the
+# ended (10:00 -> 11:00, say) and posts the a0 and a1 trigger counts, so the
 # chat holds one line per box per hour. Counting is trigger-count.sh's: a
-# re-touch within GAP seconds of release is the same trigger. Each hour is
-# counted on its own, so a hold that spans the hour mark counts in both.
+# hold is one touch however long, and only a release starts a new one. A hold
+# that spans the hour mark counts in the hour it started, not the next.
 #
 # Settings come from the environment (telegram.env, via mami-telegram.service):
 #   MAMI_BOX_NAME        name shown in each message, e.g. "Box 1"
-#   MAMI_PLANT_A_SOUND   what plant A plays, e.g. "tiếng chim" (optional)
-#   MAMI_PLANT_B_SOUND   what plant B plays, e.g. "tiếng chuông" (optional)
 #   TELEGRAM_BOT_TOKEN   from @BotFather          (keep out of git)
 #   TELEGRAM_CHAT_ID     chat or group to post to (keep out of git)
-#   MAMI_GAP             re-touch gap in seconds, default 60
+#   MAMI_GAP             fold re-touches within this many seconds, default 0
 #
 # Usage:
 #   ./telegram-report.sh          # run forever, one message per hour
@@ -23,9 +21,7 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 box=${MAMI_BOX_NAME:-$(hostname)}
-gap=${MAMI_GAP:-60}
-sound_a=${MAMI_PLANT_A_SOUND:-}
-sound_b=${MAMI_PLANT_B_SOUND:-}
+gap=${MAMI_GAP:-0}
 mode=loop
 
 usage() { sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -61,8 +57,8 @@ report() {
     if [[ -z $a ]]; then
         printf 'no status lines -- sound service not running?\n'
     else
-        printf 'Plant A%s: %s touches\nPlant B%s: %s touches\n' \
-            "${sound_a:+ ($sound_a)}" "$a" "${sound_b:+ ($sound_b)}" "$b"
+        # Named after the probe channels, a0 and a1, as in the status line.
+        printf 'Plant A0: %s touches\nPlant A1: %s touches\n' "$a" "$b"
     fi
 }
 
