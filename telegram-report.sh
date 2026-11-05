@@ -7,7 +7,7 @@
 # re-touch within GAP seconds of release is the same trigger. Each hour is
 # counted on its own, so a hold that spans the hour mark counts in both.
 #
-# Settings come from the environment (mami-telegram.service sets them):
+# Settings come from the environment (telegram.env, via mami-telegram.service):
 #   MAMI_BOX_NAME        name shown in each message, e.g. "Box 1"
 #   MAMI_PLANT_A_SOUND   what plant A plays, e.g. "tiếng chim" (optional)
 #   MAMI_PLANT_B_SOUND   what plant B plays, e.g. "tiếng chuông" (optional)

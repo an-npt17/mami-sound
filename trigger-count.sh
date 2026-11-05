@@ -76,12 +76,16 @@ BEGIN { name[1] = "A"; name[2] = "B" }
     if (first == "") first = day " " hms
     last = day " " hms
 
-    # A new process starts untouched, so its first touch is a fresh edge.
+    # A new process (a boot, or a service restart) starts untouched, so its
+    # first touch is a fresh edge. Each one gets its own row in the report.
     if (pid != last_pid) {
         if (last_pid != "") restarts++
         on[1] = on[2] = 0
         last_pid = pid
+        runs++
+        run_start[runs] = day " " hms
     }
+    run_lines[runs]++
 
     for (p = 1; p <= 2; p++) {
         if (substr(touch, p, 1) != name[p]) { on[p] = 0; continue }
@@ -90,6 +94,7 @@ BEGIN { name[1] = "A"; name[2] = "B" }
             # A 1 s step between touched lines means no release at all.
             if (!(p in seen) || now - seen[p] - 1 > gap) {
                 trig[p]++
+                run_trig[runs, p]++
                 hours[hour] = 1
                 per[p, hour]++
                 start[p] = now
@@ -105,12 +110,17 @@ BEGIN { name[1] = "A"; name[2] = "B" }
 END {
     print "mami-sound triggers -- " title
     if (!lines) { print "no status lines found (service not running, or wrong window?)"; exit }
-    printf "log span  %s -> %s  (%d status lines, ~%s running, %d restarts)\n", \
-        first, last, lines, dur(lines), restarts
+    printf "log span  %s -> %s  (%d status lines, ~%s running, %d boots/restarts)\n", \
+        first, last, lines, dur(lines), runs
     printf "a re-touch within %ss of release counts as the same trigger\n\n", gap
     printf "%-6s%9s%6s%12s%10s\n", "plant", "triggers", "raw", "touched", "longest"
     for (p = 1; p <= 2; p++)
         printf "%-6s%9d%6d%12s%10s\n", name[p], trig[p], raw[p], dur(touched[p]), dur(longest[p])
+
+    printf "\nper boot  started              running       A     B\n"
+    for (r = 1; r <= runs; r++)
+        printf "%-9d %-18s %9s  %4d  %4d\n", r, run_start[r], dur(run_lines[r]), \
+            run_trig[r, 1], run_trig[r, 2]
 
     n = 0
     for (h = 0; h < 24; h++) { k = sprintf("%02d", h); if (k in hours) n++ }
